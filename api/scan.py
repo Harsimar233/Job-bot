@@ -1,6 +1,5 @@
 """
-Job Bot — Fast version using only RSS feeds and public APIs.
-No HTML scraping (too slow for Vercel's timeout).
+Job Bot — Uses ScraperAPI to bypass blocks on crypto job boards.
 """
 import os, json, hashlib, logging, time
 import requests, feedparser
@@ -9,8 +8,9 @@ from http.server import BaseHTTPRequestHandler
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("job-bot")
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-CHAT_ID   = os.environ.get("CHAT_ID", "")
+BOT_TOKEN  = os.environ.get("BOT_TOKEN", "")
+CHAT_ID    = os.environ.get("CHAT_ID", "")
+SCRAPER_KEY = os.environ.get("SCRAPER_KEY", "")
 
 KEYWORDS = os.environ.get("KEYWORDS",
     "community,ambassador,growth,discord,telegram,dao,defi,nft,kol,"
@@ -27,9 +27,11 @@ EXCLUDE_LIST  = [k.strip().lower() for k in EXCLUDE.split(",") if k.strip()]
 SEEN_FILE     = "/tmp/seen_jobs.json"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; JobBot/1.0)",
-    "Accept": "application/rss+xml, application/xml, text/xml, application/json",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/rss+xml, application/xml, text/xml, text/html, */*",
 }
+
+# ─── Dedup ───────────────────────────────────────────────────────────────────
 
 def load_seen():
     try:
@@ -48,7 +50,7 @@ def save_seen(seen):
 def jid(url):
     return hashlib.md5(url.encode()).hexdigest()
 
-def job(title, company, location, url, source, desc="", tags=None, salary=""):
+def make_job(title, company, location, url, source, desc="", tags=None, salary=""):
     return {
         "title": (title or "").strip(),
         "company": (company or "").strip(),
@@ -61,13 +63,23 @@ def job(title, company, location, url, source, desc="", tags=None, salary=""):
         "_id": jid(url or ""),
     }
 
-def fetch_rss(urls):
+# ─── Fetch helpers ────────────────────────────────────────────────────────────
+
+def scraper_url(target_url):
+    """Route a URL through ScraperAPI to bypass IP blocks."""
+    if not SCRAPER_KEY:
+        return target_url
+    return f"https://api.scraperapi.com/?api_key={SCRAPER_KEY}&url={requests.utils.quote(target_url, safe='')}"
+
+def fetch_rss(urls, use_scraper=False):
     for url in (urls if isinstance(urls, list) else [urls]):
         try:
-            r = requests.get(url, headers=HEADERS, timeout=8)
+            fetch = scraper_url(url) if use_scraper else url
+            r = requests.get(fetch, headers=HEADERS, timeout=15)
             if r.status_code == 200 and len(r.text) > 200:
                 return feedparser.parse(r.text)
-        except Exception:
+        except Exception as e:
+            logger.error(f"fetch_rss {url}: {e}")
             continue
     return None
 
@@ -78,49 +90,71 @@ def split_co(title):
             return p[0].strip(), p[1].strip()
     return title.strip(), ""
 
+# ─── Source 1: CryptoJobsList (via ScraperAPI) ───────────────────────────────
+
 def src_cryptojobslist():
     jobs = []
-    feed = fetch_rss(["https://cryptojobslist.com/rss.xml", "https://cryptojobslist.com/rss"])
+    feed = fetch_rss(
+        ["https://cryptojobslist.com/rss.xml", "https://cryptojobslist.com/rss"],
+        use_scraper=True
+    )
     if not feed:
+        logger.warning("CryptoJobsList: no feed")
         return []
     for e in feed.entries:
         t, c = split_co(e.get("title", ""))
         tags = [x.term for x in e.get("tags", [])]
-        jobs.append(job(t, c, "Remote", e.get("link",""), "CryptoJobsList", e.get("summary",""), tags))
+        jobs.append(make_job(t, c, "Remote", e.get("link",""), "CryptoJobsList", e.get("summary",""), tags))
     logger.info(f"CryptoJobsList: {len(jobs)}")
     return jobs
 
+# ─── Source 2: Web3.career (via ScraperAPI) ──────────────────────────────────
+
 def src_web3career():
     jobs = []
-    feed = fetch_rss(["https://web3.career/rss.xml", "https://web3.career/feed.xml"])
+    feed = fetch_rss(
+        ["https://web3.career/rss.xml", "https://web3.career/feed.xml"],
+        use_scraper=True
+    )
     if not feed:
+        logger.warning("Web3.career: no feed")
         return []
     for e in feed.entries:
         t, c = split_co(e.get("title", ""))
         tags = [x.term for x in e.get("tags", [])]
-        jobs.append(job(t, c, "Remote", e.get("link",""), "Web3.career", e.get("summary",""), tags))
+        jobs.append(make_job(t, c, "Remote", e.get("link",""), "Web3.career", e.get("summary",""), tags))
     logger.info(f"Web3.career: {len(jobs)}")
     return jobs
 
+# ─── Source 3: WeWorkRemotely ─────────────────────────────────────────────────
+
 def src_weworkremotely():
     jobs = []
-    feed = fetch_rss("https://weworkremotely.com/categories/remote-sales-and-marketing-jobs.rss")
-    if not feed:
-        return []
-    for e in feed.entries:
-        t = e.get("title", "")
-        c = ""
-        if ": " in t:
-            c, t = t.split(": ", 1)
-        jobs.append(job(t.strip(), c.strip(), "Remote", e.get("link",""), "WeWorkRemotely", e.get("summary","")))
+    for url in [
+        "https://weworkremotely.com/categories/remote-sales-and-marketing-jobs.rss",
+        "https://weworkremotely.com/categories/all-other-remote-jobs.rss",
+    ]:
+        feed = fetch_rss(url)
+        if not feed:
+            continue
+        for e in feed.entries:
+            t = e.get("title", "")
+            c = ""
+            if ": " in t:
+                c, t = t.split(": ", 1)
+            jobs.append(make_job(t.strip(), c.strip(), "Remote", e.get("link",""), "WeWorkRemotely", e.get("summary","")))
     logger.info(f"WeWorkRemotely: {len(jobs)}")
     return jobs
+
+# ─── Source 4: RemoteOK ───────────────────────────────────────────────────────
 
 def src_remoteok():
     jobs = []
     try:
-        r = requests.get("https://remoteok.com/api?tags=crypto,web3,community",
-                         headers={**HEADERS, "Accept": "application/json"}, timeout=8)
+        r = requests.get(
+            "https://remoteok.com/api?tags=crypto,web3,community,marketing,non-tech",
+            headers={**HEADERS, "Accept": "application/json"}, timeout=10
+        )
         if r.status_code != 200:
             return []
         data = r.json()
@@ -128,7 +162,7 @@ def src_remoteok():
             if not isinstance(j, dict) or not j.get("url"):
                 continue
             tags = j.get("tags", [])
-            jobs.append(job(
+            jobs.append(make_job(
                 j.get("position",""), j.get("company",""), "Remote",
                 j.get("url",""), "RemoteOK",
                 j.get("description",""),
@@ -140,14 +174,16 @@ def src_remoteok():
         logger.error(f"RemoteOK: {e}")
     return jobs
 
+# ─── Source 5: Jobicy API ─────────────────────────────────────────────────────
+
 def src_jobicy():
     jobs = []
     seen = set()
-    for q in ["community+manager+web3", "ambassador+crypto", "growth+web3"]:
+    for q in ["community+manager", "ambassador+crypto", "growth+web3", "discord+moderator"]:
         try:
             r = requests.get(
                 f"https://jobicy.com/api/v2/remote-jobs?count=50&jobCategory=marketing&keyWord={q}",
-                headers=HEADERS, timeout=8)
+                headers=HEADERS, timeout=10)
             if r.status_code != 200:
                 continue
             for j in r.json().get("jobs", []):
@@ -155,15 +191,40 @@ def src_jobicy():
                 if not u or u in seen:
                     continue
                 seen.add(u)
-                jobs.append(job(
+                jobs.append(make_job(
                     j.get("jobTitle",""), j.get("companyName",""),
                     j.get("jobGeo","Remote"), u, "Jobicy",
                     j.get("jobDescription",""), [j.get("jobCategory","")]
                 ))
+            time.sleep(0.3)
         except Exception as e:
             logger.error(f"Jobicy {q}: {e}")
     logger.info(f"Jobicy: {len(jobs)}")
     return jobs
+
+# ─── Source 6: Indeed RSS ─────────────────────────────────────────────────────
+
+def src_indeed():
+    jobs = []
+    seen = set()
+    for q in ["web3+community+manager", "crypto+ambassador+remote", "dao+community+manager"]:
+        try:
+            feed = fetch_rss(f"https://www.indeed.com/rss?q={q}&l=remote&sort=date")
+            if not feed:
+                continue
+            for e in feed.entries:
+                link = e.get("link","")
+                if not link or link in seen:
+                    continue
+                seen.add(link)
+                t, c = split_co(e.get("title",""))
+                jobs.append(make_job(t, c, "Remote", link, "Indeed", e.get("summary","")))
+        except Exception as e:
+            logger.error(f"Indeed {q}: {e}")
+    logger.info(f"Indeed: {len(jobs)}")
+    return jobs
+
+# ─── Scoring ─────────────────────────────────────────────────────────────────
 
 def score(j):
     text = f"{j['title']} {j['description']} {' '.join(j['tags'])}".lower()
@@ -173,6 +234,8 @@ def score(j):
 def excluded(j):
     text = f"{j['title']} {j['description']}".lower()
     return any(k in text for k in EXCLUDE_LIST)
+
+# ─── Telegram ────────────────────────────────────────────────────────────────
 
 def tg(text):
     if not BOT_TOKEN or not CHAT_ID:
@@ -197,19 +260,21 @@ def fmt(j, rank):
     lines += [f"📊 Match: {bar} {s:.0f}%", f"🔗 [Apply Now]({j['url']})", f"_via {j['source']}_"]
     return "\n".join(lines)
 
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
 def run_scan():
     if not BOT_TOKEN or not CHAT_ID:
         logger.error("Missing credentials")
         return
 
     all_jobs = []
-    for fn in [src_cryptojobslist, src_web3career, src_weworkremotely, src_remoteok, src_jobicy]:
+    for fn in [src_cryptojobslist, src_web3career, src_weworkremotely, src_remoteok, src_jobicy, src_indeed]:
         try:
             all_jobs += fn()
         except Exception as e:
             logger.error(f"{fn.__name__}: {e}")
 
-    logger.info(f"Total: {len(all_jobs)}")
+    logger.info(f"Total raw: {len(all_jobs)}")
 
     seen = load_seen()
     unique = {}
@@ -222,7 +287,7 @@ def run_scan():
         if excluded(j):
             continue
         s = score(j)
-        if s >= 15:
+        if s >= 10:
             j["_score"] = s
             scored.append(j)
 
@@ -242,6 +307,8 @@ def run_scan():
     for i, j in enumerate(top, 1):
         tg(fmt(j, i))
         time.sleep(0.3)
+
+# ─── Vercel ──────────────────────────────────────────────────────────────────
 
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
