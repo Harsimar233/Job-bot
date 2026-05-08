@@ -177,7 +177,7 @@ def scrape_cryptojobslist():
     jobs = []
     for path in ["/community", "/marketing", "/support"]:
         try:
-            r = scrape_url(f"https://cryptojobslist.com{path}", render=True, timeout=60)
+            r = scrape_url(f"https://cryptojobslist.com{path}", render=True)
             soup = BeautifulSoup(r.text, "html.parser")
             for tag in soup.find_all(["h2","h3","span"], string=re.compile(r'.{6,}', re.I)):
                 title = tag.get_text(strip=True)
@@ -209,9 +209,8 @@ def scrape_cryptocurrencyjobs():
     ]:
         try:
             r = scrape_url(target, render=True, timeout=45)
-          soup = BeautifulSoup(r.text, "html.parser")
-print(f"CryptoJobsList HTML snippet: {r.text[:500]}")
-for tag in soup.find_all(["h2","h3","span"], string=re.compile(r'.{6,}', re.I)):
+            soup = BeautifulSoup(r.text, "html.parser")
+            for tag in soup.find_all(["h2","h3"], string=re.compile(r'.{6,}', re.I)):
                 title = tag.get_text(strip=True)
                 if not is_relevant(title):
                     continue
