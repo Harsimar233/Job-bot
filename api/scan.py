@@ -13,7 +13,7 @@ KEYWORDS = [
     "community operations","community building","community advocate",
     "community growth","web3 community","crypto community","dao community",
     "nft community","discord moderator","discord mod","telegram moderator",
-    "moderator","content moderator","mod",
+    "moderator","content moderator",
     "customer support","customer success","support specialist","support agent",
     "support manager","live chat support","help desk",
     "social media manager","social media lead","social media strategist",
@@ -30,6 +30,15 @@ KEYWORDS = [
     "regional ambassador","ecosystem growth",
 ]
 
+# Job must contain at least one of these to be included
+CRYPTO_SIGNALS = [
+    "web3","crypto","blockchain","defi","nft","dao","dex","protocol",
+    "token","wallet","exchange","binance","coinbase","uniswap","polygon",
+    "arbitrum","optimism","solana","ethereum","bitcoin","chainlink",
+    "decentralized","on-chain","layer2","layer 2","l2","metaverse",
+    "gamefi","play to earn","p2e","yield","staking","airdrop",
+]
+
 EXCLUDE = [
     "engineer","developer","software","solidity","backend",
     "frontend","devops","data scientist","machine learning",
@@ -41,7 +50,6 @@ EXCLUDE = [
 FAKE_PATTERNS = [
     r"post a job", r"browse jobs", r"view all jobs",
     r"find jobs", r"job board", r"get hired now",
-    r"hiring.*talent pool", r"submit.*resume",
 ]
 
 CUTOFF_DAYS = 7
@@ -49,9 +57,22 @@ CUTOFF_DAYS = 7
 def uid(title, company):
     return hashlib.md5(f"{title}{company}".lower().encode()).hexdigest()[:10]
 
-def is_relevant(text):
-    t = text.lower().strip()
-    if len(t) < 6 or len(t) > 150:
+def is_relevant(title, description=""):
+    t = (title + " " + description).lower().strip()
+    if len(title) < 6 or len(title) > 150:
+        return False
+    if any(re.search(p, title.lower()) for p in FAKE_PATTERNS):
+        return False
+    if any(e in title.lower() for e in EXCLUDE):
+        return False
+    has_role = any(k in t for k in KEYWORDS)
+    has_crypto = any(s in t for s in CRYPTO_SIGNALS)
+    return has_role and has_crypto
+
+def is_relevant_loose(title, description=""):
+    """For crypto-specific boards where all jobs are crypto — skip signal check."""
+    t = title.lower().strip()
+    if len(title) < 6 or len(title) > 150:
         return False
     if any(re.search(p, t) for p in FAKE_PATTERNS):
         return False
@@ -118,7 +139,8 @@ def scrape_wwr():
                     company, title = parts[0].strip(), parts[1].strip()
                 else:
                     title, company = raw, ""
-                if is_relevant(title):
+                desc = e.get("summary", "")
+                if is_relevant(title, desc):
                     jobs.append({"title": title, "company": company, "url": e.get("link",""), "source": "WeWorkRemotely", "date": e.get("published","")})
         except Exception as ex:
             print(f"WWR error: {ex}")
@@ -141,7 +163,8 @@ def scrape_remoteok():
                 continue
             title = j.get("position", "")
             tags  = " ".join(j.get("tags", []))
-            if is_relevant(title) or is_relevant(tags):
+            desc  = j.get("description", "")
+            if is_relevant(title, tags + " " + desc):
                 jobs.append({"title": title, "company": j.get("company",""), "url": j.get("url",""), "source": "RemoteOK", "date": date_str})
     except Exception as e:
         print(f"RemoteOK error: {e}")
@@ -171,7 +194,8 @@ def scrape_jobicy():
                     continue
                 title = j.get("jobTitle","")
                 url = j.get("url","")
-                if is_relevant(title) and url not in seen:
+                desc = j.get("jobDescription","")
+                if is_relevant(title, desc) and url not in seen:
                     seen.add(url)
                     jobs.append({"title": title, "company": j.get("companyName",""), "url": url, "source": "Jobicy", "date": j.get("pubDate","")})
         except Exception as e:
@@ -193,7 +217,7 @@ def scrape_web3career():
             soup = BeautifulSoup(r.text, "html.parser")
             for tag in soup.find_all("h2"):
                 title = tag.get_text(strip=True)
-                if not is_relevant(title):
+                if not is_relevant_loose(title):
                     continue
                 date_tag = tag.find_next("time")
                 date_str = date_tag.get("datetime","") if date_tag else ""
@@ -216,145 +240,86 @@ def scrape_web3career():
     return jobs
 
 
-# ── SOURCE 5: Indeed RSS ──────────────────────────────────────────────────────
+# ── SOURCE 5: Greenhouse API (crypto companies) ───────────────────────────────
 
-def scrape_indeed():
+# These are real crypto companies using Greenhouse for hiring
+GREENHOUSE_COMPANIES = [
+    "coinbase", "uniswaplabs", "chainlink-labs", "polygon-labs",
+    "arbitrum", "optimism-pbc", "aave", "opensea", "dydx",
+    "consensys", "ledger", "kraken", "gemini", "ripple",
+    "blockchain-com", "bitgo", "anchorage", "alchemy",
+    "infura", "metamask", "zapper", "zerion",
+]
+
+def scrape_greenhouse():
     jobs = []
     seen = set()
-    queries = [
-        "web3+community+manager+remote", "crypto+community+manager+remote",
-        "web3+marketing+manager+remote", "crypto+social+media+manager+remote",
-        "crypto+ambassador+manager+remote", "web3+kol+manager+remote",
-        "crypto+influencer+marketing+remote", "dao+community+moderator+remote",
-        "blockchain+growth+manager+remote", "web3+customer+support+remote",
-    ]
-    for q in queries:
+    for company in GREENHOUSE_COMPANIES:
         try:
-            feed = feedparser.parse(f"https://www.indeed.com/rss?q={q}&sort=date")
-            for e in feed.entries:
-                if not is_recent(e.get("published","")):
+            r = requests.get(
+                f"https://boards-api.greenhouse.io/v1/boards/{company}/jobs?content=true",
+                headers={"User-Agent": "Mozilla/5.0"}, timeout=10
+            )
+            if r.status_code != 200:
+                continue
+            for j in r.json().get("jobs", []):
+                title = j.get("title", "")
+                url = j.get("absolute_url", "")
+                updated = j.get("updated_at", "")
+                if not is_recent(updated):
                     continue
-                link = e.get("link","")
-                title = e.get("title","")
-                if not link or link in seen or not is_relevant(title):
-                    continue
-                seen.add(link)
-                jobs.append({"title": title, "company": "", "url": link, "source": "Indeed", "date": e.get("published","")})
+                content = j.get("content", "")
+                if is_relevant_loose(title, content) and url not in seen:
+                    seen.add(url)
+                    location = ""
+                    locs = j.get("location", {})
+                    if locs:
+                        location = locs.get("name", "")
+                    jobs.append({"title": title, "company": company.replace("-", " ").title(), "url": url, "source": "Greenhouse", "date": updated, "location": location})
         except Exception as e:
-            print(f"Indeed error: {e}")
-    print(f"Indeed: {len(jobs)}")
+            print(f"Greenhouse {company} error: {e}")
+    print(f"Greenhouse: {len(jobs)}")
     return jobs
 
 
-# ── SOURCE 6: crypto.jobs ─────────────────────────────────────────────────────
+# ── SOURCE 6: Lever API (crypto companies) ────────────────────────────────────
 
-def scrape_cryptodotjobs():
+LEVER_COMPANIES = [
+    "binance", "ftx", "moonpay", "fireblocks", "chainalysis",
+    "nansen", "dune", "the-graph", "livepeer", "filecoin",
+    "protocol-labs", "near", "flow", "immutable", "sandbox",
+    "decentraland", "axie-infinity", "sky-mavis", "animoca",
+    "yuga-labs", "magic-eden", "blur",
+]
+
+def scrape_lever():
     jobs = []
     seen = set()
-    for path in ["/jobs?category=community-manager", "/jobs?category=customer-support",
-                 "/jobs?category=marketing", "/jobs?category=social-media"]:
+    for company in LEVER_COMPANIES:
         try:
-            r = scrape_url(f"https://crypto.jobs{path}", render=True, timeout=45)
-            soup = BeautifulSoup(r.text, "html.parser")
-            for tag in soup.find_all(["h2","h3"]):
-                title = tag.get_text(strip=True)
-                if not is_relevant(title):
-                    continue
-                date_tag = tag.find_next("time")
-                date_str = date_tag.get("datetime","") if date_tag else ""
-                if date_str and not is_recent(date_str):
-                    continue
-                parent = tag.find_parent("a")
-                if not parent:
-                    continue
-                href = parent.get("href","")
-                link = ("https://crypto.jobs" + href) if href.startswith("/") else href
-                if link in seen:
-                    continue
-                seen.add(link)
-                company_tag = tag.find_next(["span","p","h4"])
-                company = company_tag.get_text(strip=True) if company_tag else ""
-                jobs.append({"title": title, "company": company, "url": link, "source": "crypto.jobs", "date": date_str})
+            r = requests.get(
+                f"https://api.lever.co/v0/postings/{company}?mode=json",
+                headers={"User-Agent": "Mozilla/5.0"}, timeout=10
+            )
+            if r.status_code != 200:
+                continue
+            for j in r.json():
+                title = j.get("text", "")
+                url = j.get("hostedUrl", "")
+                created = j.get("createdAt", 0)
+                # Lever uses millisecond timestamps
+                if created:
+                    date_str = datetime.fromtimestamp(created/1000, tz=timezone.utc).isoformat()
+                    if not is_recent(date_str):
+                        continue
+                desc = j.get("descriptionPlain", "")
+                if is_relevant_loose(title, desc) and url not in seen:
+                    seen.add(url)
+                    location = j.get("categories", {}).get("location", "Remote")
+                    jobs.append({"title": title, "company": company.replace("-", " ").title(), "url": url, "source": "Lever", "date": date_str if created else "", "location": location})
         except Exception as e:
-            print(f"crypto.jobs error: {e}")
-    print(f"crypto.jobs: {len(jobs)}")
-    return jobs
-
-
-# ── SOURCE 7: remote3.co ──────────────────────────────────────────────────────
-
-def scrape_remote3():
-    jobs = []
-    seen = set()
-    for path in ["/jobs?tag=community-manager", "/jobs?tag=customer-support",
-                 "/jobs?tag=social-media", "/jobs?tag=moderator",
-                 "/jobs?tag=marketing", "/jobs?tag=ambassador"]:
-        try:
-            r = scrape_url(f"https://remote3.co{path}", render=True, timeout=45)
-            soup = BeautifulSoup(r.text, "html.parser")
-            for tag in soup.find_all(["h2","h3"]):
-                title = tag.get_text(strip=True)
-                if not is_relevant(title):
-                    continue
-                date_tag = tag.find_next("time")
-                date_str = date_tag.get("datetime","") if date_tag else ""
-                if date_str and not is_recent(date_str):
-                    continue
-                parent = tag.find_parent("a")
-                if not parent:
-                    continue
-                href = parent.get("href","")
-                link = ("https://remote3.co" + href) if href.startswith("/") else href
-                if link in seen:
-                    continue
-                seen.add(link)
-                company_tag = tag.find_next(["span","p"])
-                company = company_tag.get_text(strip=True) if company_tag else ""
-                jobs.append({"title": title, "company": company, "url": link, "source": "Remote3", "date": date_str})
-        except Exception as e:
-            print(f"Remote3 error: {e}")
-    print(f"Remote3: {len(jobs)}")
-    return jobs
-
-
-# ── SOURCE 8: Telegram Channels via RSSHub ───────────────────────────────────
-
-def scrape_telegram_channels():
-    jobs = []
-    seen = set()
-    # Public Telegram job channels converted to RSS via rsshub.app
-    channels = [
-        ("cryptojobslist",    "CryptoJobsList TG"),
-        ("web3_jobs",         "Web3Jobs TG"),
-        ("remote3co",         "Remote3 TG"),
-        ("cryptocurrencyjobs","CryptocurrencyJobs TG"),
-        ("web3jobsio",        "Web3Jobs.io TG"),
-        ("kolmanagerjobs",    "KOL Manager Jobs TG"),
-        ("web3marketing",     "Web3 Marketing TG"),
-    ]
-    for channel, source_name in channels:
-        try:
-            # Try rsshub.app first
-            feed = feedparser.parse(f"https://rsshub.app/telegram/channel/{channel}")
-            if not feed.entries:
-                # Fallback to another rsshub instance
-                feed = feedparser.parse(f"https://rsshub.vercel.app/telegram/channel/{channel}")
-            for e in feed.entries:
-                if not is_recent(e.get("published","")):
-                    continue
-                # Telegram posts don't have titles — use summary as title
-                title = e.get("title","") or e.get("summary","")[:100]
-                title = re.sub(r'<[^>]+>', '', title).strip()  # strip HTML
-                link = e.get("link","")
-                if not link or link in seen:
-                    continue
-                if not is_relevant(title):
-                    continue
-                seen.add(link)
-                jobs.append({"title": title, "company": "", "url": link, "source": source_name, "date": e.get("published","")})
-        except Exception as e:
-            print(f"TG {channel} error: {e}")
-    print(f"Telegram channels: {len(jobs)}")
+            print(f"Lever {company} error: {e}")
+    print(f"Lever: {len(jobs)}")
     return jobs
 
 
@@ -379,10 +344,8 @@ def run_scan():
     all_jobs += scrape_remoteok()
     all_jobs += scrape_jobicy()
     all_jobs += scrape_web3career()
-    all_jobs += scrape_indeed()
-    all_jobs += scrape_cryptodotjobs()
-    all_jobs += scrape_remote3()
-    all_jobs += scrape_telegram_channels()
+    all_jobs += scrape_greenhouse()
+    all_jobs += scrape_lever()
 
     seen, new_jobs = set(), []
     for j in all_jobs:
@@ -403,9 +366,10 @@ def run_scan():
 
     for j in new_jobs[:20]:
         date_label = f"\n📅 {fmt_date(j.get('date',''))}" if j.get("date") else ""
+        location_label = f"\n📍 {j['location']}" if j.get("location") else ""
         send_telegram(
             f"💼 <b>{j['title']}</b>\n"
-            f"🏢 {j['company']}{date_label}\n"
+            f"🏢 {j['company']}{location_label}{date_label}\n"
             f"🔗 <a href='{j['url']}'>Apply Now</a>\n"
             f"📌 via {j['source']}"
         )
