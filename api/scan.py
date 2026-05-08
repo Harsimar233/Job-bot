@@ -9,27 +9,39 @@ CHAT_ID     = os.environ.get("CHAT_ID", "")
 SCRAPER_KEY = os.environ.get("SCRAPER_KEY", "")
 
 KEYWORDS = [
-    "community manager","community lead","community moderator",
-    "discord moderator","telegram moderator","moderator",
-    "customer support","customer success","support specialist",
-    "social media manager","social media","content moderator",
-    "community growth","web3 community","crypto community",
-    "ambassador","community operations","community building",
-    "community advocate","dao community","nft community",
+    "community manager","community lead","community moderator","community mod",
+    "community operations","community building","community advocate",
+    "community growth","web3 community","crypto community","dao community",
+    "nft community","discord moderator","discord mod","telegram moderator",
+    "moderator","content moderator","mod",
+    "customer support","customer success","support specialist","support agent",
+    "support manager","live chat support","help desk",
+    "social media manager","social media lead","social media strategist",
+    "social media coordinator","social media growth","content creator",
+    "content strategist","twitter manager","x manager",
+    "marketing manager","marketing lead","growth marketing","growth manager",
+    "growth hacker","marketing coordinator","crypto marketing",
+    "web3 marketing","blockchain marketing","defi marketing",
+    "marketing specialist","performance marketing","digital marketing",
+    "kol manager","kol lead","influencer manager","influencer marketing",
+    "partnerships manager","partnership lead","bd manager",
+    "business development","ecosystem partnerships",
+    "ambassador","ambassador program","ambassador lead","ambassador manager",
+    "regional ambassador","ecosystem growth",
 ]
 
 EXCLUDE = [
     "engineer","developer","software","solidity","backend",
     "frontend","devops","data scientist","machine learning",
     "accountant","lawyer","designer","staff engineer",
-    "mandarin","chinese speaker","native chinese",
-    "russian speaker","native russian","native japanese",
+    "mandarin only","chinese speaker required","native chinese required",
+    "russian speaker required","native japanese required",
 ]
 
 FAKE_PATTERNS = [
-    r"hiring.*talent", r"latest.*jobs", r"success stor",
-    r"post a job", r"browse jobs", r"view all",
-    r"find jobs", r"job board", r"get hired",
+    r"post a job", r"browse jobs", r"view all jobs",
+    r"find jobs", r"job board", r"get hired now",
+    r"hiring.*talent pool", r"submit.*resume",
 ]
 
 CUTOFF_DAYS = 7
@@ -39,7 +51,7 @@ def uid(title, company):
 
 def is_relevant(text):
     t = text.lower().strip()
-    if len(t) < 6 or len(t) > 120:
+    if len(t) < 6 or len(t) > 150:
         return False
     if any(re.search(p, t) for p in FAKE_PATTERNS):
         return False
@@ -92,7 +104,7 @@ def scrape_url(url, timeout=25, render=False):
 
 def scrape_wwr():
     jobs = []
-    for cat in ["remote-customer-support-jobs", "remote-marketing-jobs"]:
+    for cat in ["remote-customer-support-jobs", "remote-marketing-jobs", "all-other-remote-jobs"]:
         try:
             feed = feedparser.parse(f"https://weworkremotely.com/categories/{cat}.rss")
             for e in feed.entries:
@@ -119,7 +131,10 @@ def scrape_wwr():
 def scrape_remoteok():
     jobs = []
     try:
-        r = requests.get("https://remoteok.com/api", headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        r = requests.get(
+            "https://remoteok.com/api?tags=community,marketing,crypto,web3,social-media,non-tech",
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=10
+        )
         for j in r.json()[1:]:
             date_str = j.get("date", "")
             if not is_recent(date_str):
@@ -138,15 +153,27 @@ def scrape_remoteok():
 
 def scrape_jobicy():
     jobs = []
-    for q in ["community+manager","moderator","customer+support","social+media+manager","ambassador"]:
+    seen = set()
+    queries = [
+        "community+manager", "moderator", "customer+support",
+        "social+media+manager", "ambassador", "kol+manager",
+        "influencer+marketing", "marketing+manager",
+        "growth+manager", "partnerships+manager",
+    ]
+    for q in queries:
         try:
-            r = requests.get(f"https://jobicy.com/api/v2/remote-jobs?count=20&tag={q}", headers={"User-Agent":"Mozilla/5.0"}, timeout=10)
+            r = requests.get(
+                f"https://jobicy.com/api/v2/remote-jobs?count=20&tag={q}",
+                headers={"User-Agent":"Mozilla/5.0"}, timeout=10
+            )
             for j in r.json().get("jobs",[]):
                 if not is_recent(j.get("pubDate","")):
                     continue
                 title = j.get("jobTitle","")
-                if is_relevant(title):
-                    jobs.append({"title": title, "company": j.get("companyName",""), "url": j.get("url",""), "source": "Jobicy", "date": j.get("pubDate","")})
+                url = j.get("url","")
+                if is_relevant(title) and url not in seen:
+                    seen.add(url)
+                    jobs.append({"title": title, "company": j.get("companyName",""), "url": url, "source": "Jobicy", "date": j.get("pubDate","")})
         except Exception as e:
             print(f"Jobicy error: {e}")
     print(f"Jobicy: {len(jobs)}")
@@ -157,7 +184,10 @@ def scrape_jobicy():
 
 def scrape_web3career():
     jobs = []
-    for q in ["community-manager", "moderator", "customer-support", "social-media-manager"]:
+    seen = set()
+    for q in ["community-manager", "moderator", "customer-support",
+              "social-media-manager", "marketing", "ambassador",
+              "growth", "partnerships"]:
         try:
             r = scrape_url(f"https://web3.career/{q}-jobs")
             soup = BeautifulSoup(r.text, "html.parser")
@@ -174,6 +204,9 @@ def scrape_web3career():
                     continue
                 href = parent.get("href","")
                 link = ("https://web3.career" + href) if href.startswith("/") else href
+                if link in seen:
+                    continue
+                seen.add(link)
                 company_tag = tag.find_next("h3")
                 company = company_tag.get_text(strip=True) if company_tag else ""
                 jobs.append({"title": title, "company": company, "url": link, "source": "Web3.career", "date": date_str})
@@ -189,12 +222,11 @@ def scrape_indeed():
     jobs = []
     seen = set()
     queries = [
-        "web3+community+manager+remote",
-        "crypto+community+manager+remote",
-        "dao+community+manager+remote",
-        "crypto+discord+moderator+remote",
-        "web3+customer+support+remote",
-        "crypto+social+media+manager+remote",
+        "web3+community+manager+remote", "crypto+community+manager+remote",
+        "web3+marketing+manager+remote", "crypto+social+media+manager+remote",
+        "crypto+ambassador+manager+remote", "web3+kol+manager+remote",
+        "crypto+influencer+marketing+remote", "dao+community+moderator+remote",
+        "blockchain+growth+manager+remote", "web3+customer+support+remote",
     ]
     for q in queries:
         try:
@@ -203,14 +235,11 @@ def scrape_indeed():
                 if not is_recent(e.get("published","")):
                     continue
                 link = e.get("link","")
-                if not link or link in seen:
-                    continue
                 title = e.get("title","")
-                if not is_relevant(title):
+                if not link or link in seen or not is_relevant(title):
                     continue
                 seen.add(link)
-                company = e.get("source", {}).get("value","") if isinstance(e.get("source"), dict) else ""
-                jobs.append({"title": title, "company": company, "url": link, "source": "Indeed", "date": e.get("published","")})
+                jobs.append({"title": title, "company": "", "url": link, "source": "Indeed", "date": e.get("published","")})
         except Exception as e:
             print(f"Indeed error: {e}")
     print(f"Indeed: {len(jobs)}")
@@ -221,11 +250,9 @@ def scrape_indeed():
 
 def scrape_cryptodotjobs():
     jobs = []
-    for path in [
-        "/jobs?category=community-manager",
-        "/jobs?category=customer-support",
-        "/jobs?category=marketing",
-    ]:
+    seen = set()
+    for path in ["/jobs?category=community-manager", "/jobs?category=customer-support",
+                 "/jobs?category=marketing", "/jobs?category=social-media"]:
         try:
             r = scrape_url(f"https://crypto.jobs{path}", render=True, timeout=45)
             soup = BeautifulSoup(r.text, "html.parser")
@@ -242,6 +269,9 @@ def scrape_cryptodotjobs():
                     continue
                 href = parent.get("href","")
                 link = ("https://crypto.jobs" + href) if href.startswith("/") else href
+                if link in seen:
+                    continue
+                seen.add(link)
                 company_tag = tag.find_next(["span","p","h4"])
                 company = company_tag.get_text(strip=True) if company_tag else ""
                 jobs.append({"title": title, "company": company, "url": link, "source": "crypto.jobs", "date": date_str})
@@ -255,12 +285,10 @@ def scrape_cryptodotjobs():
 
 def scrape_remote3():
     jobs = []
-    for path in [
-        "/jobs?tag=community-manager",
-        "/jobs?tag=customer-support",
-        "/jobs?tag=social-media",
-        "/jobs?tag=moderator",
-    ]:
+    seen = set()
+    for path in ["/jobs?tag=community-manager", "/jobs?tag=customer-support",
+                 "/jobs?tag=social-media", "/jobs?tag=moderator",
+                 "/jobs?tag=marketing", "/jobs?tag=ambassador"]:
         try:
             r = scrape_url(f"https://remote3.co{path}", render=True, timeout=45)
             soup = BeautifulSoup(r.text, "html.parser")
@@ -277,6 +305,9 @@ def scrape_remote3():
                     continue
                 href = parent.get("href","")
                 link = ("https://remote3.co" + href) if href.startswith("/") else href
+                if link in seen:
+                    continue
+                seen.add(link)
                 company_tag = tag.find_next(["span","p"])
                 company = company_tag.get_text(strip=True) if company_tag else ""
                 jobs.append({"title": title, "company": company, "url": link, "source": "Remote3", "date": date_str})
@@ -286,7 +317,48 @@ def scrape_remote3():
     return jobs
 
 
-# ── Telegram ──────────────────────────────────────────────────────────────────
+# ── SOURCE 8: Telegram Channels via RSSHub ───────────────────────────────────
+
+def scrape_telegram_channels():
+    jobs = []
+    seen = set()
+    # Public Telegram job channels converted to RSS via rsshub.app
+    channels = [
+        ("cryptojobslist",    "CryptoJobsList TG"),
+        ("web3_jobs",         "Web3Jobs TG"),
+        ("remote3co",         "Remote3 TG"),
+        ("cryptocurrencyjobs","CryptocurrencyJobs TG"),
+        ("web3jobsio",        "Web3Jobs.io TG"),
+        ("kolmanagerjobs",    "KOL Manager Jobs TG"),
+        ("web3marketing",     "Web3 Marketing TG"),
+    ]
+    for channel, source_name in channels:
+        try:
+            # Try rsshub.app first
+            feed = feedparser.parse(f"https://rsshub.app/telegram/channel/{channel}")
+            if not feed.entries:
+                # Fallback to another rsshub instance
+                feed = feedparser.parse(f"https://rsshub.vercel.app/telegram/channel/{channel}")
+            for e in feed.entries:
+                if not is_recent(e.get("published","")):
+                    continue
+                # Telegram posts don't have titles — use summary as title
+                title = e.get("title","") or e.get("summary","")[:100]
+                title = re.sub(r'<[^>]+>', '', title).strip()  # strip HTML
+                link = e.get("link","")
+                if not link or link in seen:
+                    continue
+                if not is_relevant(title):
+                    continue
+                seen.add(link)
+                jobs.append({"title": title, "company": "", "url": link, "source": source_name, "date": e.get("published","")})
+        except Exception as e:
+            print(f"TG {channel} error: {e}")
+    print(f"Telegram channels: {len(jobs)}")
+    return jobs
+
+
+# ── Telegram sender ───────────────────────────────────────────────────────────
 
 def send_telegram(msg):
     if not BOT_TOKEN or not CHAT_ID:
@@ -310,6 +382,7 @@ def run_scan():
     all_jobs += scrape_indeed()
     all_jobs += scrape_cryptodotjobs()
     all_jobs += scrape_remote3()
+    all_jobs += scrape_telegram_channels()
 
     seen, new_jobs = set(), []
     for j in all_jobs:
