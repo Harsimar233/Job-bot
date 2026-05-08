@@ -44,7 +44,7 @@ EXCLUDE = [
     "frontend","devops","data scientist","machine learning",
     "accountant","lawyer","designer","staff engineer",
     "mandarin only","chinese speaker required","native chinese required",
-    "russian speaker required","native japanese required",
+    "russian speaker required","native japanese required",     "spanish","portuguese","french required","german required",     "arabic required","hindi required","turkish required",
 ]
 
 FAKE_PATTERNS = [
