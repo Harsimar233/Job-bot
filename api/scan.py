@@ -266,9 +266,19 @@ def run_scan():
         all_jobs += scrape_cryptocurrencyjobs()
         all_jobs += scrape_jobstash()
 
+ from datetime import datetime, timezone, timedelta
+    cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+
     seen, new_jobs = set(), []
     for j in all_jobs:
         jid = uid(j["title"], j["company"])
+        pub = j.get("published")
+        if pub:
+            try:
+                if pub < cutoff:
+                    continue
+            except:
+                pass
         if jid not in seen:
             new_jobs.append(j)
             seen.add(jid)
