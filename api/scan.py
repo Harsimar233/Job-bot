@@ -52,7 +52,6 @@ def score(title):
     return min(sum(10 for k in KEYWORDS if k in t), 100)
 
 def parse_date(date_str):
-    """Try to parse a date string into an aware datetime."""
     if not date_str:
         return None
     try:
@@ -66,14 +65,19 @@ def parse_date(date_str):
     return None
 
 def is_recent(date_str, days=CUTOFF_DAYS):
-    """Return True if date is within the last N days, or if date is unknown."""
     dt = parse_date(date_str)
     if dt is None:
-        return True  # No date info — include it
+        return True
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     return dt >= cutoff
+
+def fmt_date(date_str):
+    dt = parse_date(date_str)
+    if not dt:
+        return ""
+    return dt.strftime("%-d %b %Y")
 
 def scrape_url(url, timeout=25, render=False):
     if SCRAPER_KEY:
@@ -152,7 +156,6 @@ def scrape_web3career():
                 title = tag.get_text(strip=True)
                 if not is_relevant(title):
                     continue
-                # Check for date near the job listing
                 date_tag = tag.find_next("time")
                 date_str = date_tag.get("datetime","") if date_tag else ""
                 if date_str and not is_recent(date_str):
@@ -174,9 +177,9 @@ def scrape_cryptojobslist():
     jobs = []
     for path in ["/community", "/marketing", "/support"]:
         try:
-            r = scrape_url(f"https://cryptojobslist.com{path}")
+            r = scrape_url(f"https://cryptojobslist.com{path}", render=True)
             soup = BeautifulSoup(r.text, "html.parser")
-            for tag in soup.find_all("h2"):
+            for tag in soup.find_all(["h2","h3","span"], string=re.compile(r'.{6,}', re.I)):
                 title = tag.get_text(strip=True)
                 if not is_relevant(title):
                     continue
@@ -205,9 +208,9 @@ def scrape_cryptocurrencyjobs():
         "https://cryptocurrencyjobs.co/support/",
     ]:
         try:
-            r = scrape_url(target, render=True)
+            r = scrape_url(target, render=True, timeout=45)
             soup = BeautifulSoup(r.text, "html.parser")
-            for tag in soup.find_all(["h2","h3"]):
+            for tag in soup.find_all(["h2","h3"], string=re.compile(r'.{6,}', re.I)):
                 title = tag.get_text(strip=True)
                 if not is_relevant(title):
                     continue
@@ -240,12 +243,6 @@ def send_telegram(msg):
         json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML", "disable_web_page_preview": True},
         timeout=10
     )
-
-def fmt_date(date_str):
-    dt = parse_date(date_str)
-    if not dt:
-        return ""
-    return dt.strftime("%-d %b %Y")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
