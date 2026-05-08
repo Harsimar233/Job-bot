@@ -19,3 +19,4 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
           SCRAPER_KEY: ${{ secrets.SCRAPER_KEY }}
+          RUN_MODE: full
