@@ -88,7 +88,7 @@ def scrape_url(url, timeout=25, render=False):
     return requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=timeout)
 
 
-# ── SOURCES ───────────────────────────────────────────────────────────────────
+# ── SOURCE 1: WeWorkRemotely ──────────────────────────────────────────────────
 
 def scrape_wwr():
     jobs = []
@@ -109,9 +109,12 @@ def scrape_wwr():
                 if is_relevant(title):
                     jobs.append({"title": title, "company": company, "url": e.get("link",""), "source": "WeWorkRemotely", "date": e.get("published","")})
         except Exception as ex:
-            print(f"WWR: {ex}")
+            print(f"WWR error: {ex}")
     print(f"WWR: {len(jobs)}")
     return jobs
+
+
+# ── SOURCE 2: RemoteOK ────────────────────────────────────────────────────────
 
 def scrape_remoteok():
     jobs = []
@@ -126,9 +129,12 @@ def scrape_remoteok():
             if is_relevant(title) or is_relevant(tags):
                 jobs.append({"title": title, "company": j.get("company",""), "url": j.get("url",""), "source": "RemoteOK", "date": date_str})
     except Exception as e:
-        print(f"RemoteOK: {e}")
+        print(f"RemoteOK error: {e}")
     print(f"RemoteOK: {len(jobs)}")
     return jobs
+
+
+# ── SOURCE 3: Jobicy API ──────────────────────────────────────────────────────
 
 def scrape_jobicy():
     jobs = []
@@ -142,9 +148,12 @@ def scrape_jobicy():
                 if is_relevant(title):
                     jobs.append({"title": title, "company": j.get("companyName",""), "url": j.get("url",""), "source": "Jobicy", "date": j.get("pubDate","")})
         except Exception as e:
-            print(f"Jobicy: {e}")
+            print(f"Jobicy error: {e}")
     print(f"Jobicy: {len(jobs)}")
     return jobs
+
+
+# ── SOURCE 4: Web3.career ─────────────────────────────────────────────────────
 
 def scrape_web3career():
     jobs = []
@@ -169,48 +178,58 @@ def scrape_web3career():
                 company = company_tag.get_text(strip=True) if company_tag else ""
                 jobs.append({"title": title, "company": company, "url": link, "source": "Web3.career", "date": date_str})
         except Exception as e:
-            print(f"Web3.career: {e}")
+            print(f"Web3.career error: {e}")
     print(f"Web3.career: {len(jobs)}")
     return jobs
 
-def scrape_cryptojobslist():
+
+# ── SOURCE 5: Indeed RSS ──────────────────────────────────────────────────────
+
+def scrape_indeed():
     jobs = []
-    for path in ["/community", "/marketing", "/support"]:
+    seen = set()
+    queries = [
+        "web3+community+manager+remote",
+        "crypto+community+manager+remote",
+        "dao+community+manager+remote",
+        "crypto+discord+moderator+remote",
+        "web3+customer+support+remote",
+        "crypto+social+media+manager+remote",
+    ]
+    for q in queries:
         try:
-            r = scrape_url(f"https://cryptojobslist.com{path}", render=True)
-            soup = BeautifulSoup(r.text, "html.parser")
-            for tag in soup.find_all(["h2","h3","span"], string=re.compile(r'.{6,}', re.I)):
-                title = tag.get_text(strip=True)
+            feed = feedparser.parse(f"https://www.indeed.com/rss?q={q}&sort=date")
+            for e in feed.entries:
+                if not is_recent(e.get("published","")):
+                    continue
+                link = e.get("link","")
+                if not link or link in seen:
+                    continue
+                title = e.get("title","")
                 if not is_relevant(title):
                     continue
-                date_tag = tag.find_next("time")
-                date_str = date_tag.get("datetime","") if date_tag else ""
-                if date_str and not is_recent(date_str):
-                    continue
-                parent = tag.find_parent("a")
-                if not parent:
-                    continue
-                href = parent.get("href","")
-                link = ("https://cryptojobslist.com" + href) if href.startswith("/") else href
-                company_tag = tag.find_next("span")
-                company = company_tag.get_text(strip=True) if company_tag else ""
-                jobs.append({"title": title, "company": company, "url": link, "source": "CryptoJobsList", "date": date_str})
+                seen.add(link)
+                company = e.get("source", {}).get("value","") if isinstance(e.get("source"), dict) else ""
+                jobs.append({"title": title, "company": company, "url": link, "source": "Indeed", "date": e.get("published","")})
         except Exception as e:
-            print(f"CryptoJobsList: {e}")
-    print(f"CryptoJobsList: {len(jobs)}")
+            print(f"Indeed error: {e}")
+    print(f"Indeed: {len(jobs)}")
     return jobs
 
-def scrape_cryptocurrencyjobs():
+
+# ── SOURCE 6: crypto.jobs ─────────────────────────────────────────────────────
+
+def scrape_cryptodotjobs():
     jobs = []
-    for target in [
-        "https://cryptocurrencyjobs.co/community/",
-        "https://cryptocurrencyjobs.co/marketing/",
-        "https://cryptocurrencyjobs.co/support/",
+    for path in [
+        "/jobs?category=community-manager",
+        "/jobs?category=customer-support",
+        "/jobs?category=marketing",
     ]:
         try:
-            r = scrape_url(target, render=True, timeout=45)
+            r = scrape_url(f"https://crypto.jobs{path}", render=True, timeout=45)
             soup = BeautifulSoup(r.text, "html.parser")
-            for tag in soup.find_all(["h2","h3"], string=re.compile(r'.{6,}', re.I)):
+            for tag in soup.find_all(["h2","h3"]):
                 title = tag.get_text(strip=True)
                 if not is_relevant(title):
                     continue
@@ -222,13 +241,48 @@ def scrape_cryptocurrencyjobs():
                 if not parent:
                     continue
                 href = parent.get("href","")
-                link = ("https://cryptocurrencyjobs.co" + href) if href.startswith("/") else href
+                link = ("https://crypto.jobs" + href) if href.startswith("/") else href
+                company_tag = tag.find_next(["span","p","h4"])
+                company = company_tag.get_text(strip=True) if company_tag else ""
+                jobs.append({"title": title, "company": company, "url": link, "source": "crypto.jobs", "date": date_str})
+        except Exception as e:
+            print(f"crypto.jobs error: {e}")
+    print(f"crypto.jobs: {len(jobs)}")
+    return jobs
+
+
+# ── SOURCE 7: remote3.co ──────────────────────────────────────────────────────
+
+def scrape_remote3():
+    jobs = []
+    for path in [
+        "/jobs?tag=community-manager",
+        "/jobs?tag=customer-support",
+        "/jobs?tag=social-media",
+        "/jobs?tag=moderator",
+    ]:
+        try:
+            r = scrape_url(f"https://remote3.co{path}", render=True, timeout=45)
+            soup = BeautifulSoup(r.text, "html.parser")
+            for tag in soup.find_all(["h2","h3"]):
+                title = tag.get_text(strip=True)
+                if not is_relevant(title):
+                    continue
+                date_tag = tag.find_next("time")
+                date_str = date_tag.get("datetime","") if date_tag else ""
+                if date_str and not is_recent(date_str):
+                    continue
+                parent = tag.find_parent("a")
+                if not parent:
+                    continue
+                href = parent.get("href","")
+                link = ("https://remote3.co" + href) if href.startswith("/") else href
                 company_tag = tag.find_next(["span","p"])
                 company = company_tag.get_text(strip=True) if company_tag else ""
-                jobs.append({"title": title, "company": company, "url": link, "source": "CryptocurrencyJobs", "date": date_str})
+                jobs.append({"title": title, "company": company, "url": link, "source": "Remote3", "date": date_str})
         except Exception as e:
-            print(f"CryptocurrencyJobs: {e}")
-    print(f"CryptocurrencyJobs: {len(jobs)}")
+            print(f"Remote3 error: {e}")
+    print(f"Remote3: {len(jobs)}")
     return jobs
 
 
@@ -253,8 +307,9 @@ def run_scan():
     all_jobs += scrape_remoteok()
     all_jobs += scrape_jobicy()
     all_jobs += scrape_web3career()
-    all_jobs += scrape_cryptojobslist()
-    all_jobs += scrape_cryptocurrencyjobs()
+    all_jobs += scrape_indeed()
+    all_jobs += scrape_cryptodotjobs()
+    all_jobs += scrape_remote3()
 
     seen, new_jobs = set(), []
     for j in all_jobs:
@@ -268,10 +323,10 @@ def run_scan():
     print(f"Total after date filter: {len(new_jobs)} | Sources: {sources}")
 
     if not new_jobs:
-        send_telegram("✅ Scan done — no new jobs from the last 7 days.")
+        send_telegram("No new matching jobs from the last 7 days.")
         return "no jobs"
 
-    send_telegram(f"🔍 <b>{min(len(new_jobs),20)} jobs posted in the last 7 days</b>\nSources: {', '.join(sources)}")
+    send_telegram(f"🔍 <b>{min(len(new_jobs),20)} jobs from the last 7 days</b>\nSources: {', '.join(sources)}")
 
     for j in new_jobs[:20]:
         date_label = f"\n📅 {fmt_date(j.get('date',''))}" if j.get("date") else ""
