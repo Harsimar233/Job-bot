@@ -1,321 +1,257 @@
-"""
-Job Bot — Uses ScraperAPI to bypass blocks on crypto job boards.
-"""
-import os, json, hashlib, logging, time
-import requests, feedparser
-from http.server import BaseHTTPRequestHandler
+import os, re, hashlib, json, requests, feedparser
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("job-bot")
-
-BOT_TOKEN  = os.environ.get("BOT_TOKEN", "")
-CHAT_ID    = os.environ.get("CHAT_ID", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+CHAT_ID   = os.environ.get("CHAT_ID", "")
 SCRAPER_KEY = os.environ.get("SCRAPER_KEY", "")
 
-KEYWORDS = os.environ.get("KEYWORDS",
-    "community,ambassador,growth,discord,telegram,dao,defi,nft,kol,"
-    "galxe,zealy,moderator,ecosystem,web3,crypto,blockchain,protocol,"
-    "marketing,partnerships,acquisition,retention"
-)
-EXCLUDE = os.environ.get("EXCLUDE",
-    "engineer,developer,solidity,backend,frontend,devops,"
-    "10+ years,china only,japanese required,korean required"
-)
+KEYWORDS = [
+    "community manager","community lead","community moderator",
+    "discord moderator","telegram moderator","moderator",
+    "customer support","customer success","support specialist",
+    "social media manager","social media","content moderator",
+    "community growth","web3 community","crypto community",
+    "ambassador","community operations","community building",
+]
 
-KEYWORDS_LIST = [k.strip().lower() for k in KEYWORDS.split(",") if k.strip()]
-EXCLUDE_LIST  = [k.strip().lower() for k in EXCLUDE.split(",") if k.strip()]
-SEEN_FILE     = "/tmp/seen_jobs.json"
+EXCLUDE = [
+    "engineer","developer","software","solidity","backend",
+    "frontend","devops","data scientist","machine learning",
+    "accountant","lawyer","designer","staff engineer",
+]
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "application/rss+xml, application/xml, text/xml, text/html, */*",
-}
+SEEN_FILE = "/tmp/seen.json"
 
-# ─── Dedup ───────────────────────────────────────────────────────────────────
 
 def load_seen():
     try:
         with open(SEEN_FILE) as f:
             return set(json.load(f))
-    except Exception:
+    except:
         return set()
 
+
 def save_seen(seen):
-    try:
-        with open(SEEN_FILE, "w") as f:
-            json.dump(list(seen), f)
-    except Exception:
-        pass
+    with open(SEEN_FILE, "w") as f:
+        json.dump(list(seen)[-500:], f)
 
-def jid(url):
-    return hashlib.md5(url.encode()).hexdigest()
 
-def make_job(title, company, location, url, source, desc="", tags=None, salary=""):
-    return {
-        "title": (title or "").strip(),
-        "company": (company or "").strip(),
-        "location": (location or "Remote").strip(),
-        "url": (url or "").strip(),
-        "source": source,
-        "description": desc or "",
-        "tags": tags or [],
-        "salary": (salary or "").strip(),
-        "_id": jid(url or ""),
-    }
+def uid(title, company):
+    return hashlib.md5(f"{title}{company}".lower().encode()).hexdigest()[:10]
 
-# ─── Fetch helpers ────────────────────────────────────────────────────────────
 
-def scraper_url(target_url):
-    """Route a URL through ScraperAPI to bypass IP blocks."""
-    if not SCRAPER_KEY:
-        return target_url
-    return f"https://api.scraperapi.com/?api_key={SCRAPER_KEY}&url={requests.utils.quote(target_url, safe='')}"
+def is_relevant(title):
+    t = title.lower()
+    if any(e in t for e in EXCLUDE):
+        return False
+    return any(k in t for k in KEYWORDS)
 
-def fetch_rss(urls, use_scraper=False):
-    for url in (urls if isinstance(urls, list) else [urls]):
-        try:
-            fetch = scraper_url(url) if use_scraper else url
-            r = requests.get(fetch, headers=HEADERS, timeout=15)
-            if r.status_code == 200 and len(r.text) > 200:
-                return feedparser.parse(r.text)
-        except Exception as e:
-            logger.error(f"fetch_rss {url}: {e}")
-            continue
-    return None
 
-def split_co(title):
-    for sep in [" at ", " — ", " - "]:
-        if sep in title:
-            p = title.split(sep, 1)
-            return p[0].strip(), p[1].strip()
-    return title.strip(), ""
+def score(title):
+    t = title.lower()
+    s = 0
+    for k in KEYWORDS:
+        if k in t:
+            s += 10
+    return min(s, 100)
 
-# ─── Source 1: CryptoJobsList (via ScraperAPI) ───────────────────────────────
 
-def src_cryptojobslist():
-    jobs = []
-    feed = fetch_rss(
-        ["https://cryptojobslist.com/rss.xml", "https://cryptojobslist.com/rss"],
-        use_scraper=True
-    )
-    if not feed:
-        logger.warning("CryptoJobsList: no feed")
-        return []
-    for e in feed.entries:
-        t, c = split_co(e.get("title", ""))
-        tags = [x.term for x in e.get("tags", [])]
-        jobs.append(make_job(t, c, "Remote", e.get("link",""), "CryptoJobsList", e.get("summary",""), tags))
-    logger.info(f"CryptoJobsList: {len(jobs)}")
-    return jobs
-
-# ─── Source 2: Web3.career (via ScraperAPI) ──────────────────────────────────
-
-def src_web3career():
-    jobs = []
-    feed = fetch_rss(
-        ["https://web3.career/rss.xml", "https://web3.career/feed.xml"],
-        use_scraper=True
-    )
-    if not feed:
-        logger.warning("Web3.career: no feed")
-        return []
-    for e in feed.entries:
-        t, c = split_co(e.get("title", ""))
-        tags = [x.term for x in e.get("tags", [])]
-        jobs.append(make_job(t, c, "Remote", e.get("link",""), "Web3.career", e.get("summary",""), tags))
-    logger.info(f"Web3.career: {len(jobs)}")
-    return jobs
-
-# ─── Source 3: WeWorkRemotely ─────────────────────────────────────────────────
-
-def src_weworkremotely():
-    jobs = []
-    for url in [
-        "https://weworkremotely.com/categories/remote-sales-and-marketing-jobs.rss",
-        "https://weworkremotely.com/categories/all-other-remote-jobs.rss",
-    ]:
-        feed = fetch_rss(url)
-        if not feed:
-            continue
-        for e in feed.entries:
-            t = e.get("title", "")
-            c = ""
-            if ": " in t:
-                c, t = t.split(": ", 1)
-            jobs.append(make_job(t.strip(), c.strip(), "Remote", e.get("link",""), "WeWorkRemotely", e.get("summary","")))
-    logger.info(f"WeWorkRemotely: {len(jobs)}")
-    return jobs
-
-# ─── Source 4: RemoteOK ───────────────────────────────────────────────────────
-
-def src_remoteok():
+def scrape_remoteok():
     jobs = []
     try:
-        r = requests.get(
-            "https://remoteok.com/api?tags=crypto,web3,community,marketing,non-tech",
-            headers={**HEADERS, "Accept": "application/json"}, timeout=10
-        )
-        if r.status_code != 200:
-            return []
+        r = requests.get("https://remoteok.com/api", headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
         data = r.json()
         for j in data[1:]:
-            if not isinstance(j, dict) or not j.get("url"):
-                continue
-            tags = j.get("tags", [])
-            jobs.append(make_job(
-                j.get("position",""), j.get("company",""), "Remote",
-                j.get("url",""), "RemoteOK",
-                j.get("description",""),
-                tags if isinstance(tags, list) else [],
-                str(j.get("salary",""))
-            ))
-        logger.info(f"RemoteOK: {len(jobs)}")
+            title = j.get("position", "")
+            company = j.get("company", "")
+            url = j.get("url", "")
+            tags = " ".join(j.get("tags", []))
+            if is_relevant(title) or is_relevant(tags):
+                jobs.append({"title": title, "company": company, "url": url, "source": "RemoteOK"})
     except Exception as e:
-        logger.error(f"RemoteOK: {e}")
+        print(f"RemoteOK error: {e}")
     return jobs
 
-# ─── Source 5: Jobicy API ─────────────────────────────────────────────────────
 
-def src_jobicy():
+def scrape_wwr():
     jobs = []
-    seen = set()
-    for q in ["community+manager", "ambassador+crypto", "growth+web3", "discord+moderator"]:
+    feeds = [
+        "https://weworkremotely.com/categories/remote-customer-support-jobs.rss",
+        "https://weworkremotely.com/categories/remote-marketing-jobs.rss",
+        "https://weworkremotely.com/categories/remote-sales-jobs.rss",
+    ]
+    for feed_url in feeds:
+        try:
+            feed = feedparser.parse(feed_url)
+            for e in feed.entries:
+                title = e.get("title", "")
+                company = e.get("author", "")
+                url = e.get("link", "")
+                if is_relevant(title):
+                    jobs.append({"title": title, "company": company, "url": url, "source": "WeWorkRemotely"})
+        except Exception as ex:
+            print(f"WWR error: {ex}")
+    return jobs
+
+
+def scrape_jobicy():
+    jobs = []
+    searches = ["community+manager", "moderator", "customer+support", "social+media+manager", "ambassador"]
+    for q in searches:
         try:
             r = requests.get(
-                f"https://jobicy.com/api/v2/remote-jobs?count=50&jobCategory=marketing&keyWord={q}",
-                headers=HEADERS, timeout=10)
-            if r.status_code != 200:
-                continue
-            for j in r.json().get("jobs", []):
-                u = j.get("url","")
-                if not u or u in seen:
-                    continue
-                seen.add(u)
-                jobs.append(make_job(
-                    j.get("jobTitle",""), j.get("companyName",""),
-                    j.get("jobGeo","Remote"), u, "Jobicy",
-                    j.get("jobDescription",""), [j.get("jobCategory","")]
-                ))
-            time.sleep(0.3)
+                f"https://jobicy.com/api/v2/remote-jobs?count=20&tag={q}",
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=15
+            )
+            data = r.json()
+            for j in data.get("jobs", []):
+                title = j.get("jobTitle", "")
+                company = j.get("companyName", "")
+                url = j.get("url", "")
+                if is_relevant(title):
+                    jobs.append({"title": title, "company": company, "url": url, "source": "Jobicy"})
         except Exception as e:
-            logger.error(f"Jobicy {q}: {e}")
-    logger.info(f"Jobicy: {len(jobs)}")
+            print(f"Jobicy error: {e}")
     return jobs
 
-# ─── Source 6: Indeed RSS ─────────────────────────────────────────────────────
 
-def src_indeed():
+def scrape_cryptojobslist():
     jobs = []
-    seen = set()
-    for q in ["web3+community+manager", "crypto+ambassador+remote", "dao+community+manager"]:
-        try:
-            feed = fetch_rss(f"https://www.indeed.com/rss?q={q}&l=remote&sort=date")
-            if not feed:
-                continue
-            for e in feed.entries:
-                link = e.get("link","")
-                if not link or link in seen:
-                    continue
-                seen.add(link)
-                t, c = split_co(e.get("title",""))
-                jobs.append(make_job(t, c, "Remote", link, "Indeed", e.get("summary","")))
-        except Exception as e:
-            logger.error(f"Indeed {q}: {e}")
-    logger.info(f"Indeed: {len(jobs)}")
+    if not SCRAPER_KEY:
+        return jobs
+    try:
+        target = "https://cryptojobslist.com/community"
+        url = f"http://api.scraperapi.com?api_key={SCRAPER_KEY}&url={target}"
+        r = requests.get(url, timeout=30)
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(r.text, "html.parser")
+        for tag in soup.find_all("h2"):
+            title = tag.get_text(strip=True)
+            parent = tag.find_parent("a")
+            link = "https://cryptojobslist.com" + parent["href"] if parent and parent.get("href") else target
+            company_tag = tag.find_next("span")
+            company = company_tag.get_text(strip=True) if company_tag else ""
+            if is_relevant(title):
+                jobs.append({"title": title, "company": company, "url": link, "source": "CryptoJobsList"})
+    except Exception as e:
+        print(f"CryptoJobsList error: {e}")
     return jobs
 
-# ─── Scoring ─────────────────────────────────────────────────────────────────
 
-def score(j):
-    text = f"{j['title']} {j['description']} {' '.join(j['tags'])}".lower()
-    hits = sum(1 for k in KEYWORDS_LIST if k in text)
-    return round((hits / max(len(KEYWORDS_LIST), 1)) * 100, 1)
-
-def excluded(j):
-    text = f"{j['title']} {j['description']}".lower()
-    return any(k in text for k in EXCLUDE_LIST)
-
-# ─── Telegram ────────────────────────────────────────────────────────────────
-
-def tg(text):
-    if not BOT_TOKEN or not CHAT_ID:
-        return
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": text,
-                  "parse_mode": "Markdown", "disable_web_page_preview": True},
-            timeout=10)
-    except Exception as e:
-        logger.error(f"TG: {e}")
-
-def fmt(j, rank):
-    s = j["_score"]
-    bar = "🟩" * min(int(s/10), 10) or "⬜"
-    lines = [f"*#{rank} {j['title']}*", f"🏢 {j['company'] or 'Unknown'}", f"📍 {j['location']}"]
-    if j["salary"]:
-        lines.append(f"💰 {j['salary']}")
-    if j["tags"]:
-        lines.append("🏷 " + " ".join(f"`{t}`" for t in j["tags"][:5]))
-    lines += [f"📊 Match: {bar} {s:.0f}%", f"🔗 [Apply Now]({j['url']})", f"_via {j['source']}_"]
-    return "\n".join(lines)
-
-# ─── Main ─────────────────────────────────────────────────────────────────────
-
-def run_scan():
-    if not BOT_TOKEN or not CHAT_ID:
-        logger.error("Missing credentials")
-        return
-
-    all_jobs = []
-    for fn in [src_cryptojobslist, src_web3career, src_weworkremotely, src_remoteok, src_jobicy, src_indeed]:
+def scrape_web3career():
+    jobs = []
+    if not SCRAPER_KEY:
+        return jobs
+    searches = ["community-manager", "moderator", "customer-support", "social-media"]
+    for q in searches:
         try:
-            all_jobs += fn()
+            target = f"https://web3.career/{q}-jobs"
+            url = f"http://api.scraperapi.com?api_key={SCRAPER_KEY}&url={target}"
+            r = requests.get(url, timeout=30)
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(r.text, "html.parser")
+            for tag in soup.find_all("h2"):
+                title = tag.get_text(strip=True)
+                parent = tag.find_parent("a")
+                link = "https://web3.career" + parent["href"] if parent and parent.get("href") else target
+                company_tag = tag.find_next("h3")
+                company = company_tag.get_text(strip=True) if company_tag else ""
+                if is_relevant(title):
+                    jobs.append({"title": title, "company": company, "url": link, "source": "Web3.career"})
         except Exception as e:
-            logger.error(f"{fn.__name__}: {e}")
+            print(f"Web3.career error: {e}")
+    return jobs
 
-    logger.info(f"Total raw: {len(all_jobs)}")
 
+def scrape_indeed_rss():
+    jobs = []
+    searches = [
+        "community+manager+web3",
+        "discord+moderator+crypto",
+        "customer+support+web3",
+        "social+media+manager+crypto",
+        "community+manager+remote",
+    ]
+    for q in searches:
+        try:
+            url = f"https://www.indeed.com/rss?q={q}&l=remote&sort=date"
+            feed = feedparser.parse(url)
+            for e in feed.entries:
+                title = e.get("title", "")
+                company = e.get("author", "")
+                link = e.get("link", "")
+                if is_relevant(title):
+                    jobs.append({"title": title, "company": company, "url": link, "source": "Indeed"})
+        except Exception as ex:
+            print(f"Indeed error: {ex}")
+    return jobs
+
+
+def send_telegram(msg):
+    if not BOT_TOKEN or not CHAT_ID:
+        print("No bot token/chat id")
+        return
+    requests.post(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+        json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML", "disable_web_page_preview": True},
+        timeout=10
+    )
+
+
+def main():
     seen = load_seen()
-    unique = {}
+    all_jobs = []
+
+    print("Scraping RemoteOK...")
+    all_jobs += scrape_remoteok()
+
+    print("Scraping WeWorkRemotely...")
+    all_jobs += scrape_wwr()
+
+    print("Scraping Jobicy...")
+    all_jobs += scrape_jobicy()
+
+    print("Scraping Indeed RSS...")
+    all_jobs += scrape_indeed_rss()
+
+    print("Scraping CryptoJobsList...")
+    all_jobs += scrape_cryptojobslist()
+
+    print("Scraping Web3.career...")
+    all_jobs += scrape_web3career()
+
+    # Deduplicate
+    new_jobs = []
+    new_ids = set()
     for j in all_jobs:
-        if j["_id"] not in seen and j["_id"] not in unique and j["url"]:
-            unique[j["_id"]] = j
+        jid = uid(j["title"], j["company"])
+        if jid not in seen and jid not in new_ids:
+            new_jobs.append(j)
+            new_ids.add(jid)
 
-    scored = []
-    for j in unique.values():
-        if excluded(j):
-            continue
-        s = score(j)
-        if s >= 10:
-            j["_score"] = s
-            scored.append(j)
+    # Sort by score
+    new_jobs.sort(key=lambda j: score(j["title"]), reverse=True)
 
-    scored.sort(key=lambda j: j["_score"], reverse=True)
-    top = scored[:10]
+    print(f"Found {len(new_jobs)} new jobs")
 
-    for j in top:
-        seen.add(j["_id"])
+    if not new_jobs:
+        send_telegram("✅ Job scan complete — no new matching jobs found.")
+        return
+
+    # Send top 15
+    for j in new_jobs[:15]:
+        msg = (
+            f"💼 <b>{j['title']}</b>\n"
+            f"🏢 {j['company']}\n"
+            f"🔗 <a href='{j['url']}'>Apply Now</a>\n"
+            f"📌 via {j['source']}"
+        )
+        send_telegram(msg)
+
+    send_telegram(f"✅ Scan done — sent {min(len(new_jobs), 15)} new jobs!")
+    seen.update(new_ids)
     save_seen(seen)
 
-    if not top:
-        tg("No new matching jobs found in this scan.")
-        return
 
-    sources = list({j["source"] for j in top})
-    tg(f"🔍 *{len(top)} new job matches*\nSources: {', '.join(sources)}\nSorted by match score ↓")
-    for i, j in enumerate(top, 1):
-        tg(fmt(j, i))
-        time.sleep(0.3)
-
-# ─── Vercel ──────────────────────────────────────────────────────────────────
-
-class handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        run_scan()
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"Done.")
-    def log_message(self, format, *args):
-        pass
+if __name__ == "__main__":
+    main()
