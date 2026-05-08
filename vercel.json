@@ -1,4 +1,9 @@
 {
+  "functions": {
+    "api/scan.py": {
+      "runtime": "vercel-python@3.0.7"
+    }
+  },
   "crons": [
     {
       "path": "/api/scan",
