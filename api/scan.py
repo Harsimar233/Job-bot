@@ -48,7 +48,7 @@ def scrape_url(url, timeout=25):
     """Fetch a URL via ScraperAPI if key available, else direct"""
     if SCRAPER_KEY:
         return requests.get(
-            f"http://api.scraperapi.com?api_key={SCRAPER_KEY}&url={requests.utils.quote(url, safe=':/')}",
+            f"http://api.scraperapi.com?api_key={SCRAPER_KEY}&render=true&url={requests.utils.quote(url, safe=':/')}",
             timeout=timeout
         )
     return requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=timeout)
