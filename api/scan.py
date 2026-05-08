@@ -12,27 +12,29 @@ KEYWORDS = [
     "social media manager","social media","content moderator",
     "community growth","web3 community","crypto community",
     "ambassador","community operations","community building",
+    "community advocate","dao community","nft community",
 ]
 
 EXCLUDE = [
     "engineer","developer","software","solidity","backend",
     "frontend","devops","data scientist","machine learning",
     "accountant","lawyer","designer","staff engineer",
+    "hiring crypto community manager talent",
+    "latest crypto community manager jobs",
 ]
 
 def uid(title, company):
     return hashlib.md5(f"{title}{company}".lower().encode()).hexdigest()[:10]
 
-def is_relevant(title):
-    t = title.lower()
+def is_relevant(text):
+    t = text.lower()
     if any(e in t for e in EXCLUDE):
         return False
     return any(k in t for k in KEYWORDS)
 
 def score(title):
     t = title.lower()
-    s = sum(10 for k in KEYWORDS if k in t)
-    return min(s, 100)
+    return min(sum(10 for k in KEYWORDS if k in t), 100)
 
 def scrape_remoteok():
     jobs = []
@@ -62,7 +64,7 @@ def scrape_wwr():
 
 def scrape_jobicy():
     jobs = []
-    for q in ["community+manager","moderator","customer+support","social+media+manager"]:
+    for q in ["community+manager","moderator","customer+support","social+media+manager","ambassador"]:
         try:
             r = requests.get(f"https://jobicy.com/api/v2/remote-jobs?count=20&tag={q}", headers={"User-Agent":"Mozilla/5.0"}, timeout=10)
             for j in r.json().get("jobs",[]):
@@ -73,23 +75,80 @@ def scrape_jobicy():
             print(f"Jobicy: {e}")
     return jobs
 
+def scrape_hireweb3():
+    jobs = []
+    try:
+        feed = feedparser.parse("https://www.hireweb3.io/rss")
+        for e in feed.entries:
+            title = e.get("title","")
+            if is_relevant(title):
+                jobs.append({"title": title, "company": e.get("author",""), "url": e.get("link",""), "source": "HireWeb3"})
+    except Exception as e:
+        print(f"HireWeb3: {e}")
+    return jobs
+
+def scrape_jobstash():
+    jobs = []
+    try:
+        r = requests.get(
+            "https://middleware.jobstash.xyz/jobs?page=1&limit=50&order=desc&orderBy=publishedAt",
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+            timeout=15
+        )
+        data = r.json()
+        job_list = data.get("data", data) if isinstance(data, dict) else data
+        for j in job_list:
+            title = j.get("title","") or j.get("role","")
+            company = j.get("organization",{}).get("name","") if isinstance(j.get("organization"), dict) else j.get("company","")
+            url = j.get("url","") or j.get("shortUUID","")
+            if url and not url.startswith("http"):
+                url = f"https://jobstash.xyz/jobs/{url}"
+            if is_relevant(title):
+                jobs.append({"title": title, "company": company, "url": url, "source": "JobStash"})
+    except Exception as e:
+        print(f"JobStash: {e}")
+    return jobs
+
+def scrape_cryptocurrencyjobs():
+    jobs = []
+    if not SCRAPER_KEY:
+        return jobs
+    try:
+        from bs4 import BeautifulSoup
+        for path in ["/community", "/marketing", "/support"]:
+            target = f"https://cryptocurrencyjobs.co{path}"
+            r = requests.get(f"http://api.scraperapi.com?api_key={SCRAPER_KEY}&url={target}", timeout=25)
+            soup = BeautifulSoup(r.text, "html.parser")
+            for tag in soup.find_all("h2"):
+                title = tag.get_text(strip=True)
+                parent = tag.find_parent("a")
+                link = "https://cryptocurrencyjobs.co" + parent["href"] if parent and parent.get("href") else target
+                company_tag = tag.find_next("p")
+                company = company_tag.get_text(strip=True) if company_tag else ""
+                if is_relevant(title):
+                    jobs.append({"title": title, "company": company, "url": link, "source": "CryptocurrencyJobs"})
+    except Exception as e:
+        print(f"CryptocurrencyJobs: {e}")
+    return jobs
+
 def scrape_cryptojobslist():
     jobs = []
     if not SCRAPER_KEY:
         return jobs
     try:
         from bs4 import BeautifulSoup
-        target = "https://cryptojobslist.com/community"
-        r = requests.get(f"http://api.scraperapi.com?api_key={SCRAPER_KEY}&url={target}", timeout=25)
-        soup = BeautifulSoup(r.text, "html.parser")
-        for tag in soup.find_all("h2"):
-            title = tag.get_text(strip=True)
-            parent = tag.find_parent("a")
-            link = "https://cryptojobslist.com" + parent["href"] if parent and parent.get("href") else target
-            company_tag = tag.find_next("span")
-            company = company_tag.get_text(strip=True) if company_tag else ""
-            if is_relevant(title):
-                jobs.append({"title": title, "company": company, "url": link, "source": "CryptoJobsList"})
+        for path in ["/community", "/marketing", "/support"]:
+            target = f"https://cryptojobslist.com{path}"
+            r = requests.get(f"http://api.scraperapi.com?api_key={SCRAPER_KEY}&url={target}", timeout=25)
+            soup = BeautifulSoup(r.text, "html.parser")
+            for tag in soup.find_all("h2"):
+                title = tag.get_text(strip=True)
+                parent = tag.find_parent("a")
+                link = "https://cryptojobslist.com" + parent["href"] if parent and parent.get("href") else target
+                company_tag = tag.find_next("span")
+                company = company_tag.get_text(strip=True) if company_tag else ""
+                if is_relevant(title) and len(title) > 5:
+                    jobs.append({"title": title, "company": company, "url": link, "source": "CryptoJobsList"})
     except Exception as e:
         print(f"CryptoJobsList: {e}")
     return jobs
@@ -98,7 +157,7 @@ def scrape_web3career():
     jobs = []
     if not SCRAPER_KEY:
         return jobs
-    for q in ["community-manager","moderator","customer-support"]:
+    for q in ["community-manager", "moderator", "customer-support", "social-media"]:
         try:
             from bs4 import BeautifulSoup
             target = f"https://web3.career/{q}-jobs"
@@ -110,10 +169,50 @@ def scrape_web3career():
                 link = "https://web3.career" + parent["href"] if parent and parent.get("href") else target
                 company_tag = tag.find_next("h3")
                 company = company_tag.get_text(strip=True) if company_tag else ""
-                if is_relevant(title):
+                if is_relevant(title) and len(title) > 5:
                     jobs.append({"title": title, "company": company, "url": link, "source": "Web3.career"})
         except Exception as e:
             print(f"Web3.career: {e}")
+    return jobs
+
+def scrape_remote3():
+    jobs = []
+    if not SCRAPER_KEY:
+        return jobs
+    try:
+        from bs4 import BeautifulSoup
+        for path in ["/community-jobs", "/marketing-jobs", "/support-jobs"]:
+            target = f"https://remote3.co{path}"
+            r = requests.get(f"http://api.scraperapi.com?api_key={SCRAPER_KEY}&url={target}", timeout=25)
+            soup = BeautifulSoup(r.text, "html.parser")
+            for tag in soup.find_all(["h2","h3"]):
+                title = tag.get_text(strip=True)
+                parent = tag.find_parent("a")
+                link = "https://remote3.co" + parent["href"] if parent and parent.get("href") else target
+                if is_relevant(title) and len(title) > 5:
+                    jobs.append({"title": title, "company": "", "url": link, "source": "Remote3"})
+    except Exception as e:
+        print(f"Remote3: {e}")
+    return jobs
+
+def scrape_ct_google():
+    """Scrape crypto Twitter job posts via Google RSS"""
+    jobs = []
+    queries = [
+        "site:twitter.com hiring community manager web3",
+        "site:twitter.com hiring discord moderator crypto",
+        "site:twitter.com web3 community manager job remote",
+    ]
+    for q in queries:
+        try:
+            encoded = requests.utils.quote(q)
+            feed = feedparser.parse(f"https://news.google.com/rss/search?q={encoded}&hl=en-US&gl=US&ceid=US:en")
+            for e in feed.entries:
+                title = e.get("title","")
+                if is_relevant(title):
+                    jobs.append({"title": title, "company": "via CT", "url": e.get("link",""), "source": "Crypto Twitter"})
+        except Exception as e:
+            print(f"CT Google: {e}")
     return jobs
 
 def send_telegram(msg):
@@ -127,11 +226,16 @@ def send_telegram(msg):
 
 def run_scan():
     all_jobs = []
-    all_jobs += scrape_wwr()
-    all_jobs += scrape_remoteok()
-    all_jobs += scrape_jobicy()
-    all_jobs += scrape_cryptojobslist()
-    all_jobs += scrape_web3career()
+    print("Scraping WeWorkRemotely..."); all_jobs += scrape_wwr()
+    print("Scraping RemoteOK...");       all_jobs += scrape_remoteok()
+    print("Scraping Jobicy...");          all_jobs += scrape_jobicy()
+    print("Scraping HireWeb3...");        all_jobs += scrape_hireweb3()
+    print("Scraping JobStash...");        all_jobs += scrape_jobstash()
+    print("Scraping CryptoJobsList...");  all_jobs += scrape_cryptojobslist()
+    print("Scraping Web3.career...");     all_jobs += scrape_web3career()
+    print("Scraping CryptocurrencyJobs...");  all_jobs += scrape_cryptocurrencyjobs()
+    print("Scraping Remote3...");         all_jobs += scrape_remote3()
+    print("Scraping Crypto Twitter...");  all_jobs += scrape_ct_google()
 
     # Deduplicate
     seen_ids = set()
@@ -143,12 +247,13 @@ def run_scan():
             seen_ids.add(jid)
 
     new_jobs.sort(key=lambda j: score(j["title"]), reverse=True)
+    print(f"Total unique jobs found: {len(new_jobs)}")
 
     if not new_jobs:
         send_telegram("✅ Scan done — no new matching jobs found.")
         return "no jobs"
 
-    for j in new_jobs[:15]:
+    for j in new_jobs[:20]:
         send_telegram(
             f"💼 <b>{j['title']}</b>\n"
             f"🏢 {j['company']}\n"
@@ -156,7 +261,7 @@ def run_scan():
             f"📌 via {j['source']}"
         )
 
-    send_telegram(f"✅ Done — sent {min(len(new_jobs),15)} jobs!")
+    send_telegram(f"✅ Done — sent {min(len(new_jobs),20)} jobs from {len(set(j['source'] for j in new_jobs[:20]))} sources!")
     return f"sent {len(new_jobs)} jobs"
 
 class handler(BaseHTTPRequestHandler):
