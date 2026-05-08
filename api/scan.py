@@ -1,10 +1,12 @@
-from http.server import BaseHTTPRequestHandler
 import os, hashlib, re, requests, feedparser
+from datetime import datetime, timezone, timedelta
+from http.server import BaseHTTPRequestHandler
+from bs4 import BeautifulSoup
 
 BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
 CHAT_ID     = os.environ.get("CHAT_ID", "")
 SCRAPER_KEY = os.environ.get("SCRAPER_KEY", "")
-RUN_MODE    = os.environ.get("RUN_MODE", "fast")  # "fast" for Vercel, "full" for GitHub Actions
+RUN_MODE    = os.environ.get("RUN_MODE", "full")
 
 KEYWORDS = [
     "community manager","community lead","community moderator",
@@ -45,25 +47,16 @@ def score(title):
     t = title.lower()
     return min(sum(10 for k in KEYWORDS if k in t), 100)
 
-def scrape_url_js(url, timeout=45):
-    """Fetch JS-rendered page via ScraperAPI render mode"""
+def scrape_url(url, timeout=25, render=False):
     if SCRAPER_KEY:
-        return requests.get(
-            f"http://api.scraperapi.com?api_key={SCRAPER_KEY}&render=true&url={requests.utils.quote(url, safe=':/')}",
-            timeout=timeout
-        )
+        params = f"api_key={SCRAPER_KEY}&url={requests.utils.quote(url, safe=':/')}"
+        if render:
+            params += "&render=true"
+        return requests.get(f"http://api.scraperapi.com?{params}", timeout=timeout)
     return requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=timeout)
 
-def scrape_url(url, timeout=25):
-    """Fetch static page via ScraperAPI"""
-    if SCRAPER_KEY:
-        return requests.get(
-            f"http://api.scraperapi.com?api_key={SCRAPER_KEY}&url={requests.utils.quote(url, safe=':/')}",
-            timeout=timeout
-        )
-    return requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=timeout)
 
-# ── FAST SOURCES (run on Vercel + GitHub Actions) ─────────────────────────────
+# ── SOURCES ───────────────────────────────────────────────────────────────────
 
 def scrape_wwr():
     jobs = []
@@ -118,14 +111,15 @@ def scrape_web3career():
     jobs = []
     for q in ["community-manager", "moderator", "customer-support", "social-media-manager"]:
         try:
-            from bs4 import BeautifulSoup
             r = scrape_url(f"https://web3.career/{q}-jobs")
             soup = BeautifulSoup(r.text, "html.parser")
             for tag in soup.find_all("h2"):
                 title = tag.get_text(strip=True)
-                if not is_relevant(title): continue
+                if not is_relevant(title):
+                    continue
                 parent = tag.find_parent("a")
-                if not parent: continue
+                if not parent:
+                    continue
                 href = parent.get("href","")
                 link = ("https://web3.career" + href) if href.startswith("/") else href
                 company_tag = tag.find_next("h3")
@@ -140,14 +134,15 @@ def scrape_cryptojobslist():
     jobs = []
     for path in ["/community", "/marketing", "/support"]:
         try:
-            from bs4 import BeautifulSoup
             r = scrape_url(f"https://cryptojobslist.com{path}")
             soup = BeautifulSoup(r.text, "html.parser")
             for tag in soup.find_all("h2"):
                 title = tag.get_text(strip=True)
-                if not is_relevant(title): continue
+                if not is_relevant(title):
+                    continue
                 parent = tag.find_parent("a")
-                if not parent: continue
+                if not parent:
+                    continue
                 href = parent.get("href","")
                 link = ("https://cryptojobslist.com" + href) if href.startswith("/") else href
                 company_tag = tag.find_next("span")
@@ -158,87 +153,36 @@ def scrape_cryptojobslist():
     print(f"CryptoJobsList: {len(jobs)}")
     return jobs
 
-# ── SLOW SOURCES (only run in GitHub Actions full mode) ───────────────────────
-
-def scrape_cryptodotjobs():
-    jobs = []
-    try:
-        from bs4 import BeautifulSoup
-        for target in [
-            "https://crypto.jobs/jobs/community-manager",
-            "https://crypto.jobs/jobs/customer-support",
-            "https://crypto.jobs/jobs/marketing",
-        ]:
-            r = scrape_url_js(target)
-            soup = BeautifulSoup(r.text, "html.parser")
-            for tag in soup.find_all(["h2","h3"]):
-                title = tag.get_text(strip=True)
-                if not is_relevant(title): continue
-                parent = tag.find_parent("a")
-                if not parent: continue
-                href = parent.get("href","")
-                link = ("https://crypto.jobs" + href) if href.startswith("/") else href
-                company_tag = tag.find_next(["span","p","h4"])
-                company = company_tag.get_text(strip=True) if company_tag else ""
-                jobs.append({"title": title, "company": company, "url": link, "source": "crypto.jobs"})
-    except Exception as e:
-        print(f"crypto.jobs: {e}")
-    print(f"crypto.jobs: {len(jobs)}")
-    return jobs
-
 def scrape_cryptocurrencyjobs():
     jobs = []
-    try:
-        from bs4 import BeautifulSoup
-        for target in [
-            "https://cryptocurrencyjobs.co/community/",
-            "https://cryptocurrencyjobs.co/marketing/",
-            "https://cryptocurrencyjobs.co/support/",
-        ]:
-            r = scrape_url_js(target)
+    for target in [
+        "https://cryptocurrencyjobs.co/community/",
+        "https://cryptocurrencyjobs.co/marketing/",
+        "https://cryptocurrencyjobs.co/support/",
+    ]:
+        try:
+            r = scrape_url(target, render=True)
             soup = BeautifulSoup(r.text, "html.parser")
             for tag in soup.find_all(["h2","h3"]):
                 title = tag.get_text(strip=True)
-                if not is_relevant(title): continue
+                if not is_relevant(title):
+                    continue
                 parent = tag.find_parent("a")
-                if not parent: continue
+                if not parent:
+                    continue
                 href = parent.get("href","")
                 link = ("https://cryptocurrencyjobs.co" + href) if href.startswith("/") else href
                 company_tag = tag.find_next(["span","p"])
                 company = company_tag.get_text(strip=True) if company_tag else ""
                 jobs.append({"title": title, "company": company, "url": link, "source": "CryptocurrencyJobs"})
-    except Exception as e:
-        print(f"CryptocurrencyJobs: {e}")
+        except Exception as e:
+            print(f"CryptocurrencyJobs: {e}")
     print(f"CryptocurrencyJobs: {len(jobs)}")
     return jobs
 
-def scrape_jobstash():
-    jobs = []
-    try:
-        from bs4 import BeautifulSoup
-        for target in [
-            "https://jobstash.xyz/jobs?category=community",
-            "https://jobstash.xyz/jobs?category=support",
-            "https://jobstash.xyz/jobs?category=marketing",
-        ]:
-            r = scrape_url_js(target)
-            soup = BeautifulSoup(r.text, "html.parser")
-            for tag in soup.find_all(["h2","h3"]):
-                title = tag.get_text(strip=True)
-                if not is_relevant(title): continue
-                parent = tag.find_parent("a")
-                if not parent: continue
-                href = parent.get("href","")
-                link = ("https://jobstash.xyz" + href) if href.startswith("/") else href
-                company_tag = tag.find_next(["span","p","h4"])
-                company = company_tag.get_text(strip=True) if company_tag else ""
-                jobs.append({"title": title, "company": company, "url": link, "source": "JobStash"})
-    except Exception as e:
-        print(f"JobStash: {e}")
-    print(f"JobStash: {len(jobs)}")
-    return jobs
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
+
 def send_telegram(msg):
     if not BOT_TOKEN or not CHAT_ID:
         return
@@ -248,37 +192,23 @@ def send_telegram(msg):
         timeout=10
     )
 
+
 # ── Main ──────────────────────────────────────────────────────────────────────
+
 def run_scan():
     all_jobs = []
-
-    # Fast sources — always run
     all_jobs += scrape_wwr()
     all_jobs += scrape_remoteok()
     all_jobs += scrape_jobicy()
     all_jobs += scrape_web3career()
     all_jobs += scrape_cryptojobslist()
+    all_jobs += scrape_cryptocurrencyjobs()
 
-    # Slow sources — only in GitHub Actions (RUN_MODE=full)
-    if RUN_MODE == "full":
-        print("Running slow sources (GitHub Actions mode)...")
-        all_jobs += scrape_cryptodotjobs()
-        all_jobs += scrape_cryptocurrencyjobs()
-        all_jobs += scrape_jobstash()
-
- from datetime import datetime, timezone, timedelta
     cutoff = datetime.now(timezone.utc) - timedelta(days=30)
 
     seen, new_jobs = set(), []
     for j in all_jobs:
         jid = uid(j["title"], j["company"])
-        pub = j.get("published")
-        if pub:
-            try:
-                if pub < cutoff:
-                    continue
-            except:
-                pass
         if jid not in seen:
             new_jobs.append(j)
             seen.add(jid)
@@ -288,8 +218,10 @@ def run_scan():
     print(f"Total: {len(new_jobs)} jobs | Sources: {sources}")
 
     if not new_jobs:
-        send_telegram("✅ Scan done — no new matching jobs found.")
+        send_telegram("No new matching jobs found.")
         return "no jobs"
+
+    send_telegram(f"🔍 <b>{min(len(new_jobs),20)} new job matches</b>\nSources: {', '.join(sources)}")
 
     for j in new_jobs[:20]:
         send_telegram(
@@ -299,8 +231,8 @@ def run_scan():
             f"📌 via {j['source']}"
         )
 
-    send_telegram(f"✅ Done — {min(len(new_jobs),20)} jobs from: {', '.join(sources)}")
     return f"sent {len(new_jobs)} jobs"
+
 
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
