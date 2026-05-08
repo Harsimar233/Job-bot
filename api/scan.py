@@ -177,7 +177,7 @@ def scrape_cryptojobslist():
     jobs = []
     for path in ["/community", "/marketing", "/support"]:
         try:
-            r = scrape_url(f"https://cryptojobslist.com{path}", render=True)
+            r = scrape_url(f"https://cryptojobslist.com{path}", render=True, timeout=60)
             soup = BeautifulSoup(r.text, "html.parser")
             for tag in soup.find_all(["h2","h3","span"], string=re.compile(r'.{6,}', re.I)):
                 title = tag.get_text(strip=True)
