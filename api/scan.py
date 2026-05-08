@@ -2,11 +2,11 @@ import os, hashlib, re, requests, feedparser
 from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler
 from bs4 import BeautifulSoup
+from email.utils import parsedate_to_datetime
 
 BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
 CHAT_ID     = os.environ.get("CHAT_ID", "")
 SCRAPER_KEY = os.environ.get("SCRAPER_KEY", "")
-RUN_MODE    = os.environ.get("RUN_MODE", "full")
 
 KEYWORDS = [
     "community manager","community lead","community moderator",
@@ -22,13 +22,17 @@ EXCLUDE = [
     "engineer","developer","software","solidity","backend",
     "frontend","devops","data scientist","machine learning",
     "accountant","lawyer","designer","staff engineer",
+    "mandarin","chinese speaker","native chinese",
+    "russian speaker","native russian","native japanese",
 ]
 
 FAKE_PATTERNS = [
     r"hiring.*talent", r"latest.*jobs", r"success stor",
-    r"^\d+[-–]\d+/month", r"post a job", r"browse jobs",
-    r"view all", r"find jobs", r"job board", r"get hired",
+    r"post a job", r"browse jobs", r"view all",
+    r"find jobs", r"job board", r"get hired",
 ]
+
+CUTOFF_DAYS = 7
 
 def uid(title, company):
     return hashlib.md5(f"{title}{company}".lower().encode()).hexdigest()[:10]
@@ -47,6 +51,30 @@ def score(title):
     t = title.lower()
     return min(sum(10 for k in KEYWORDS if k in t), 100)
 
+def parse_date(date_str):
+    """Try to parse a date string into an aware datetime."""
+    if not date_str:
+        return None
+    try:
+        return parsedate_to_datetime(date_str)
+    except Exception:
+        pass
+    try:
+        return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+    except Exception:
+        pass
+    return None
+
+def is_recent(date_str, days=CUTOFF_DAYS):
+    """Return True if date is within the last N days, or if date is unknown."""
+    dt = parse_date(date_str)
+    if dt is None:
+        return True  # No date info — include it
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    return dt >= cutoff
+
 def scrape_url(url, timeout=25, render=False):
     if SCRAPER_KEY:
         params = f"api_key={SCRAPER_KEY}&url={requests.utils.quote(url, safe=':/')}"
@@ -64,6 +92,8 @@ def scrape_wwr():
         try:
             feed = feedparser.parse(f"https://weworkremotely.com/categories/{cat}.rss")
             for e in feed.entries:
+                if not is_recent(e.get("published")):
+                    continue
                 raw = e.get("title", "")
                 if " at " in raw:
                     title, company = raw.split(" at ")[0].strip(), raw.split(" at ")[-1].strip()
@@ -73,7 +103,7 @@ def scrape_wwr():
                 else:
                     title, company = raw, ""
                 if is_relevant(title):
-                    jobs.append({"title": title, "company": company, "url": e.get("link",""), "source": "WeWorkRemotely"})
+                    jobs.append({"title": title, "company": company, "url": e.get("link",""), "source": "WeWorkRemotely", "date": e.get("published","")})
         except Exception as ex:
             print(f"WWR: {ex}")
     print(f"WWR: {len(jobs)}")
@@ -84,10 +114,13 @@ def scrape_remoteok():
     try:
         r = requests.get("https://remoteok.com/api", headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
         for j in r.json()[1:]:
+            date_str = j.get("date", "")
+            if not is_recent(date_str):
+                continue
             title = j.get("position", "")
             tags  = " ".join(j.get("tags", []))
             if is_relevant(title) or is_relevant(tags):
-                jobs.append({"title": title, "company": j.get("company",""), "url": j.get("url",""), "source": "RemoteOK"})
+                jobs.append({"title": title, "company": j.get("company",""), "url": j.get("url",""), "source": "RemoteOK", "date": date_str})
     except Exception as e:
         print(f"RemoteOK: {e}")
     print(f"RemoteOK: {len(jobs)}")
@@ -99,9 +132,11 @@ def scrape_jobicy():
         try:
             r = requests.get(f"https://jobicy.com/api/v2/remote-jobs?count=20&tag={q}", headers={"User-Agent":"Mozilla/5.0"}, timeout=10)
             for j in r.json().get("jobs",[]):
+                if not is_recent(j.get("pubDate","")):
+                    continue
                 title = j.get("jobTitle","")
                 if is_relevant(title):
-                    jobs.append({"title": title, "company": j.get("companyName",""), "url": j.get("url",""), "source": "Jobicy"})
+                    jobs.append({"title": title, "company": j.get("companyName",""), "url": j.get("url",""), "source": "Jobicy", "date": j.get("pubDate","")})
         except Exception as e:
             print(f"Jobicy: {e}")
     print(f"Jobicy: {len(jobs)}")
@@ -117,6 +152,11 @@ def scrape_web3career():
                 title = tag.get_text(strip=True)
                 if not is_relevant(title):
                     continue
+                # Check for date near the job listing
+                date_tag = tag.find_next("time")
+                date_str = date_tag.get("datetime","") if date_tag else ""
+                if date_str and not is_recent(date_str):
+                    continue
                 parent = tag.find_parent("a")
                 if not parent:
                     continue
@@ -124,7 +164,7 @@ def scrape_web3career():
                 link = ("https://web3.career" + href) if href.startswith("/") else href
                 company_tag = tag.find_next("h3")
                 company = company_tag.get_text(strip=True) if company_tag else ""
-                jobs.append({"title": title, "company": company, "url": link, "source": "Web3.career"})
+                jobs.append({"title": title, "company": company, "url": link, "source": "Web3.career", "date": date_str})
         except Exception as e:
             print(f"Web3.career: {e}")
     print(f"Web3.career: {len(jobs)}")
@@ -140,6 +180,10 @@ def scrape_cryptojobslist():
                 title = tag.get_text(strip=True)
                 if not is_relevant(title):
                     continue
+                date_tag = tag.find_next("time")
+                date_str = date_tag.get("datetime","") if date_tag else ""
+                if date_str and not is_recent(date_str):
+                    continue
                 parent = tag.find_parent("a")
                 if not parent:
                     continue
@@ -147,7 +191,7 @@ def scrape_cryptojobslist():
                 link = ("https://cryptojobslist.com" + href) if href.startswith("/") else href
                 company_tag = tag.find_next("span")
                 company = company_tag.get_text(strip=True) if company_tag else ""
-                jobs.append({"title": title, "company": company, "url": link, "source": "CryptoJobsList"})
+                jobs.append({"title": title, "company": company, "url": link, "source": "CryptoJobsList", "date": date_str})
         except Exception as e:
             print(f"CryptoJobsList: {e}")
     print(f"CryptoJobsList: {len(jobs)}")
@@ -167,6 +211,10 @@ def scrape_cryptocurrencyjobs():
                 title = tag.get_text(strip=True)
                 if not is_relevant(title):
                     continue
+                date_tag = tag.find_next("time")
+                date_str = date_tag.get("datetime","") if date_tag else ""
+                if date_str and not is_recent(date_str):
+                    continue
                 parent = tag.find_parent("a")
                 if not parent:
                     continue
@@ -174,7 +222,7 @@ def scrape_cryptocurrencyjobs():
                 link = ("https://cryptocurrencyjobs.co" + href) if href.startswith("/") else href
                 company_tag = tag.find_next(["span","p"])
                 company = company_tag.get_text(strip=True) if company_tag else ""
-                jobs.append({"title": title, "company": company, "url": link, "source": "CryptocurrencyJobs"})
+                jobs.append({"title": title, "company": company, "url": link, "source": "CryptocurrencyJobs", "date": date_str})
         except Exception as e:
             print(f"CryptocurrencyJobs: {e}")
     print(f"CryptocurrencyJobs: {len(jobs)}")
@@ -185,12 +233,19 @@ def scrape_cryptocurrencyjobs():
 
 def send_telegram(msg):
     if not BOT_TOKEN or not CHAT_ID:
+        print("Missing BOT_TOKEN or CHAT_ID")
         return
     requests.post(
         f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
         json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML", "disable_web_page_preview": True},
         timeout=10
     )
+
+def fmt_date(date_str):
+    dt = parse_date(date_str)
+    if not dt:
+        return ""
+    return dt.strftime("%-d %b %Y")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -204,8 +259,6 @@ def run_scan():
     all_jobs += scrape_cryptojobslist()
     all_jobs += scrape_cryptocurrencyjobs()
 
-    cutoff = datetime.now(timezone.utc) - timedelta(days=30)
-
     seen, new_jobs = set(), []
     for j in all_jobs:
         jid = uid(j["title"], j["company"])
@@ -215,18 +268,19 @@ def run_scan():
 
     new_jobs.sort(key=lambda j: score(j["title"]), reverse=True)
     sources = list(set(j["source"] for j in new_jobs))
-    print(f"Total: {len(new_jobs)} jobs | Sources: {sources}")
+    print(f"Total after date filter: {len(new_jobs)} | Sources: {sources}")
 
     if not new_jobs:
-        send_telegram("No new matching jobs found.")
+        send_telegram("✅ Scan done — no new jobs from the last 7 days.")
         return "no jobs"
 
-    send_telegram(f"🔍 <b>{min(len(new_jobs),20)} new job matches</b>\nSources: {', '.join(sources)}")
+    send_telegram(f"🔍 <b>{min(len(new_jobs),20)} jobs posted in the last 7 days</b>\nSources: {', '.join(sources)}")
 
     for j in new_jobs[:20]:
+        date_label = f"\n📅 {fmt_date(j.get('date',''))}" if j.get("date") else ""
         send_telegram(
             f"💼 <b>{j['title']}</b>\n"
-            f"🏢 {j['company']}\n"
+            f"🏢 {j['company']}{date_label}\n"
             f"🔗 <a href='{j['url']}'>Apply Now</a>\n"
             f"📌 via {j['source']}"
         )
