@@ -44,7 +44,16 @@ def score(title):
     t = title.lower()
     return min(sum(10 for k in KEYWORDS if k in t), 100)
 
-# ── WWR ─────────────────────────────────────────────────────────────────────
+def scrape_url(url, timeout=25):
+    """Fetch a URL via ScraperAPI if key available, else direct"""
+    if SCRAPER_KEY:
+        return requests.get(
+            f"http://api.scraperapi.com?api_key={SCRAPER_KEY}&url={requests.utils.quote(url, safe=':/')}",
+            timeout=timeout
+        )
+    return requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=timeout)
+
+# ── WeWorkRemotely ───────────────────────────────────────────────────────────
 def scrape_wwr():
     jobs = []
     for cat in ["remote-customer-support-jobs", "remote-marketing-jobs"]:
@@ -53,21 +62,20 @@ def scrape_wwr():
             for e in feed.entries:
                 raw = e.get("title", "")
                 if " at " in raw:
-                    title   = raw.split(" at ")[0].strip()
-                    company = raw.split(" at ")[-1].strip()
+                    title, company = raw.split(" at ")[0].strip(), raw.split(" at ")[-1].strip()
                 elif ": " in raw:
-                    parts   = raw.split(": ", 1)
-                    company = parts[0].strip()
-                    title   = parts[1].strip()
+                    parts = raw.split(": ", 1)
+                    company, title = parts[0].strip(), parts[1].strip()
                 else:
                     title, company = raw, ""
                 if is_relevant(title):
                     jobs.append({"title": title, "company": company, "url": e.get("link",""), "source": "WeWorkRemotely"})
         except Exception as ex:
             print(f"WWR: {ex}")
+    print(f"WWR: {len(jobs)}")
     return jobs
 
-# ── RemoteOK ────────────────────────────────────────────────────────────────
+# ── RemoteOK ─────────────────────────────────────────────────────────────────
 def scrape_remoteok():
     jobs = []
     try:
@@ -79,9 +87,10 @@ def scrape_remoteok():
                 jobs.append({"title": title, "company": j.get("company",""), "url": j.get("url",""), "source": "RemoteOK"})
     except Exception as e:
         print(f"RemoteOK: {e}")
+    print(f"RemoteOK: {len(jobs)}")
     return jobs
 
-# ── Jobicy API ───────────────────────────────────────────────────────────────
+# ── Jobicy ────────────────────────────────────────────────────────────────────
 def scrape_jobicy():
     jobs = []
     for q in ["community+manager","moderator","customer+support","social+media+manager","ambassador"]:
@@ -93,83 +102,22 @@ def scrape_jobicy():
                     jobs.append({"title": title, "company": j.get("companyName",""), "url": j.get("url",""), "source": "Jobicy"})
         except Exception as e:
             print(f"Jobicy: {e}")
+    print(f"Jobicy: {len(jobs)}")
     return jobs
 
-# ── Crypto.jobs RSS ──────────────────────────────────────────────────────────
-def scrape_cryptodotjobs():
-    jobs = []
-    try:
-        feed = feedparser.parse("https://crypto.jobs/jobs.rss")
-        print(f"crypto.jobs entries: {len(feed.entries)}")
-        for e in feed.entries:
-            title   = e.get("title","")
-            company = e.get("author","") or e.get("dc_creator","")
-            if is_relevant(title):
-                jobs.append({"title": title, "company": company, "url": e.get("link",""), "source": "crypto.jobs"})
-    except Exception as ex:
-        print(f"crypto.jobs: {ex}")
-    return jobs
-
-# ── CryptocurrencyJobs RSS ───────────────────────────────────────────────────
-def scrape_cryptocurrencyjobs_rss():
-    jobs = []
-    try:
-        feed = feedparser.parse("https://cryptocurrencyjobs.co/feed/")
-        print(f"CryptocurrencyJobs entries: {len(feed.entries)}")
-        for e in feed.entries:
-            title   = e.get("title","")
-            company = e.get("author","")
-            if is_relevant(title):
-                jobs.append({"title": title, "company": company, "url": e.get("link",""), "source": "CryptocurrencyJobs"})
-    except Exception as ex:
-        print(f"CryptocurrencyJobs: {ex}")
-    return jobs
-
-# ── CryptoJobsList scrape ────────────────────────────────────────────────────
-def scrape_cryptojobslist():
-    jobs = []
-    if not SCRAPER_KEY:
-        return jobs
-    try:
-        from bs4 import BeautifulSoup
-        for path in ["/community", "/marketing", "/support"]:
-            target = f"https://cryptojobslist.com{path}"
-            r = requests.get(f"http://api.scraperapi.com?api_key={SCRAPER_KEY}&url={target}", timeout=25)
-            soup = BeautifulSoup(r.text, "html.parser")
-            for tag in soup.find_all("h2"):
-                title = tag.get_text(strip=True)
-                if not is_relevant(title):
-                    continue
-                parent = tag.find_parent("a")
-                if not parent:
-                    continue
-                href = parent.get("href","")
-                link = ("https://cryptojobslist.com" + href) if href.startswith("/") else href
-                company_tag = tag.find_next("span")
-                company = company_tag.get_text(strip=True) if company_tag else ""
-                jobs.append({"title": title, "company": company, "url": link, "source": "CryptoJobsList"})
-    except Exception as e:
-        print(f"CryptoJobsList: {e}")
-    return jobs
-
-# ── Web3.career scrape ───────────────────────────────────────────────────────
+# ── Web3.career ───────────────────────────────────────────────────────────────
 def scrape_web3career():
     jobs = []
-    if not SCRAPER_KEY:
-        return jobs
     for q in ["community-manager", "moderator", "customer-support", "social-media-manager"]:
         try:
             from bs4 import BeautifulSoup
-            target = f"https://web3.career/{q}-jobs"
-            r = requests.get(f"http://api.scraperapi.com?api_key={SCRAPER_KEY}&url={target}", timeout=25)
+            r = scrape_url(f"https://web3.career/{q}-jobs")
             soup = BeautifulSoup(r.text, "html.parser")
             for tag in soup.find_all("h2"):
                 title = tag.get_text(strip=True)
-                if not is_relevant(title):
-                    continue
+                if not is_relevant(title): continue
                 parent = tag.find_parent("a")
-                if not parent:
-                    continue
+                if not parent: continue
                 href = parent.get("href","")
                 link = ("https://web3.career" + href) if href.startswith("/") else href
                 company_tag = tag.find_next("h3")
@@ -177,50 +125,139 @@ def scrape_web3career():
                 jobs.append({"title": title, "company": company, "url": link, "source": "Web3.career"})
         except Exception as e:
             print(f"Web3.career: {e}")
+    print(f"Web3.career: {len(jobs)}")
     return jobs
 
-# ── Remote3 scrape ───────────────────────────────────────────────────────────
-def scrape_remote3():
+# ── crypto.jobs ───────────────────────────────────────────────────────────────
+def scrape_cryptodotjobs():
     jobs = []
-    if not SCRAPER_KEY:
-        return jobs
-    for path in ["/community-jobs", "/marketing-jobs", "/support-jobs"]:
-        try:
-            from bs4 import BeautifulSoup
-            target = f"https://remote3.co{path}"
-            r = requests.get(f"http://api.scraperapi.com?api_key={SCRAPER_KEY}&url={target}", timeout=25)
+    urls = [
+        "https://crypto.jobs/jobs/community-manager",
+        "https://crypto.jobs/jobs/customer-support",
+        "https://crypto.jobs/jobs/marketing",
+    ]
+    try:
+        from bs4 import BeautifulSoup
+        for target in urls:
+            r = scrape_url(target)
+            soup = BeautifulSoup(r.text, "html.parser")
+            # crypto.jobs uses <h3> for job titles inside <a> tags
+            for tag in soup.find_all(["h2","h3"]):
+                title = tag.get_text(strip=True)
+                if not is_relevant(title): continue
+                parent = tag.find_parent("a")
+                if not parent: continue
+                href = parent.get("href","")
+                link = ("https://crypto.jobs" + href) if href.startswith("/") else href
+                company_tag = tag.find_next(["span","p","h4"])
+                company = company_tag.get_text(strip=True) if company_tag else ""
+                jobs.append({"title": title, "company": company, "url": link, "source": "crypto.jobs"})
+    except Exception as e:
+        print(f"crypto.jobs: {e}")
+    print(f"crypto.jobs: {len(jobs)}")
+    return jobs
+
+# ── CryptocurrencyJobs ────────────────────────────────────────────────────────
+def scrape_cryptocurrencyjobs():
+    jobs = []
+    urls = [
+        "https://cryptocurrencyjobs.co/community/",
+        "https://cryptocurrencyjobs.co/marketing/",
+        "https://cryptocurrencyjobs.co/support/",
+    ]
+    try:
+        from bs4 import BeautifulSoup
+        for target in urls:
+            r = scrape_url(target)
             soup = BeautifulSoup(r.text, "html.parser")
             for tag in soup.find_all(["h2","h3"]):
                 title = tag.get_text(strip=True)
-                if not is_relevant(title):
-                    continue
+                if not is_relevant(title): continue
                 parent = tag.find_parent("a")
-                if not parent:
-                    continue
+                if not parent: continue
+                href = parent.get("href","")
+                link = ("https://cryptocurrencyjobs.co" + href) if href.startswith("/") else href
+                company_tag = tag.find_next(["span","p"])
+                company = company_tag.get_text(strip=True) if company_tag else ""
+                jobs.append({"title": title, "company": company, "url": link, "source": "CryptocurrencyJobs"})
+    except Exception as e:
+        print(f"CryptocurrencyJobs: {e}")
+    print(f"CryptocurrencyJobs: {len(jobs)}")
+    return jobs
+
+# ── JobStash ──────────────────────────────────────────────────────────────────
+def scrape_jobstash():
+    jobs = []
+    urls = [
+        "https://jobstash.xyz/community",
+        "https://jobstash.xyz/support",
+        "https://jobstash.xyz/marketing",
+    ]
+    try:
+        from bs4 import BeautifulSoup
+        for target in urls:
+            r = scrape_url(target)
+            soup = BeautifulSoup(r.text, "html.parser")
+            for tag in soup.find_all(["h2","h3"]):
+                title = tag.get_text(strip=True)
+                if not is_relevant(title): continue
+                parent = tag.find_parent("a")
+                if not parent: continue
+                href = parent.get("href","")
+                link = ("https://jobstash.xyz" + href) if href.startswith("/") else href
+                company_tag = tag.find_next(["span","p","h4"])
+                company = company_tag.get_text(strip=True) if company_tag else ""
+                jobs.append({"title": title, "company": company, "url": link, "source": "JobStash"})
+    except Exception as e:
+        print(f"JobStash: {e}")
+    print(f"JobStash: {len(jobs)}")
+    return jobs
+
+# ── CryptoJobsList ────────────────────────────────────────────────────────────
+def scrape_cryptojobslist():
+    jobs = []
+    for path in ["/community", "/marketing", "/support"]:
+        try:
+            from bs4 import BeautifulSoup
+            r = scrape_url(f"https://cryptojobslist.com{path}")
+            soup = BeautifulSoup(r.text, "html.parser")
+            for tag in soup.find_all("h2"):
+                title = tag.get_text(strip=True)
+                if not is_relevant(title): continue
+                parent = tag.find_parent("a")
+                if not parent: continue
+                href = parent.get("href","")
+                link = ("https://cryptojobslist.com" + href) if href.startswith("/") else href
+                company_tag = tag.find_next("span")
+                company = company_tag.get_text(strip=True) if company_tag else ""
+                jobs.append({"title": title, "company": company, "url": link, "source": "CryptoJobsList"})
+        except Exception as e:
+            print(f"CryptoJobsList: {e}")
+    print(f"CryptoJobsList: {len(jobs)}")
+    return jobs
+
+# ── Remote3 ───────────────────────────────────────────────────────────────────
+def scrape_remote3():
+    jobs = []
+    for path in ["/community-jobs", "/marketing-jobs", "/support-jobs"]:
+        try:
+            from bs4 import BeautifulSoup
+            r = scrape_url(f"https://remote3.co{path}")
+            soup = BeautifulSoup(r.text, "html.parser")
+            for tag in soup.find_all(["h2","h3"]):
+                title = tag.get_text(strip=True)
+                if not is_relevant(title): continue
+                parent = tag.find_parent("a")
+                if not parent: continue
                 href = parent.get("href","")
                 link = ("https://remote3.co" + href) if href.startswith("/") else href
                 jobs.append({"title": title, "company": "", "url": link, "source": "Remote3"})
         except Exception as e:
             print(f"Remote3: {e}")
+    print(f"Remote3: {len(jobs)}")
     return jobs
 
-# ── Crypto Twitter via Google RSS ────────────────────────────────────────────
-def scrape_ct_google():
-    jobs = []
-    for q in ["site:twitter.com hiring community manager web3",
-              "site:twitter.com hiring discord moderator crypto"]:
-        try:
-            enc = requests.utils.quote(q)
-            feed = feedparser.parse(f"https://news.google.com/rss/search?q={enc}&hl=en-US&gl=US&ceid=US:en")
-            for e in feed.entries:
-                title = e.get("title","")
-                if is_relevant(title):
-                    jobs.append({"title": title, "company": "CT", "url": e.get("link",""), "source": "Crypto Twitter"})
-        except Exception as e:
-            print(f"CT: {e}")
-    return jobs
-
-# ── Telegram sender ──────────────────────────────────────────────────────────
+# ── Telegram ──────────────────────────────────────────────────────────────────
 def send_telegram(msg):
     if not BOT_TOKEN or not CHAT_ID:
         return
@@ -230,20 +267,19 @@ def send_telegram(msg):
         timeout=10
     )
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 def run_scan():
     all_jobs = []
     all_jobs += scrape_wwr()
     all_jobs += scrape_remoteok()
     all_jobs += scrape_jobicy()
-    all_jobs += scrape_cryptodotjobs()
-    all_jobs += scrape_cryptocurrencyjobs_rss()
-    all_jobs += scrape_cryptojobslist()
     all_jobs += scrape_web3career()
+    all_jobs += scrape_cryptodotjobs()
+    all_jobs += scrape_cryptocurrencyjobs()
+    all_jobs += scrape_jobstash()
+    all_jobs += scrape_cryptojobslist()
     all_jobs += scrape_remote3()
-    all_jobs += scrape_ct_google()
 
-    # Deduplicate by title+company hash
     seen, new_jobs = set(), []
     for j in all_jobs:
         jid = uid(j["title"], j["company"])
