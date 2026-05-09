@@ -69,13 +69,28 @@ def store_jobs(jobs):
             "salary": j.get("salary",""),
             "funding": j.get("funding",""),
             "company_type": j.get("company_type",""),
-            "visa": j.get("visa", False),
-            "hot": j.get("hot", False),
+            "visa": bool(j.get("visa", False)),
+            "hot": bool(j.get("hot", False)),
         })
-    # Insert in batches of 100
+    hdrs = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates,return=minimal",
+    }
+    url = SUPABASE_URL.rstrip("/") + "/rest/v1/jobs"
+    total = 0
     for i in range(0, len(rows), 100):
-        sb_post("jobs", rows[i:i+100], upsert=True)
-    print(f"Stored {len(rows)} jobs in Supabase")
+        batch = rows[i:i+100]
+        try:
+            r = requests.post(url, headers=hdrs, json=batch, timeout=30)
+            if r.status_code in (200, 201):
+                total += len(batch)
+            else:
+                print(f"store_jobs batch error: {r.status_code} {r.text[:200]}")
+        except Exception as e:
+            print(f"store_jobs error: {e}")
+    print(f"Stored {total} jobs in Supabase")
 
 def fmt_date(date_val):
     if not date_val:
