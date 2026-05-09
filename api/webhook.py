@@ -162,6 +162,7 @@ def handle_start(chat_id, username):
         "location_key": "worldwide",
         "remote_only": False,
         "company_type": "any",
+        "awaiting_keywords": False,
     })
     send(chat_id, WELCOME, kb_main())
 
@@ -267,25 +268,29 @@ def finish_setup(chat_id, msg_id, ctype, cb_id):
         f"🎯 {SEN_LABELS.get(user.get('seniority','all'),'All Levels')}\n"
         f"📍 {LOC_LABELS.get(user.get('location_key','worldwide'),'Worldwide')}\n"
         f"🏢 {CTYPE_LABELS.get(ctype,'Any')}\n\n"
-        f"💡 <b>Want more specific results?</b> Add keywords:\n"
-        f"<code>/keywords ambassador, kol manager, discord moderator, telegram mod, zealy, galxe</code>\n\n"
+        f"💡 <b>Want more specific results?</b>\n"
+        f"Tap /keywords and type your specific roles e.g:\n"
+        f"<code>ambassador, kol manager, discord moderator</code>\n\n"
         f"Share with friends who need remote jobs! 🚀",
-        [[{"text": "📋 View My Preferences", "callback_data": "status"}]]
+        [[{"text": "📋 View My Preferences", "callback_data": "status"},
+          {"text": "🔑 Add Keywords", "callback_data": "add_keywords"}]]
     )
     send_jobs_now(chat_id, user)
 
 def handle_keywords(chat_id, text):
-    keywords = text.replace("/keywords", "").strip()
+    keywords = text.replace("/keywords", "").strip().lstrip(",").strip()
     if not keywords:
+        db_update(chat_id, {"awaiting_keywords": True})
         send(chat_id,
-             "Send your keywords like this:\n\n"
-             "<code>/keywords community manager, web3, discord</code>\n\n"
-             "Examples for specific roles:\n"
-             "<code>/keywords ambassador, kol manager, discord moderator</code>\n"
-             "<code>/keywords zealy, galxe, telegram mod</code>")
+             "✏️ <b>Add Keywords</b>\n\n"
+             "Type your keywords below and send:\n\n"
+             "<b>Examples:</b>\n"
+             "• <code>moderator, community manager</code>\n"
+             "• <code>ambassador, kol manager, discord mod</code>\n"
+             "• <code>zealy, galxe, telegram moderator</code>")
         return
-    db_update(chat_id, {"keywords": keywords})
-    send(chat_id, f"✅ Keywords saved: <b>{keywords}</b>\n\nYour alerts will now include jobs matching these terms.")
+    db_update(chat_id, {"keywords": keywords, "awaiting_keywords": False})
+    send(chat_id, f"✅ Keywords saved: <b>{keywords}</b>\n\nYour next alert will include jobs matching these terms.")
 
 def process_update(update):
     if "message" in update:
@@ -293,6 +298,14 @@ def process_update(update):
         chat_id = msg["chat"]["id"]
         username = msg.get("from", {}).get("username", "")
         text = msg.get("text", "")
+
+        # Handle keyword reply state
+        if text and not text.startswith("/"):
+            user = db_get(chat_id)
+            if user.get("awaiting_keywords"):
+                db_update(chat_id, {"keywords": text.strip(), "awaiting_keywords": False})
+                send(chat_id, f"✅ Keywords saved: <b>{text.strip()}</b>\n\nYour next alert will include jobs matching these terms.")
+                return
 
         if text.startswith("/start"):
             handle_start(chat_id, username)
@@ -314,8 +327,8 @@ def process_update(update):
                 "/stop — Pause alerts\n"
                 "/help — This message\n\n"
                 "💡 <b>Keyword examples:</b>\n"
-                "<code>/keywords ambassador, kol manager, discord moderator</code>\n"
-                "<code>/keywords zealy, galxe, telegram mod, community lead</code>")
+                "<code>ambassador, kol manager, discord moderator</code>\n"
+                "<code>zealy, galxe, telegram mod, community lead</code>")
 
     elif "callback_query" in update:
         cb = update["callback_query"]
@@ -331,6 +344,16 @@ def process_update(update):
         if data == "setup_start":
             answer(cb_id)
             step1_category(chat_id, msg_id)
+        elif data == "add_keywords":
+            answer(cb_id)
+            db_update(chat_id, {"awaiting_keywords": True})
+            send(chat_id,
+                 "✏️ <b>Add Keywords</b>\n\n"
+                 "Type your keywords below and send:\n\n"
+                 "<b>Examples:</b>\n"
+                 "• <code>moderator, community manager</code>\n"
+                 "• <code>ambassador, kol manager, discord mod</code>\n"
+                 "• <code>zealy, galxe, telegram moderator</code>")
         elif data == "status":
             answer(cb_id)
             handle_status(chat_id)
