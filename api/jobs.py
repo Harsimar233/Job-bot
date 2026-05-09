@@ -411,7 +411,7 @@ def scrape_adzuna():
     jobs = []
     seen = set()
     # Search top countries with most relevant queries
-    priority_countries = ["gb", "us"]
+    priority_countries = ["gb", "us", "in", "au", "de", "ca", "sg", "za", "fr", "nl"]
     for country in priority_countries:
         country_name = ADZUNA_COUNTRIES.get(country, country.upper())
         for query in ADZUNA_QUERIES[:5]:  # Limit queries per country to save API calls
@@ -428,9 +428,8 @@ def scrape_adzuna():
                     },
                     headers=HEADERS, timeout=15
                 )
-               if r.status_code != 200:
-    print(f"Adzuna {country} {query}: status {r.status_code} - {r.text[:100]}")
-    continue
+                if r.status_code != 200:
+                    continue
                 for j in r.json().get("results", []):
                     url = j.get("redirect_url","")
                     if not url or url in seen:
