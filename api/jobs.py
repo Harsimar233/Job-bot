@@ -428,8 +428,9 @@ def scrape_adzuna():
                     },
                     headers=HEADERS, timeout=15
                 )
-                if r.status_code != 200:
-                    continue
+               if r.status_code != 200:
+    print(f"Adzuna {country} {query}: status {r.status_code} - {r.text[:100]}")
+    continue
                 for j in r.json().get("results", []):
                     url = j.get("redirect_url","")
                     if not url or url in seen:
