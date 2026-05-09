@@ -1,220 +1,288 @@
 """
-Telegram Webhook Handler — Public Bot
-Handles /start, /setup, /stop, /status commands.
-Stores user preferences in Supabase.
+Remote Radar — Public Telegram Bot Webhook
+Full setup flow: category, seniority, location, keywords, company type
 """
 import os, json, requests
 from http.server import BaseHTTPRequestHandler
 
-BOT_TOKEN  = os.environ.get("JOB_BOT_TOKEN", "")
+BOT_TOKEN    = os.environ.get("JOB_BOT_TOKEN", "")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+TG_API       = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+WELCOME = """👋 <b>Welcome to Remote Radar!</b>
 
-WELCOME = """👋 Welcome to <b>Remote Radar</b>!
+I find remote jobs worldwide and send alerts straight to your Telegram — daily, free, forever.
 
-I send you daily alerts for remote jobs that match your preferences — for free.
+🌍 Jobs from 9 sources globally
+📂 Every category — Tech, Marketing, Sales, Finance, Executive & more
+⚡ Personalised to your exact preferences
 
-🔍 Jobs from 6+ sources updated daily
-🌍 Remote jobs worldwide
-⚡ Delivered straight to Telegram
+Let's set up your alerts in 4 quick steps 👇"""
 
-Tap <b>Setup Alerts</b> to get started 👇"""
+# ── Supabase ──────────────────────────────────────────────────────────────────
 
-CATEGORIES = {
-    "community": "Community & Social Media",
-    "marketing": "Marketing & Growth",
-    "support": "Customer Support",
-    "web3": "Web3 & Crypto",
-    "all": "All Remote Jobs",
-}
-
-# ── Supabase helpers ──────────────────────────────────────────────────────────
+def db_headers():
+    return {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates",
+    }
 
 def db_get(chat_id):
     r = requests.get(
         f"{SUPABASE_URL}/rest/v1/users?chat_id=eq.{chat_id}&select=*",
-        headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"},
-        timeout=10
-    )
+        headers=db_headers(), timeout=10)
     data = r.json()
-    return data[0] if data else None
+    return data[0] if data else {}
 
-def db_upsert(chat_id, data):
+def db_set(chat_id, data):
     data["chat_id"] = chat_id
-    requests.post(
-        f"{SUPABASE_URL}/rest/v1/users",
-        headers={
-            "apikey": SUPABASE_KEY,
-            "Authorization": f"Bearer {SUPABASE_KEY}",
-            "Content-Type": "application/json",
-            "Prefer": "resolution=merge-duplicates",
-        },
-        json=data,
-        timeout=10
-    )
+    requests.post(f"{SUPABASE_URL}/rest/v1/users",
+                  headers=db_headers(), json=data, timeout=10)
 
-def db_delete(chat_id):
-    requests.delete(
+def db_update(chat_id, data):
+    requests.patch(
         f"{SUPABASE_URL}/rest/v1/users?chat_id=eq.{chat_id}",
-        headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"},
-        timeout=10
-    )
+        headers=db_headers(), json=data, timeout=10)
 
 # ── Telegram helpers ──────────────────────────────────────────────────────────
 
 def send(chat_id, text, keyboard=None):
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
+    payload = {"chat_id": chat_id, "text": text,
+                "parse_mode": "HTML", "disable_web_page_preview": True}
     if keyboard:
         payload["reply_markup"] = {"inline_keyboard": keyboard}
     requests.post(f"{TG_API}/sendMessage", json=payload, timeout=10)
 
-def answer_callback(callback_id, text=""):
-    requests.post(f"{TG_API}/answerCallbackQuery",
-                  json={"callback_query_id": callback_id, "text": text}, timeout=5)
-
-def edit_message(chat_id, message_id, text, keyboard=None):
-    payload = {
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "text": text,
-        "parse_mode": "HTML",
-    }
+def edit(chat_id, msg_id, text, keyboard=None):
+    payload = {"chat_id": chat_id, "message_id": msg_id,
+                "text": text, "parse_mode": "HTML"}
     if keyboard:
         payload["reply_markup"] = {"inline_keyboard": keyboard}
     requests.post(f"{TG_API}/editMessageText", json=payload, timeout=10)
 
-# ── Keyboards ─────────────────────────────────────────────────────────────────
+def answer(cb_id, text=""):
+    requests.post(f"{TG_API}/answerCallbackQuery",
+                  json={"callback_query_id": cb_id, "text": text}, timeout=5)
 
-def main_keyboard():
-    return [
-        [{"text": "⚙️ Setup My Alerts", "callback_data": "setup_start"}],
-        [{"text": "📋 My Preferences", "callback_data": "status"},
-         {"text": "⏹ Stop Alerts", "callback_data": "stop"}],
-    ]
+# ── Step keyboards ────────────────────────────────────────────────────────────
 
-def category_keyboard():
+def kb_category():
     return [
-        [{"text": "🌐 Community & Social Media", "callback_data": "cat_community"}],
+        [{"text": "💻 Tech & Engineering", "callback_data": "cat_tech"}],
+        [{"text": "📦 Product Management", "callback_data": "cat_product"}],
+        [{"text": "🎨 Design & Creative", "callback_data": "cat_design"}],
         [{"text": "📣 Marketing & Growth", "callback_data": "cat_marketing"}],
+        [{"text": "🌐 Community & Social Media", "callback_data": "cat_community"}],
         [{"text": "💬 Customer Support", "callback_data": "cat_support"}],
+        [{"text": "💼 Sales & Business Dev", "callback_data": "cat_sales"}],
+        [{"text": "💰 Finance & Accounting", "callback_data": "cat_finance"}],
+        [{"text": "⚙️ Operations & HR", "callback_data": "cat_operations"}],
+        [{"text": "👔 Executive (CEO, CMO, VP+)", "callback_data": "cat_executive"}],
         [{"text": "🔗 Web3 & Crypto", "callback_data": "cat_web3"}],
-        [{"text": "🌍 All Remote Jobs", "callback_data": "cat_all"}],
+        [{"text": "🌍 All Categories", "callback_data": "cat_all"}],
     ]
 
-def location_keyboard():
+def kb_seniority():
+    return [
+        [{"text": "🌱 Entry Level", "callback_data": "sen_entry"},
+         {"text": "📈 Mid Level", "callback_data": "sen_mid"}],
+        [{"text": "⭐ Senior", "callback_data": "sen_senior"},
+         {"text": "👥 Manager / Lead", "callback_data": "sen_manager"}],
+        [{"text": "🏆 Director / VP", "callback_data": "sen_director"},
+         {"text": "👑 C-Suite", "callback_data": "sen_executive"}],
+        [{"text": "🌍 All Levels", "callback_data": "sen_all"}],
+    ]
+
+def kb_location():
     return [
         [{"text": "🌍 Remote Only", "callback_data": "loc_remote"}],
         [{"text": "🇺🇸 USA", "callback_data": "loc_usa"},
          {"text": "🇬🇧 UK", "callback_data": "loc_uk"}],
         [{"text": "🇮🇳 India", "callback_data": "loc_india"},
-         {"text": "🇪🇺 Europe", "callback_data": "loc_europe"}],
-        [{"text": "🌐 Worldwide", "callback_data": "loc_worldwide"}],
+         {"text": "🇳🇬 Nigeria", "callback_data": "loc_nigeria"}],
+        [{"text": "🇯🇵 Japan", "callback_data": "loc_japan"},
+         {"text": "🇨🇳 China", "callback_data": "loc_china"}],
+        [{"text": "🌏 SE Asia", "callback_data": "loc_sea"},
+         {"text": "🕌 Middle East", "callback_data": "loc_me"}],
+        [{"text": "🇪🇺 Europe", "callback_data": "loc_europe"}],
+        [{"text": "🌐 Worldwide / Any", "callback_data": "loc_worldwide"}],
     ]
 
-# ── Category keyword mapping ───────────────────────────────────────────────────
+def kb_company_type():
+    return [
+        [{"text": "🚀 Startups & Early Stage", "callback_data": "ctype_startup"}],
+        [{"text": "🏢 Established Companies", "callback_data": "ctype_established"}],
+        [{"text": "🌍 Both / Any", "callback_data": "ctype_any"}],
+    ]
 
-CATEGORY_KEYWORDS = {
-    "community": "community manager,community lead,discord moderator,telegram moderator,moderator,community mod,community growth,ambassador",
-    "marketing": "marketing manager,marketing lead,growth manager,growth marketing,kol manager,influencer marketing,partnerships manager,social media manager,content creator,digital marketing",
-    "support": "customer support,customer success,support specialist,support agent,help desk,live chat support",
-    "web3": "web3,crypto,blockchain,defi,dao,nft,community manager,marketing,ambassador,support",
-    "all": "community,marketing,support,social media,ambassador,growth,partnerships,customer success",
+def kb_main():
+    return [
+        [{"text": "⚙️ Setup Alerts", "callback_data": "setup_start"}],
+        [{"text": "📋 My Preferences", "callback_data": "status"},
+         {"text": "⏹ Pause Alerts", "callback_data": "stop"}],
+    ]
+
+# ── Category labels ───────────────────────────────────────────────────────────
+
+CAT_LABELS = {
+    "tech": "💻 Tech & Engineering",
+    "product": "📦 Product Management",
+    "design": "🎨 Design & Creative",
+    "marketing": "📣 Marketing & Growth",
+    "community": "🌐 Community & Social Media",
+    "support": "💬 Customer Support",
+    "sales": "💼 Sales & Business Dev",
+    "finance": "💰 Finance & Accounting",
+    "operations": "⚙️ Operations & HR",
+    "executive": "👔 Executive",
+    "web3": "🔗 Web3 & Crypto",
+    "all": "🌍 All Categories",
 }
 
-# ── Command handlers ───────────────────────────────────────────────────────────
+SEN_LABELS = {
+    "entry": "🌱 Entry Level",
+    "mid": "📈 Mid Level",
+    "senior": "⭐ Senior",
+    "manager": "👥 Manager / Lead",
+    "director": "🏆 Director / VP",
+    "executive": "👑 C-Suite",
+    "all": "🌍 All Levels",
+}
+
+LOC_LABELS = {
+    "remote": "🌍 Remote Only",
+    "usa": "🇺🇸 USA",
+    "uk": "🇬🇧 UK",
+    "india": "🇮🇳 India",
+    "nigeria": "🇳🇬 Nigeria",
+    "japan": "🇯🇵 Japan",
+    "china": "🇨🇳 China",
+    "sea": "🌏 SE Asia",
+    "me": "🕌 Middle East",
+    "europe": "🇪🇺 Europe",
+    "worldwide": "🌐 Worldwide",
+}
+
+CTYPE_LABELS = {
+    "startup": "🚀 Startups",
+    "established": "🏢 Established",
+    "any": "🌍 Any",
+}
+
+# ── Handlers ──────────────────────────────────────────────────────────────────
 
 def handle_start(chat_id, username):
-    db_upsert(chat_id, {
-        "username": username or "",
-        "active": False,
-        "setup_complete": False,
-    })
-    send(chat_id, WELCOME, main_keyboard())
+    existing = db_get(chat_id)
+    if not existing:
+        db_set(chat_id, {"username": username or "", "active": False, "setup_complete": False})
+    send(chat_id, WELCOME, kb_main())
 
 def handle_status(chat_id):
     user = db_get(chat_id)
     if not user or not user.get("setup_complete"):
-        send(chat_id, "You haven't set up your alerts yet.", main_keyboard())
+        send(chat_id, "You haven't set up alerts yet. Tap below to get started.", kb_main())
         return
-    category = user.get("category", "all")
-    location = user.get("location", "Remote")
-    active = "✅ Active" if user.get("active") else "⏸ Paused"
+    status = "✅ Active" if user.get("active") else "⏸ Paused"
+    kws = user.get("keywords","") or "None set"
     send(chat_id,
         f"📋 <b>Your Alert Preferences</b>\n\n"
-        f"Category: {CATEGORIES.get(category, category)}\n"
-        f"Location: {location}\n"
-        f"Status: {active}\n\n"
-        f"You receive alerts daily at 9am UTC.",
+        f"📂 Category: {CAT_LABELS.get(user.get('category','all'), 'All')}\n"
+        f"🎯 Level: {SEN_LABELS.get(user.get('seniority','all'), 'All')}\n"
+        f"📍 Location: {LOC_LABELS.get(user.get('location_key','worldwide'), 'Worldwide')}\n"
+        f"🏢 Company: {CTYPE_LABELS.get(user.get('company_type','any'), 'Any')}\n"
+        f"🔑 Keywords: {kws}\n"
+        f"📡 Status: {status}\n\n"
+        f"Alerts arrive daily at 9am UTC.",
         [[{"text": "✏️ Change Preferences", "callback_data": "setup_start"},
-          {"text": "⏹ Stop Alerts", "callback_data": "stop"}]]
+          {"text": "⏹ Pause", "callback_data": "stop"}]]
     )
 
 def handle_stop(chat_id):
-    db_upsert(chat_id, {"active": False})
-    send(chat_id,
-        "⏹ Alerts paused. You won't receive any more job alerts.\n\n"
-        "Tap below to restart anytime.",
-        [[{"text": "▶️ Restart Alerts", "callback_data": "setup_start"}]]
-    )
+    db_update(chat_id, {"active": False})
+    send(chat_id, "⏸ Alerts paused.\n\nTap below to restart anytime.",
+         [[{"text": "▶️ Restart Alerts", "callback_data": "setup_start"}]])
 
-def handle_setup_category(chat_id, message_id):
-    edit_message(chat_id, message_id,
-        "🎯 <b>Step 1 of 2 — Job Category</b>\n\nWhat type of remote jobs are you looking for?",
-        category_keyboard()
-    )
+def step1_category(chat_id, msg_id):
+    edit(chat_id, msg_id,
+         "⚙️ <b>Step 1 of 4 — Job Category</b>\n\nWhat type of jobs are you looking for?",
+         kb_category())
 
-def handle_category_selected(chat_id, message_id, category, callback_id):
-    answer_callback(callback_id, f"Selected: {CATEGORIES.get(category, category)}")
-    db_upsert(chat_id, {"category": category, "keywords": CATEGORY_KEYWORDS.get(category, "")})
-    edit_message(chat_id, message_id,
-        f"✅ Category: <b>{CATEGORIES.get(category, category)}</b>\n\n"
-        "📍 <b>Step 2 of 2 — Location</b>\n\nWhere are you looking to work?",
-        location_keyboard()
-    )
+def step2_seniority(chat_id, msg_id, category, cb_id):
+    answer(cb_id, f"✅ {CAT_LABELS.get(category, category)}")
+    db_update(chat_id, {"category": category})
+    edit(chat_id, msg_id,
+         f"✅ Category: {CAT_LABELS.get(category, category)}\n\n"
+         f"⚙️ <b>Step 2 of 4 — Seniority Level</b>\n\nWhat level are you targeting?",
+         kb_seniority())
 
-def handle_location_selected(chat_id, message_id, location, callback_id):
+def step3_location(chat_id, msg_id, seniority, cb_id):
+    answer(cb_id, f"✅ {SEN_LABELS.get(seniority, seniority)}")
+    db_update(chat_id, {"seniority": seniority})
+    edit(chat_id, msg_id,
+         f"✅ Level: {SEN_LABELS.get(seniority, seniority)}\n\n"
+         f"⚙️ <b>Step 3 of 4 — Location</b>\n\nWhere are you looking to work?",
+         kb_location())
+
+def step4_company_type(chat_id, msg_id, loc_key, cb_id):
     loc_map = {
-        "remote": "Remote", "usa": "USA", "uk": "UK",
-        "india": "India", "europe": "Europe", "worldwide": "Worldwide"
+        "remote": ("Remote", True),
+        "usa": ("USA", False),
+        "uk": ("UK", False),
+        "india": ("India", False),
+        "nigeria": ("Nigeria", False),
+        "japan": ("Japan", False),
+        "china": ("China", False),
+        "sea": ("Southeast Asia", False),
+        "me": ("Middle East", False),
+        "europe": ("Europe", False),
+        "worldwide": ("Worldwide", False),
     }
-    loc_name = loc_map.get(location, "Remote")
-    remote_only = location == "remote"
-    answer_callback(callback_id, f"Selected: {loc_name}")
-    db_upsert(chat_id, {
-        "location": loc_name,
-        "remote_only": remote_only,
+    loc_name, remote_only = loc_map.get(loc_key, ("Worldwide", False))
+    answer(cb_id, f"✅ {LOC_LABELS.get(loc_key, loc_key)}")
+    db_update(chat_id, {"location": loc_name, "location_key": loc_key, "remote_only": remote_only})
+    edit(chat_id, msg_id,
+         f"✅ Location: {LOC_LABELS.get(loc_key, loc_key)}\n\n"
+         f"⚙️ <b>Step 4 of 4 — Company Type</b>\n\nWhat kind of company do you prefer?",
+         kb_company_type())
+
+def finish_setup(chat_id, msg_id, ctype, cb_id):
+    answer(cb_id, f"✅ {CTYPE_LABELS.get(ctype, ctype)}")
+    db_update(chat_id, {
+        "company_type": ctype,
         "active": True,
         "setup_complete": True,
     })
+    user = db_get(chat_id)
     send(chat_id,
-        f"🎉 <b>You're all set!</b>\n\n"
-        f"You'll receive daily job alerts for:\n"
-        f"📂 {CATEGORIES.get(db_get(chat_id).get('category','all'), 'All Jobs')}\n"
-        f"📍 {loc_name}\n\n"
-        f"First alerts arrive tomorrow at 9am UTC.\n"
-        f"Share this bot with friends who need remote jobs! 👇\n\n"
-        f"<b>t.me/{get_bot_username()}</b>",
+        f"🎉 <b>All set! Your daily alerts are live.</b>\n\n"
+        f"📂 {CAT_LABELS.get(user.get('category','all'),'All Categories')}\n"
+        f"🎯 {SEN_LABELS.get(user.get('seniority','all'),'All Levels')}\n"
+        f"📍 {LOC_LABELS.get(user.get('location_key','worldwide'),'Worldwide')}\n"
+        f"🏢 {CTYPE_LABELS.get(ctype,'Any')}\n\n"
+        f"You'll get your first alerts tomorrow at 9am UTC.\n\n"
+        f"💡 <b>Tip:</b> Add specific keywords by sending /keywords\n"
+        f"Example: <code>/keywords community manager, web3, discord</code>\n\n"
+        f"Share with friends who need remote jobs! 🚀",
         [[{"text": "📋 View My Preferences", "callback_data": "status"}]]
     )
 
-def get_bot_username():
-    try:
-        r = requests.get(f"{TG_API}/getMe", timeout=5)
-        return r.json().get("result", {}).get("username", "RemoteRadarBot")
-    except Exception:
-        return "RemoteRadarBot"
+def handle_keywords(chat_id, text):
+    keywords = text.replace("/keywords", "").strip()
+    if not keywords:
+        send(chat_id,
+             "Send your keywords like this:\n\n"
+             "<code>/keywords community manager, web3, discord</code>\n\n"
+             "Jobs matching any of these will be included in your alerts.")
+        return
+    db_update(chat_id, {"keywords": keywords})
+    send(chat_id, f"✅ Keywords saved: <b>{keywords}</b>\n\nThese will be used to filter your job alerts.")
 
-# ── Main webhook handler ───────────────────────────────────────────────────────
+# ── Main processor ────────────────────────────────────────────────────────────
 
 def process_update(update):
-    # Handle regular messages
     if "message" in update:
         msg = update["message"]
         chat_id = msg["chat"]["id"]
@@ -223,44 +291,58 @@ def process_update(update):
 
         if text.startswith("/start"):
             handle_start(chat_id, username)
-        elif text.startswith("/setup"):
-            send(chat_id, "Let's update your preferences:", main_keyboard())
+        elif text.startswith("/keywords"):
+            handle_keywords(chat_id, text)
         elif text.startswith("/stop"):
             handle_stop(chat_id)
         elif text.startswith("/status"):
             handle_status(chat_id)
+        elif text.startswith("/setup"):
+            send(chat_id, "Let's update your preferences:", kb_main())
         elif text.startswith("/help"):
             send(chat_id,
                 "📖 <b>Remote Radar Commands</b>\n\n"
                 "/start — Welcome & setup\n"
                 "/setup — Change preferences\n"
+                "/keywords web3, marketing — Set custom keywords\n"
                 "/status — View your preferences\n"
                 "/stop — Pause alerts\n"
-                "/help — This message"
-            )
+                "/help — This message\n\n"
+                "🌍 Covering jobs worldwide across all categories.")
 
-    # Handle button presses
     elif "callback_query" in update:
         cb = update["callback_query"]
         chat_id = cb["from"]["id"]
-        message_id = cb["message"]["message_id"]
+        username = cb["from"].get("username", "")
+        msg_id = cb["message"]["message_id"]
         data = cb.get("data", "")
-        callback_id = cb["id"]
+        cb_id = cb["id"]
+
+        # Ensure user exists
+        if not db_get(chat_id):
+            db_set(chat_id, {"username": username, "active": False, "setup_complete": False})
 
         if data == "setup_start":
-            handle_setup_category(chat_id, message_id)
+            answer(cb_id)
+            step1_category(chat_id, msg_id)
         elif data == "status":
-            answer_callback(callback_id)
+            answer(cb_id)
             handle_status(chat_id)
         elif data == "stop":
-            answer_callback(callback_id)
+            answer(cb_id)
             handle_stop(chat_id)
         elif data.startswith("cat_"):
             category = data.replace("cat_", "")
-            handle_category_selected(chat_id, message_id, category, callback_id)
+            step2_seniority(chat_id, msg_id, category, cb_id)
+        elif data.startswith("sen_"):
+            seniority = data.replace("sen_", "")
+            step3_location(chat_id, msg_id, seniority, cb_id)
         elif data.startswith("loc_"):
-            location = data.replace("loc_", "")
-            handle_location_selected(chat_id, message_id, location, callback_id)
+            loc_key = data.replace("loc_", "")
+            step4_company_type(chat_id, msg_id, loc_key, cb_id)
+        elif data.startswith("ctype_"):
+            ctype = data.replace("ctype_", "")
+            finish_setup(chat_id, msg_id, ctype, cb_id)
 
 
 class handler(BaseHTTPRequestHandler):
@@ -268,8 +350,7 @@ class handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length)
         try:
-            update = json.loads(body)
-            process_update(update)
+            process_update(json.loads(body))
         except Exception as e:
             print(f"Webhook error: {e}")
         self.send_response(200)
@@ -279,7 +360,7 @@ class handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Remote Radar webhook is running.")
+        self.wfile.write(b"Remote Radar is running.")
 
     def log_message(self, format, *args):
         pass
