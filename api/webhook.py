@@ -50,6 +50,21 @@ def db_update(chat_id, data):
         f"{SUPABASE_URL}/rest/v1/users?chat_id=eq.{chat_id}",
         headers=db_headers(), json=data, timeout=10)
 
+def get_sent_ids(chat_id):
+    r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/sent_jobs?chat_id=eq.{chat_id}&select=job_id",
+        headers=db_headers(), timeout=10)
+    return {row["job_id"] for row in r.json()} if r.status_code == 200 else set()
+
+def mark_sent(chat_id, job_ids):
+    if not job_ids:
+        return
+    requests.post(
+        f"{SUPABASE_URL}/rest/v1/sent_jobs",
+        headers={**db_headers(), "Prefer": "resolution=ignore-duplicates"},
+        json=[{"chat_id": chat_id, "job_id": jid} for jid in job_ids],
+        timeout=10)
+
 def send(chat_id, text, keyboard=None):
     payload = {"chat_id": chat_id, "text": text,
                 "parse_mode": "HTML", "disable_web_page_preview": True}
@@ -124,6 +139,13 @@ def kb_main():
          {"text": "⏹ Pause Alerts", "callback_data": "stop"}],
     ]
 
+def kb_after_jobs():
+    return [
+        [{"text": "🔍 Find More Jobs", "callback_data": "find_jobs"}],
+        [{"text": "📋 My Preferences", "callback_data": "status"},
+         {"text": "🔑 Add Keywords", "callback_data": "add_keywords"}],
+    ]
+
 CAT_LABELS = {
     "tech": "💻 Tech & Engineering", "product": "📦 Product Management",
     "design": "🎨 Design & Creative", "marketing": "📣 Marketing & Growth",
@@ -183,7 +205,8 @@ def handle_status(chat_id):
         f"📡 Status: {status}\n\n"
         f"Alerts arrive daily at 9am UTC.",
         [[{"text": "✏️ Change Preferences", "callback_data": "setup_start"},
-          {"text": "⏹ Pause", "callback_data": "stop"}]]
+          {"text": "⏹ Pause", "callback_data": "stop"}],
+         [{"text": "🔍 Find Jobs Now", "callback_data": "find_jobs"}]]
     )
 
 def handle_stop(chat_id):
@@ -228,35 +251,63 @@ def step4_company_type(chat_id, msg_id, loc_key, cb_id):
          f"⚙️ <b>Step 4 of 4 — Company Type</b>\n\nWhat kind of company do you prefer?",
          kb_company_type())
 
-def send_jobs_now(chat_id, user):
+def fmt_job(job):
+    from api.jobs import fmt_date
+    date_label = f"\n📅 {fmt_date(job['date'])}" if job.get("date") else ""
+    loc_label = f"\n📍 {job['location']}" if job.get("location") and job["location"].lower() != "remote" else ""
+    funding = f"\n💸 {job['funding']}" if job.get("funding") else ""
+    startup = "\n🚀 Early-stage startup" if job.get("company_type") == "startup" and not job.get("funding") else ""
+    return (
+        f"💼 <b>{job['title']}</b>\n"
+        f"🏢 {job['company'] or 'Unknown'}"
+        f"{loc_label}{funding}{startup}{date_label}\n"
+        f"🔗 <a href='{job['url']}'>Apply Now</a>\n"
+        f"📌 via {job['source']}"
+    )
+
+def send_jobs_now(chat_id, user, show_button=True):
     try:
-        from api.jobs import get_all_jobs, matches_user, fmt_date, score
-        send(chat_id, "🔍 Finding your first matching jobs now...")
+        from api.jobs import get_all_jobs, matches_user, score
+        send(chat_id, "🔍 Searching for matching jobs...")
         all_jobs = get_all_jobs()
         keywords = user.get("keywords", "")
-        matched = [j for j in all_jobs if matches_user(j, user)]
+
+        # Filter out already sent jobs
+        sent_ids = get_sent_ids(chat_id)
+        matched = [j for j in all_jobs
+                   if matches_user(j, user) and j["_id"] not in sent_ids]
         matched.sort(key=lambda j: score(j["title"], keywords), reverse=True)
         matched = matched[:10]
+
         if not matched:
-            send(chat_id, "No matching jobs found right now. You'll get alerts daily at 9am UTC as new jobs are posted.")
-            return
-        sources = list({j["source"] for j in matched})
-        send(chat_id, f"🔍 <b>{len(matched)} jobs matching your profile</b>\nSources: {', '.join(sources)}")
-        for job in matched:
-            date_label = f"\n📅 {fmt_date(job['date'])}" if job.get("date") else ""
-            loc_label = f"\n📍 {job['location']}" if job.get("location") and job["location"].lower() != "remote" else ""
-            funding = f"\n💸 {job['funding']}" if job.get("funding") else ""
-            startup = "\n🚀 Early-stage startup" if job.get("company_type") == "startup" and not job.get("funding") else ""
             send(chat_id,
-                f"💼 <b>{job['title']}</b>\n"
-                f"🏢 {job['company'] or 'Unknown'}"
-                f"{loc_label}{funding}{startup}{date_label}\n"
-                f"🔗 <a href='{job['url']}'>Apply Now</a>\n"
-                f"📌 via {job['source']}"
+                "📭 <b>No new jobs found today.</b>\n\n"
+                "All matching jobs have already been sent to you. "
+                "Check back tomorrow for fresh listings or broaden your preferences.",
+                [[{"text": "⚙️ Change Preferences", "callback_data": "setup_start"},
+                  {"text": "🔑 Update Keywords", "callback_data": "add_keywords"}]]
             )
+            return
+
+        sources = list({j["source"] for j in matched})
+        send(chat_id, f"🔍 <b>{len(matched)} new jobs matching your profile</b>\nSources: {', '.join(sources)}")
+
+        new_ids = []
+        for job in matched:
+            send(chat_id, fmt_job(job))
+            new_ids.append(job["_id"])
+
+        mark_sent(chat_id, new_ids)
+
+        if show_button:
+            send(chat_id,
+                f"✅ <b>That's all for now.</b>\n\nNext batch arrives tomorrow at 9am UTC.",
+                kb_after_jobs()
+            )
+
     except Exception as e:
         print(f"send_jobs_now error: {e}")
-        send(chat_id, "You'll receive your first alerts tomorrow at 9am UTC.")
+        send(chat_id, "Something went wrong. Try again in a moment.")
 
 def finish_setup(chat_id, msg_id, ctype, cb_id):
     answer(cb_id, f"✅ {CTYPE_LABELS.get(ctype, ctype)}")
@@ -272,7 +323,7 @@ def finish_setup(chat_id, msg_id, ctype, cb_id):
         f"Tap /keywords and type your specific roles e.g:\n"
         f"<code>ambassador, kol manager, discord moderator</code>\n\n"
         f"Share with friends who need remote jobs! 🚀",
-        [[{"text": "📋 View My Preferences", "callback_data": "status"},
+        [[{"text": "📋 My Preferences", "callback_data": "status"},
           {"text": "🔑 Add Keywords", "callback_data": "add_keywords"}]]
     )
     send_jobs_now(chat_id, user)
@@ -290,7 +341,9 @@ def handle_keywords(chat_id, text):
              "• <code>zealy, galxe, telegram moderator</code>")
         return
     db_update(chat_id, {"keywords": keywords, "awaiting_keywords": False})
-    send(chat_id, f"✅ Keywords saved: <b>{keywords}</b>\n\nYour next alert will include jobs matching these terms.")
+    send(chat_id, f"✅ Keywords saved: <b>{keywords}</b>")
+    user = db_get(chat_id)
+    send_jobs_now(chat_id, user)
 
 def process_update(update):
     if "message" in update:
@@ -304,7 +357,9 @@ def process_update(update):
             user = db_get(chat_id)
             if user.get("awaiting_keywords"):
                 db_update(chat_id, {"keywords": text.strip(), "awaiting_keywords": False})
-                send(chat_id, f"✅ Keywords saved: <b>{text.strip()}</b>\n\nYour next alert will include jobs matching these terms.")
+                send(chat_id, f"✅ Keywords saved: <b>{text.strip()}</b>")
+                user = db_get(chat_id)
+                send_jobs_now(chat_id, user)
                 return
 
         if text.startswith("/start"):
@@ -317,12 +372,19 @@ def process_update(update):
             handle_status(chat_id)
         elif text.startswith("/setup"):
             send(chat_id, "Let's update your preferences:", kb_main())
+        elif text.startswith("/find"):
+            user = db_get(chat_id)
+            if user.get("setup_complete"):
+                send_jobs_now(chat_id, user)
+            else:
+                send(chat_id, "Please set up your preferences first.", kb_main())
         elif text.startswith("/help"):
             send(chat_id,
                 "📖 <b>Remote Radar Commands</b>\n\n"
                 "/start — Welcome & setup\n"
                 "/setup — Change preferences\n"
                 "/keywords — Add specific role keywords\n"
+                "/find — Find jobs now\n"
                 "/status — View your preferences\n"
                 "/stop — Pause alerts\n"
                 "/help — This message\n\n"
@@ -344,6 +406,10 @@ def process_update(update):
         if data == "setup_start":
             answer(cb_id)
             step1_category(chat_id, msg_id)
+        elif data == "find_jobs":
+            answer(cb_id, "Searching...")
+            user = db_get(chat_id)
+            send_jobs_now(chat_id, user)
         elif data == "add_keywords":
             answer(cb_id)
             db_update(chat_id, {"awaiting_keywords": True})
