@@ -411,7 +411,7 @@ def scrape_adzuna():
     jobs = []
     seen = set()
     # Search top countries with most relevant queries
-    priority_countries = ["gb", "us", "in", "au", "de", "ca", "sg", "za", "fr", "nl"]
+    priority_countries = ["gb", "us"]
     for country in priority_countries:
         country_name = ADZUNA_COUNTRIES.get(country, country.upper())
         for query in ADZUNA_QUERIES[:5]:  # Limit queries per country to save API calls
