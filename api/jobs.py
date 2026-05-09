@@ -424,9 +424,9 @@ def scrape_adzuna():
                         "results_per_page": 20,
                         "what": query,
                         "sort_by": "date",
-                        "content-type": "application/json",
                     },
-                    headers=HEADERS, timeout=15
+                    headers={**HEADERS, "Accept": "application/json"},
+                    timeout=15
                 )
                 if r.status_code != 200:
                     continue
