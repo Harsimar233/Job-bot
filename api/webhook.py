@@ -11,16 +11,17 @@ TG_API       = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 WELCOME = """👋 <b>Welcome to Remote Radar!</b>
 
-I find remote jobs worldwide and send alerts straight to your Telegram — daily, free, forever.
+Set your preferences once. We send you fresh remote job alerts every morning — automatically, free, forever.
 
 🌍 Jobs from 9 sources globally
 📂 Every category — Tech, Marketing, Sales, Finance, Executive & more
+⏰ Daily alerts at 9am UTC — no manual searching ever again
 ⚡ Personalised to your exact preferences
 
 💡 After setup, use /keywords to target specific roles like:
-<code>ambassador, kol manager, discord moderator, telegram mod, zealy, galxe</code>
+<code>ambassador, kol manager, discord moderator, telegram mod</code>
 
-Let's set up your alerts in 4 quick steps 👇
+Let's set up in 4 quick steps 👇
 
 <i>Made by <a href="https://t.me/Harsimarhs">@Harsimarhs</a> · Feel free to reach out for any queries</i>"""
 
