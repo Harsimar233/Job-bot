@@ -126,7 +126,7 @@ def run():
 
         for job in batch:
             send(chat_id, format_job(job))
-            mark_sent(chat_id, job["id"])
+            mark_sent(chat_id, job["_id"])
 
         send(chat_id,
              "That's today's batch! See you tomorrow with fresh listings. 🚀\n"
@@ -152,7 +152,7 @@ def run():
                 send(chat_id, f"👁 <b>Watchlist Alert!</b> {len(watched_jobs)} new job(s) from companies you're watching:")
                 for job in watched_jobs[:5]:
                     send(chat_id, format_job(job))
-                    mark_sent(chat_id, job["id"])
+                    mark_sent(chat_id, job["_id"])
 
     print("Scan complete.")
 
