@@ -1,4 +1,4 @@
-name: Job Scan
+name: Daily Job Scan
 
 on:
   schedule:
@@ -9,14 +9,14 @@ jobs:
   scan:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-python@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: pip install requests feedparser beautifulsoup4 lxml
-      - run: python api/scan.py
+      - run: pip install requests feedparser beautifulsoup4 lxml supabase
+      - run: python -m api.scan
         env:
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          CHAT_ID: ${{ secrets.CHAT_ID }}
+          JOB_BOT_TOKEN: ${{ secrets.JOB_BOT_TOKEN }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           SCRAPER_KEY: ${{ secrets.SCRAPER_KEY }}
-          RUN_MODE: full
