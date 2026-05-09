@@ -8,6 +8,7 @@ on:
 jobs:
   scan:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -16,9 +17,7 @@ jobs:
       - run: pip install requests feedparser beautifulsoup4 lxml supabase
       - run: python -m api.scan
         env:
-          JOB_BOT_TOKEN: ${{ secrets.JOB_BOT_TOKEN }}
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-          SCRAPER_KEY: ${{ secrets.SCRAPER_KEY }}
-          ADZUNA_ID: ${{ secrets.ADZUNA_ID }}
-          ADZUNA_KEY: ${{ secrets.ADZUNA_KEY }}
+          JOB_BOT_TOKEN:  ${{ secrets.JOB_BOT_TOKEN }}
+          SUPABASE_URL:   ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY:   ${{ secrets.SUPABASE_KEY }}
+          SCRAPER_KEY:    ${{ secrets.SCRAPER_KEY }}
