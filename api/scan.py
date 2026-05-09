@@ -101,7 +101,7 @@ def run():
 
         # Filter matching + unsent jobs
         matched = [j for j in all_jobs
-                   if matches_user(j, user) and not was_sent(chat_id, j["id"])]
+                   if matches_user(j, user) and not was_sent(chat_id, j["_id"])]
         matched.sort(key=lambda j: (-score(j["title"], keywords), not j.get("hot")))
         batch = matched[:10]
 
