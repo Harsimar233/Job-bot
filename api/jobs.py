@@ -410,41 +410,38 @@ def scrape_adzuna():
         return []
     jobs = []
     seen = set()
-    # Search top countries with most relevant queries
     priority_countries = ["gb", "us", "in"]
     for country in priority_countries:
         country_name = ADZUNA_COUNTRIES.get(country, country.upper())
         for query in ADZUNA_QUERIES[:3]:
             try:
-                r = requests.get(
-                    f"https://api.adzuna.com/v1/api/jobs/{country}/search/1",
-                    params={
-                        "app_id": ADZUNA_ID,
-                        "app_key": ADZUNA_KEY,
-                        "results_per_page": 20,
-                        "what": query,
-                        "sort_by": "date",
-                    },
-                    headers={**HEADERS, "Accept": "application/json"},
-                    timeout=8
+                q = requests.utils.quote(query)
+                url = (
+                    f"https://api.adzuna.com/v1/api/jobs/{country}/search/1"
+                    f"?app_id={ADZUNA_ID}&app_key={ADZUNA_KEY}"
+                    f"&results_per_page=20&what={q}&sort_by=date"
                 )
+                r = requests.get(url, headers={**HEADERS, "Accept": "application/json"}, timeout=10)
                 if r.status_code != 200:
+                    print(f"Adzuna {country} {query}: HTTP {r.status_code}")
                     continue
-                for j in r.json().get("results", []):
-                    url = j.get("redirect_url","")
-                    if not url or url in seen:
+                data = r.json()
+                results = data.get("results", [])
+                print(f"Adzuna {country} {query}: got {len(results)} raw results")
+                for j in results:
+                    job_url = j.get("redirect_url","")
+                    if not job_url or job_url in seen:
                         continue
-                    if not is_recent(j.get("created","")):
-                        continue
-                    seen.add(url)
+                    seen.add(job_url)
                     salary = ""
                     if j.get("salary_min"):
-                        salary = f"£{j['salary_min']:,.0f}–£{j['salary_max']:,.0f}" if country == "gb" else f"${j['salary_min']:,.0f}–${j['salary_max']:,.0f}"
+                        sym = "£" if country == "gb" else "$"
+                        salary = f"{sym}{j['salary_min']:,.0f}–{sym}{j['salary_max']:,.0f}"
                     location = j.get("location",{}).get("display_name", country_name)
                     jobs.append(make_job(
                         j.get("title",""),
                         j.get("company",{}).get("display_name",""),
-                        url, f"Adzuna ({country_name})",
+                        job_url, f"Adzuna ({country_name})",
                         j.get("created",""), location,
                         j.get("description",""), salary
                     ))
