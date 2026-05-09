@@ -332,7 +332,7 @@ def scrape_hackernews_hiring():
         # Get current month's "Who is Hiring" thread
         r = get("https://hacker-news.firebaseio.com/v0/user/whoishiring/submitted.json", timeout=10)
         if not r: return jobs
-        ids = r.json()[:3]  # last 3 months
+        ids = r.json()[:1]  # only latest month
 
         for thread_id in ids:
             tr = get(f"https://hacker-news.firebaseio.com/v0/item/{thread_id}.json", timeout=10)
@@ -340,7 +340,7 @@ def scrape_hackernews_hiring():
             item = tr.json()
             if not item or "hiring" not in item.get("title", "").lower(): continue
 
-            kids = item.get("kids", [])[:150]  # top 150 comments
+            kids = item.get("kids", [])[:40]  # top 40 comments only
             for kid_id in kids:
                 cr = get(f"https://hacker-news.firebaseio.com/v0/item/{kid_id}.json", timeout=8)
                 if not cr: continue
@@ -393,14 +393,9 @@ def scrape_ashby():
         ("openai", "OpenAI"), ("notion", "Notion"), ("linear", "Linear"),
         ("cursor", "Cursor"), ("ramp", "Ramp"), ("deel", "Deel"),
         ("vercel", "Vercel"), ("supabase", "Supabase"), ("replit", "Replit"),
-        ("zapier", "Zapier"), ("duolingo", "Duolingo"), ("figma", "Figma"),
-        ("perplexity", "Perplexity"), ("anthropic", "Anthropic"),
-        ("mistral", "Mistral"), ("cohere", "Cohere"), ("groq", "Groq"),
-        ("coreweave", "CoreWeave"), ("together-ai", "Together AI"),
-        ("hex", "Hex"), ("dbt-labs", "dbt Labs"), ("airbyte", "Airbyte"),
-        ("temporal", "Temporal"), ("grafana", "Grafana"), ("cockroachdb", "CockroachDB"),
-        ("brex", "Brex"), ("rippling", "Rippling"), ("gusto", "Gusto"),
-        ("lattice", "Lattice"), ("mercury", "Mercury"), ("stripe", "Stripe"),
+        ("anthropic", "Anthropic"), ("perplexity", "Perplexity"),
+        ("brex", "Brex"), ("rippling", "Rippling"), ("mercury", "Mercury"),
+        ("figma", "Figma"), ("zapier", "Zapier"),
     ]
     for slug, name in COMPANIES:
         try:
@@ -569,9 +564,9 @@ def get_all_jobs():
     all_jobs = []
     seen_ids = set()
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
         futures = {ex.submit(s): s.__name__ for s in scrapers}
-        for fut in concurrent.futures.as_completed(futures, timeout=300):
+        for fut in concurrent.futures.as_completed(futures, timeout=600):
             try:
                 result = fut.result(timeout=90)
                 for j in result:
