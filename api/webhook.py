@@ -17,8 +17,9 @@ I find remote jobs worldwide and send alerts straight to your Telegram — daily
 📂 Every category — Tech, Marketing, Sales, Finance, Executive & more
 ⚡ Personalised to your exact preferences
 
-Let's set up your alerts in 4 quick steps 👇"""
+Let's set up your alerts in 4 quick steps 👇
 
+<i>Made by <a href="https://t.me/Harsimarhs">@Harsimarhs</a> · Feel free to reach out for any queries</i>"""
 def db_headers():
     return {
         "apikey": SUPABASE_KEY,
