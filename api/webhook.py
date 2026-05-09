@@ -1,374 +1,364 @@
 """
-Remote Radar — Public Telegram Bot Webhook with Referral System
+Remote Radar — Public Telegram Bot Webhook
+Features: Setup flow, job alerts, /find, /apply tracker, /watch, /market, /cover, /invite
 """
-import os, json, requests
+import os, json, re, requests
 from http.server import BaseHTTPRequestHandler
 
-BOT_TOKEN    = os.environ.get("JOB_BOT_TOKEN", "")
+BOT_TOKEN  = os.environ.get("JOB_BOT_TOKEN", "")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
-TG_API       = f"https://api.telegram.org/bot{BOT_TOKEN}"
+TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 BOT_USERNAME = "RemoteDailyJobBot"
 
-WELCOME = """👋 <b>Welcome to Remote Radar!</b>
+# ── Supabase helpers ──────────────────────────────────────────────────────────
 
-Set your preferences once. We send you fresh remote job alerts every morning — automatically, free, forever.
-
-🌍 Jobs from 9 sources globally
-📂 Every category — Tech, Marketing, Sales, Finance, Executive & more
-⏰ Daily alerts at 9am UTC — no manual searching ever again
-⚡ Personalised to your exact preferences
-
-💡 After setup, use /keywords to target specific roles like:
-<code>ambassador, kol manager, discord moderator, telegram mod</code>
-
-Let's set up in 4 quick steps 👇
-
-<i>Made by <a href="https://t.me/Harsimarhs">@Harsimarhs</a> · Feel free to reach out for any queries</i>"""
-
-def db_headers():
-    return {
-        "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}",
-        "Content-Type": "application/json",
-        "Prefer": "resolution=merge-duplicates",
-    }
+def _sb(method, path, body=None, params=None):
+    hdrs = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Content-Type": "application/json", "Prefer": "return=representation"}
+    url = SUPABASE_URL.rstrip("/") + "/rest/v1/" + path
+    try:
+        r = getattr(requests, method)(url, headers=hdrs, json=body, params=params, timeout=10)
+        if r.status_code in (200, 201):
+            d = r.json()
+            return d[0] if isinstance(d, list) and d else d
+        return None
+    except Exception:
+        return None
 
 def db_get(chat_id):
-    r = requests.get(
-        f"{SUPABASE_URL}/rest/v1/users?chat_id=eq.{chat_id}&select=*",
-        headers=db_headers(), timeout=10)
-    data = r.json()
-    return data[0] if data else {}
+    return _sb("get", f"users?chat_id=eq.{chat_id}") or {}
 
 def db_set(chat_id, data):
     data["chat_id"] = chat_id
-    requests.post(f"{SUPABASE_URL}/rest/v1/users",
-                  headers=db_headers(), json=data, timeout=10)
+    _sb("post", "users", data)
 
 def db_update(chat_id, data):
-    requests.patch(
-        f"{SUPABASE_URL}/rest/v1/users?chat_id=eq.{chat_id}",
-        headers=db_headers(), json=data, timeout=10)
+    _sb("patch", f"users?chat_id=eq.{chat_id}", data)
 
-def db_increment_referrals(chat_id):
-    user = db_get(chat_id)
-    current = user.get("referrals", 0) or 0
-    db_update(chat_id, {"referrals": current + 1})
+def db_upsert(chat_id, data):
+    data["chat_id"] = chat_id
+    _sb("post", "users", data, params={"on_conflict": "chat_id"})
 
-def get_sent_ids(chat_id):
-    r = requests.get(
-        f"{SUPABASE_URL}/rest/v1/sent_jobs?chat_id=eq.{chat_id}&select=job_id",
-        headers=db_headers(), timeout=10)
-    return {row["job_id"] for row in r.json()} if r.status_code == 200 else set()
+def was_sent(chat_id, job_id):
+    r = _sb("get", f"sent_jobs?chat_id=eq.{chat_id}&job_id=eq.{job_id}")
+    return bool(r)
 
-def mark_sent(chat_id, job_ids):
-    if not job_ids:
-        return
-    requests.post(
-        f"{SUPABASE_URL}/rest/v1/sent_jobs",
-        headers={**db_headers(), "Prefer": "resolution=ignore-duplicates"},
-        json=[{"chat_id": chat_id, "job_id": jid} for jid in job_ids],
-        timeout=10)
+def mark_sent(chat_id, job_id):
+    _sb("post", "sent_jobs", {"chat_id": chat_id, "job_id": job_id})
 
-def send(chat_id, text, keyboard=None):
-    payload = {"chat_id": chat_id, "text": text,
-                "parse_mode": "HTML", "disable_web_page_preview": True}
-    if keyboard:
-        payload["reply_markup"] = {"inline_keyboard": keyboard}
-    requests.post(f"{TG_API}/sendMessage", json=payload, timeout=10)
-
-def edit(chat_id, msg_id, text, keyboard=None):
-    payload = {"chat_id": chat_id, "message_id": msg_id,
-                "text": text, "parse_mode": "HTML"}
-    if keyboard:
-        payload["reply_markup"] = {"inline_keyboard": keyboard}
-    requests.post(f"{TG_API}/editMessageText", json=payload, timeout=10)
-
-def answer(cb_id, text=""):
-    requests.post(f"{TG_API}/answerCallbackQuery",
-                  json={"callback_query_id": cb_id, "text": text}, timeout=5)
-
-def kb_category():
-    return [
-        [{"text": "💻 Tech & Engineering", "callback_data": "cat_tech"}],
-        [{"text": "📦 Product Management", "callback_data": "cat_product"}],
-        [{"text": "🎨 Design & Creative", "callback_data": "cat_design"}],
-        [{"text": "📣 Marketing & Growth", "callback_data": "cat_marketing"}],
-        [{"text": "🌐 Community & Social Media", "callback_data": "cat_community"}],
-        [{"text": "💬 Customer Support", "callback_data": "cat_support"}],
-        [{"text": "💼 Sales & Business Dev", "callback_data": "cat_sales"}],
-        [{"text": "💰 Finance & Accounting", "callback_data": "cat_finance"}],
-        [{"text": "⚙️ Operations & HR", "callback_data": "cat_operations"}],
-        [{"text": "👔 Executive (CEO, CMO, VP+)", "callback_data": "cat_executive"}],
-        [{"text": "🔗 Web3 & Crypto", "callback_data": "cat_web3"}],
-        [{"text": "🌍 All Categories", "callback_data": "cat_all"}],
-    ]
-
-def kb_seniority():
-    return [
-        [{"text": "🌱 Entry Level", "callback_data": "sen_entry"},
-         {"text": "📈 Mid Level", "callback_data": "sen_mid"}],
-        [{"text": "⭐ Senior", "callback_data": "sen_senior"},
-         {"text": "👥 Manager / Lead", "callback_data": "sen_manager"}],
-        [{"text": "🏆 Director / VP", "callback_data": "sen_director"},
-         {"text": "👑 C-Suite", "callback_data": "sen_executive"}],
-        [{"text": "🌍 All Levels", "callback_data": "sen_all"}],
-    ]
-
-def kb_location():
-    return [
-        [{"text": "🌍 Remote Only", "callback_data": "loc_remote"}],
-        [{"text": "🇺🇸 USA", "callback_data": "loc_usa"},
-         {"text": "🇬🇧 UK", "callback_data": "loc_uk"}],
-        [{"text": "🇮🇳 India", "callback_data": "loc_india"},
-         {"text": "🇳🇬 Nigeria", "callback_data": "loc_nigeria"}],
-        [{"text": "🇯🇵 Japan", "callback_data": "loc_japan"},
-         {"text": "🇨🇳 China", "callback_data": "loc_china"}],
-        [{"text": "🌏 SE Asia", "callback_data": "loc_sea"},
-         {"text": "🕌 Middle East", "callback_data": "loc_me"}],
-        [{"text": "🇪🇺 Europe", "callback_data": "loc_europe"}],
-        [{"text": "🌐 Worldwide / Any", "callback_data": "loc_worldwide"}],
-    ]
-
-def kb_company_type():
-    return [
-        [{"text": "🚀 Startups & Early Stage", "callback_data": "ctype_startup"}],
-        [{"text": "🏢 Established Companies", "callback_data": "ctype_established"}],
-        [{"text": "🌍 Both / Any", "callback_data": "ctype_any"}],
-    ]
-
-def kb_main():
-    return [
-        [{"text": "⚙️ Setup Alerts", "callback_data": "setup_start"}],
-        [{"text": "📋 My Preferences", "callback_data": "status"},
-         {"text": "⏹ Pause Alerts", "callback_data": "stop"}],
-    ]
-
-def kb_after_jobs():
-    return [
-        [{"text": "🔍 Find More Jobs", "callback_data": "find_jobs"}],
-        [{"text": "📋 My Preferences", "callback_data": "status"},
-         {"text": "🔑 Add Keywords", "callback_data": "add_keywords"}],
-    ]
-
-CAT_LABELS = {
-    "tech": "💻 Tech & Engineering", "product": "📦 Product Management",
-    "design": "🎨 Design & Creative", "marketing": "📣 Marketing & Growth",
-    "community": "🌐 Community & Social Media", "support": "💬 Customer Support",
-    "sales": "💼 Sales & Business Dev", "finance": "💰 Finance & Accounting",
-    "operations": "⚙️ Operations & HR", "executive": "👔 Executive",
-    "web3": "🔗 Web3 & Crypto", "all": "🌍 All Categories",
-}
-
-SEN_LABELS = {
-    "entry": "🌱 Entry Level", "mid": "📈 Mid Level", "senior": "⭐ Senior",
-    "manager": "👥 Manager / Lead", "director": "🏆 Director / VP",
-    "executive": "👑 C-Suite", "all": "🌍 All Levels",
-}
-
-LOC_LABELS = {
-    "remote": "🌍 Remote Only", "usa": "🇺🇸 USA", "uk": "🇬🇧 UK",
-    "india": "🇮🇳 India", "nigeria": "🇳🇬 Nigeria", "japan": "🇯🇵 Japan",
-    "china": "🇨🇳 China", "sea": "🌏 SE Asia", "me": "🕌 Middle East",
-    "europe": "🇪🇺 Europe", "worldwide": "🌐 Worldwide",
-}
-
-CTYPE_LABELS = {
-    "startup": "🚀 Startups", "established": "🏢 Established", "any": "🌍 Any",
-}
-
-def handle_start(chat_id, username, ref_code=None):
-    existing = db_get(chat_id)
-    is_new = not existing
-
-    db_set(chat_id, {
-        "username": username or "",
-        "active": False,
-        "setup_complete": False,
-        "category": "all",
-        "seniority": "all",
-        "keywords": "",
-        "location": "Worldwide",
-        "location_key": "worldwide",
-        "remote_only": False,
-        "company_type": "any",
-        "awaiting_keywords": False,
-        "referrals": existing.get("referrals", 0) if existing else 0,
-        "referred_by": existing.get("referred_by") if existing else None,
+def log_application(chat_id, job_title, company, status, url=""):
+    _sb("post", "applications", {
+        "chat_id": chat_id, "job_title": job_title,
+        "company": company, "status": status, "url": url
     })
 
-    # Handle referral
-    if is_new and ref_code and ref_code.startswith("ref_"):
-        try:
-            referrer_id = int(ref_code.replace("ref_", ""))
-            if referrer_id != chat_id:
-                db_update(chat_id, {"referred_by": referrer_id})
-                db_increment_referrals(referrer_id)
-                # Notify referrer
-                referrer = db_get(referrer_id)
-                ref_count = referrer.get("referrals", 0)
-                send(referrer_id,
-                    f"🎉 Someone joined Remote Radar using your invite link!\n\n"
-                    f"👥 You've now referred <b>{ref_count}</b> {'person' if ref_count == 1 else 'people'}.\n\n"
-                    f"Keep sharing: <code>t.me/{BOT_USERNAME}?start=ref_{referrer_id}</code>")
-        except Exception as e:
-            print(f"Referral error: {e}")
+def get_applications(chat_id):
+    hdrs = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+    url = SUPABASE_URL.rstrip("/") + f"/rest/v1/applications?chat_id=eq.{chat_id}&order=created_at.desc"
+    try:
+        r = requests.get(url, headers=hdrs, timeout=10)
+        return r.json() if r.status_code == 200 else []
+    except Exception:
+        return []
 
+def get_watchlist(chat_id):
+    hdrs = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+    url = SUPABASE_URL.rstrip("/") + f"/rest/v1/watchlist?chat_id=eq.{chat_id}"
+    try:
+        r = requests.get(url, headers=hdrs, timeout=10)
+        return [w["company"].lower() for w in (r.json() if r.status_code == 200 else [])]
+    except Exception:
+        return []
+
+def add_watchlist(chat_id, company):
+    _sb("post", "watchlist", {"chat_id": chat_id, "company": company.lower()})
+
+def remove_watchlist(chat_id, company):
+    hdrs = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+    url = SUPABASE_URL.rstrip("/") + f"/rest/v1/watchlist?chat_id=eq.{chat_id}&company=eq.{company.lower()}"
+    requests.delete(url, headers=hdrs, timeout=10)
+
+def increment_referrals(referrer_id):
+    r = db_get(referrer_id)
+    if r:
+        db_update(referrer_id, {"referrals": (r.get("referrals") or 0) + 1})
+
+# ── Telegram helpers ──────────────────────────────────────────────────────────
+
+def send(chat_id, text, buttons=None):
+    payload = {
+        "chat_id": chat_id, "text": text[:4096],
+        "parse_mode": "HTML", "disable_web_page_preview": True,
+    }
+    if buttons:
+        payload["reply_markup"] = {"inline_keyboard": buttons}
+    try:
+        requests.post(f"{TG_API}/sendMessage", json=payload, timeout=10)
+    except Exception:
+        pass
+
+def answer(callback_id, text="✅"):
+    try:
+        requests.post(f"{TG_API}/answerCallbackQuery",
+                      json={"callback_query_id": callback_id, "text": text}, timeout=5)
+    except Exception:
+        pass
+
+def edit(chat_id, msg_id, text, buttons=None):
+    payload = {"chat_id": chat_id, "message_id": msg_id,
+               "text": text[:4096], "parse_mode": "HTML"}
+    if buttons:
+        payload["reply_markup"] = {"inline_keyboard": buttons}
+    try:
+        requests.post(f"{TG_API}/editMessageText", json=payload, timeout=10)
+    except Exception:
+        pass
+
+# ── Labels & setup flow ───────────────────────────────────────────────────────
+
+CAT_LABELS = {
+    "community": "👥 Community & Social", "marketing": "📣 Marketing & Growth",
+    "support": "🎧 Customer Support", "tech": "💻 Tech & Engineering",
+    "product": "📱 Product", "design": "🎨 Design & Creative",
+    "sales": "💼 Sales & BD", "finance": "💰 Finance & Accounting",
+    "operations": "⚙️ Operations & HR", "executive": "🏆 Executive (C-Suite/VP)",
+    "web3": "🌐 Web3 & Crypto", "all": "🌍 All Categories",
+}
+SEN_LABELS = {
+    "entry": "🌱 Entry Level", "mid": "🔧 Mid Level", "senior": "⭐ Senior",
+    "manager": "👔 Manager", "director": "📊 Director", "csuite": "👑 C-Suite/VP", "all": "🌍 All Levels",
+}
+LOC_LABELS = {
+    "remote": "🌐 Remote Only", "usa": "🇺🇸 USA", "uk": "🇬🇧 UK",
+    "india": "🇮🇳 India", "europe": "🇪🇺 Europe", "nigeria": "🇳🇬 Nigeria",
+    "japan": "🇯🇵 Japan", "sea": "🌏 SE Asia", "middleeast": "🇦🇪 Middle East",
+    "worldwide": "🌐 Worldwide",
+}
+CTYPE_LABELS = {
+    "startup": "🚀 Startups & Early Stage", "established": "🏢 Established Companies",
+    "any": "🌍 Any",
+}
+
+WELCOME = """👋 <b>Welcome to Remote Radar!</b>
+
+🎯 Set your preferences <b>once</b>. Get fresh job alerts every morning — automatically, free, forever.
+
+🌍 Jobs from <b>15+ sources globally</b>
+📂 Every category — Community, Marketing, Support, Tech, Finance, Executive & more
+⏰ <b>Daily alerts at 9am UTC</b> — no manual searching ever again
+🔥 Hot jobs flagged when posted in last 24 hours
+💰 Salary info included where available
+
+💡 After setup, use /keywords to target specific roles:
+<code>ambassador, kol manager, discord moderator, zealy</code>
+
+Let's set up in 4 quick steps 👇
+
+<i>Made by <a href="https://t.me/Harsimarhs">@Harsimarhs</a> · Reach out for any queries</i>"""
+
+
+def kb_main():
+    return [[{"text": "⚡ Setup My Alerts", "callback_data": "setup_start"}]]
+
+def kb_categories():
+    rows = []
+    items = list(CAT_LABELS.items())
+    for i in range(0, len(items), 2):
+        row = [{"text": items[i][1], "callback_data": f"cat_{items[i][0]}"}]
+        if i+1 < len(items):
+            row.append({"text": items[i+1][1], "callback_data": f"cat_{items[i+1][0]}"})
+        rows.append(row)
+    return rows
+
+def kb_seniority():
+    rows = []
+    items = list(SEN_LABELS.items())
+    for i in range(0, len(items), 2):
+        row = [{"text": items[i][1], "callback_data": f"sen_{items[i][0]}"}]
+        if i+1 < len(items):
+            row.append({"text": items[i+1][1], "callback_data": f"sen_{items[i+1][0]}"})
+        rows.append(row)
+    return rows
+
+def kb_locations():
+    rows = []
+    items = list(LOC_LABELS.items())
+    for i in range(0, len(items), 2):
+        row = [{"text": items[i][1], "callback_data": f"loc_{items[i][0]}"}]
+        if i+1 < len(items):
+            row.append({"text": items[i+1][1], "callback_data": f"loc_{items[i+1][0]}"})
+        rows.append(row)
+    return rows
+
+def kb_ctype():
+    return [[{"text": v, "callback_data": f"ctype_{k}"} for k, v in CTYPE_LABELS.items()]]
+
+def kb_post_setup():
+    return [
+        [{"text": "🔍 Find Jobs Now", "callback_data": "find_now"},
+         {"text": "📋 My Preferences", "callback_data": "status"}],
+        [{"text": "👥 Invite Friends", "callback_data": "invite_link"}],
+    ]
+
+def kb_find_more():
+    return [[{"text": "🔍 Find More Jobs", "callback_data": "find_now"}]]
+
+
+# ── Job formatting ────────────────────────────────────────────────────────────
+
+def format_job(job, show_hot=True):
+    hot = "🔥 " if (show_hot and job.get("hot")) else ""
+    title = f"{hot}<b>{job['title']}</b>"
+    company = f"🏢 {job['company']}" if job.get("company") else ""
+    loc = f"\n📍 {job['location']}" if job.get("location") and job["location"].lower() not in ("remote", "") else ""
+    sal = f"\n💰 {job['salary']}" if job.get("salary") else ""
+    fund = f"\n💸 Funding: {job['funding']}" if job.get("funding") else ""
+    visa = "\n✈️ Visa sponsorship" if job.get("visa") else ""
+    date = f"\n📅 {fmt_date_display(job['date'])}" if job.get("date") else ""
+    src = f"📌 {job['source']}"
+    url = job.get("url", "")
+
+    lines = [f"💼 {title}"]
+    if company: lines.append(company)
+    if loc: lines.append(loc)
+    if sal: lines.append(sal)
+    if fund: lines.append(fund)
+    if visa: lines.append(visa)
+    if date: lines.append(date)
+    lines.append(f"🔗 <a href='{url}'>Apply Now</a>")
+    lines.append(src)
+    return "\n".join(lines)
+
+
+def fmt_date_display(date_str):
+    from datetime import datetime
+    if not date_str: return ""
+    try:
+        dt = datetime.strptime(date_str[:10], "%Y-%m-%d")
+        return dt.strftime("%d %b %Y")
+    except Exception:
+        return date_str[:10]
+
+
+# ── Handlers ──────────────────────────────────────────────────────────────────
+
+def handle_start(chat_id, username, ref=None):
+    # Track referral
+    if ref and ref.startswith("ref_"):
+        try:
+            referrer_id = int(ref.replace("ref_", ""))
+            if referrer_id != chat_id:
+                increment_referrals(referrer_id)
+                send(referrer_id, f"🎉 Someone joined using your invite link! You've referred another person. Keep sharing!")
+        except Exception:
+            pass
+
+    db_upsert(chat_id, {
+        "username": username or "",
+        "active": False, "setup_complete": False,
+        "category": "all", "seniority": "all",
+        "keywords": "", "location": "Worldwide",
+        "location_key": "worldwide", "remote_only": False,
+        "company_type": "any", "awaiting_keywords": False,
+        "referred_by": None,
+    })
     send(chat_id, WELCOME, kb_main())
 
-def handle_status(chat_id):
-    user = db_get(chat_id)
-    if not user or not user.get("setup_complete"):
-        send(chat_id, "You haven't set up alerts yet. Tap below to get started.", kb_main())
-        return
-    status = "✅ Active" if user.get("active") else "⏸ Paused"
-    kws = user.get("keywords", "") or "None set"
-    referrals = user.get("referrals", 0) or 0
-    invite_link = f"t.me/{BOT_USERNAME}?start=ref_{chat_id}"
-    send(chat_id,
-        f"📋 <b>Your Alert Preferences</b>\n\n"
-        f"📂 Category: {CAT_LABELS.get(user.get('category','all'), 'All')}\n"
-        f"🎯 Level: {SEN_LABELS.get(user.get('seniority','all'), 'All')}\n"
-        f"📍 Location: {LOC_LABELS.get(user.get('location_key','worldwide'), 'Worldwide')}\n"
-        f"🏢 Company: {CTYPE_LABELS.get(user.get('company_type','any'), 'Any')}\n"
-        f"🔑 Keywords: {kws}\n"
-        f"📡 Status: {status}\n\n"
-        f"👥 <b>Your Referrals: {referrals}</b>\n"
-        f"🔗 Invite link: <code>{invite_link}</code>\n\n"
-        f"Alerts arrive daily at 9am UTC.",
-        [[{"text": "✏️ Change Preferences", "callback_data": "setup_start"},
-          {"text": "⏹ Pause", "callback_data": "stop"}],
-         [{"text": "🔍 Find Jobs Now", "callback_data": "find_jobs"},
-          {"text": "👥 My Invite Link", "callback_data": "invite"}]]
-    )
 
-def handle_invite(chat_id):
-    user = db_get(chat_id)
-    referrals = user.get("referrals", 0) or 0
-    invite_link = f"t.me/{BOT_USERNAME}?start=ref_{chat_id}"
-    send(chat_id,
-        f"👥 <b>Invite Friends to Remote Radar</b>\n\n"
-        f"Share your personal invite link and get notified every time someone joins!\n\n"
-        f"🔗 Your link:\n<code>{invite_link}</code>\n\n"
-        f"📊 People invited so far: <b>{referrals}</b>\n\n"
-        f"💬 Share this message:\n"
-        f"<i>I use this free Telegram bot to get daily remote job alerts — no spam, just relevant jobs every morning. Check it out: t.me/{BOT_USERNAME}?start=ref_{chat_id}</i>")
-
-def handle_stop(chat_id):
-    db_update(chat_id, {"active": False})
-    send(chat_id, "⏸ Alerts paused.\n\nTap below to restart anytime.",
-         [[{"text": "▶️ Restart Alerts", "callback_data": "setup_start"}]])
-
-def step1_category(chat_id, msg_id):
+def handle_setup_start(chat_id, msg_id, cb_id):
+    answer(cb_id, "Let's set up your alerts!")
     edit(chat_id, msg_id,
          "⚙️ <b>Step 1 of 4 — Job Category</b>\n\nWhat type of jobs are you looking for?",
-         kb_category())
+         kb_categories())
 
-def step2_seniority(chat_id, msg_id, category, cb_id):
-    answer(cb_id, f"✅ {CAT_LABELS.get(category, category)}")
-    db_update(chat_id, {"category": category})
+
+def handle_category(chat_id, msg_id, cat, cb_id):
+    answer(cb_id, f"✅ {CAT_LABELS.get(cat, cat)}")
+    db_update(chat_id, {"category": cat})
     edit(chat_id, msg_id,
-         f"✅ Category: {CAT_LABELS.get(category, category)}\n\n"
-         f"⚙️ <b>Step 2 of 4 — Seniority Level</b>\n\nWhat level are you targeting?",
+         f"✅ Category: {CAT_LABELS.get(cat, cat)}\n\n⚙️ <b>Step 2 of 4 — Seniority Level</b>\n\nWhat level are you targeting?",
          kb_seniority())
 
-def step3_location(chat_id, msg_id, seniority, cb_id):
-    answer(cb_id, f"✅ {SEN_LABELS.get(seniority, seniority)}")
-    db_update(chat_id, {"seniority": seniority})
+
+def handle_seniority(chat_id, msg_id, sen, cb_id):
+    answer(cb_id, f"✅ {SEN_LABELS.get(sen, sen)}")
+    db_update(chat_id, {"seniority": sen})
     edit(chat_id, msg_id,
-         f"✅ Level: {SEN_LABELS.get(seniority, seniority)}\n\n"
-         f"⚙️ <b>Step 3 of 4 — Location</b>\n\nWhere are you looking to work?",
-         kb_location())
+         f"✅ Seniority: {SEN_LABELS.get(sen, sen)}\n\n⚙️ <b>Step 3 of 4 — Location</b>\n\nWhere are you looking to work?",
+         kb_locations())
 
-def step4_company_type(chat_id, msg_id, loc_key, cb_id):
-    loc_map = {
-        "remote": ("Remote", True), "usa": ("USA", False), "uk": ("UK", False),
-        "india": ("India", False), "nigeria": ("Nigeria", False),
-        "japan": ("Japan", False), "china": ("China", False),
-        "sea": ("Southeast Asia", False), "me": ("Middle East", False),
-        "europe": ("Europe", False), "worldwide": ("Worldwide", False),
-    }
-    loc_name, remote_only = loc_map.get(loc_key, ("Worldwide", False))
-    answer(cb_id, f"✅ {LOC_LABELS.get(loc_key, loc_key)}")
-    db_update(chat_id, {"location": loc_name, "location_key": loc_key, "remote_only": remote_only})
+
+def handle_location(chat_id, msg_id, loc, cb_id):
+    answer(cb_id, f"✅ {LOC_LABELS.get(loc, loc)}")
+    db_update(chat_id, {"location": LOC_LABELS.get(loc, loc), "location_key": loc})
     edit(chat_id, msg_id,
-         f"✅ Location: {LOC_LABELS.get(loc_key, loc_key)}\n\n"
-         f"⚙️ <b>Step 4 of 4 — Company Type</b>\n\nWhat kind of company do you prefer?",
-         kb_company_type())
+         f"✅ Location: {LOC_LABELS.get(loc, loc)}\n\n⚙️ <b>Step 4 of 4 — Company Type</b>\n\nWhat kind of company do you prefer?",
+         kb_ctype())
 
-def fmt_job(job):
-    from api.jobs import fmt_date
-    date_label = f"\n📅 {fmt_date(job['date'])}" if job.get("date") else ""
-    loc_label = f"\n📍 {job['location']}" if job.get("location") and job["location"].lower() != "remote" else ""
-    funding = f"\n💸 {job['funding']}" if job.get("funding") else ""
-    startup = "\n🚀 Early-stage startup" if job.get("company_type") == "startup" and not job.get("funding") else ""
-    return (
-        f"💼 <b>{job['title']}</b>\n"
-        f"🏢 {job['company'] or 'Unknown'}"
-        f"{loc_label}{funding}{startup}{date_label}\n"
-        f"🔗 <a href='{job['url']}'>Apply Now</a>\n"
-        f"📌 via {job['source']}"
-    )
 
-def send_jobs_now(chat_id, user, show_button=True):
-    try:
-        from api.jobs import get_all_jobs, matches_user, score
-        send(chat_id, "🔍 Searching for matching jobs...")
-        all_jobs = get_all_jobs()
-        keywords = user.get("keywords", "")
-        sent_ids = get_sent_ids(chat_id)
-        matched = [j for j in all_jobs
-                   if matches_user(j, user) and j["_id"] not in sent_ids]
-        matched.sort(key=lambda j: score(j["title"], keywords), reverse=True)
-        matched = matched[:10]
-
-        if not matched:
-            send(chat_id,
-                "📭 <b>No new jobs found today.</b>\n\n"
-                "All matching jobs have already been sent. "
-                "Check back tomorrow for fresh listings or broaden your preferences.",
-                [[{"text": "⚙️ Change Preferences", "callback_data": "setup_start"},
-                  {"text": "🔑 Update Keywords", "callback_data": "add_keywords"}]]
-            )
-            return
-
-        sources = list({j["source"] for j in matched})
-        send(chat_id, f"🔍 <b>{len(matched)} new jobs matching your profile</b>\nSources: {', '.join(sources)}")
-
-        new_ids = []
-        for job in matched:
-            send(chat_id, fmt_job(job))
-            new_ids.append(job["_id"])
-
-        mark_sent(chat_id, new_ids)
-
-        if show_button:
-            send(chat_id,
-                f"✅ <b>That's all for now.</b>\n\nNext batch arrives tomorrow at 9am UTC.",
-                kb_after_jobs())
-
-    except Exception as e:
-        print(f"send_jobs_now error: {e}")
-        send(chat_id, "Something went wrong. Try again in a moment.")
-
-def finish_setup(chat_id, msg_id, ctype, cb_id):
+def handle_ctype(chat_id, msg_id, ctype, cb_id):
     answer(cb_id, f"✅ {CTYPE_LABELS.get(ctype, ctype)}")
     db_update(chat_id, {"company_type": ctype, "active": True, "setup_complete": True})
     user = db_get(chat_id)
-    invite_link = f"t.me/{BOT_USERNAME}?start=ref_{chat_id}"
-    send(chat_id,
-        f"🎉 <b>All set! Your daily alerts are live.</b>\n\n"
-        f"📂 {CAT_LABELS.get(user.get('category','all'),'All Categories')}\n"
-        f"🎯 {SEN_LABELS.get(user.get('seniority','all'),'All Levels')}\n"
-        f"📍 {LOC_LABELS.get(user.get('location_key','worldwide'),'Worldwide')}\n"
-        f"🏢 {CTYPE_LABELS.get(ctype,'Any')}\n\n"
-        f"💡 Add keywords: <code>/keywords ambassador, kol manager, discord mod</code>\n\n"
-        f"👥 <b>Share with friends:</b>\n<code>{invite_link}</code>",
-        [[{"text": "📋 My Preferences", "callback_data": "status"},
-          {"text": "👥 Invite Friends", "callback_data": "invite"}]]
-    )
+
+    edit(chat_id, msg_id,
+         f"🎉 <b>All set! Your daily alerts are live.</b>\n\n"
+         f"📂 {CAT_LABELS.get(user.get('category','all'),'All Categories')}\n"
+         f"🎯 {SEN_LABELS.get(user.get('seniority','all'),'All Levels')}\n"
+         f"📍 {LOC_LABELS.get(user.get('location_key','worldwide'),'Worldwide')}\n"
+         f"🏢 {CTYPE_LABELS.get(ctype,'Any')}\n\n"
+         f"⏰ Daily alerts every morning at 9am UTC\n\n"
+         f"💡 Tip: Use /keywords to add specific roles:\n"
+         f"<code>ambassador, kol manager, discord moderator, zealy, galxe</code>",
+         kb_post_setup())
+
     send_jobs_now(chat_id, user)
+
+
+def handle_find_now(chat_id, cb_id):
+    answer(cb_id, "🔍 Searching...")
+    user = db_get(chat_id)
+    if not user:
+        send(chat_id, "Please /start first to set up your preferences.")
+        return
+    send_jobs_now(chat_id, user)
+
+
+def send_jobs_now(chat_id, user):
+    try:
+        from api.jobs import get_all_jobs, matches_user, score
+        all_jobs = get_all_jobs()
+        keywords = user.get("keywords", "")
+        matched = [j for j in all_jobs if matches_user(j, user) and not was_sent(chat_id, j["id"])]
+        matched.sort(key=lambda j: (-score(j["title"], keywords), not j.get("hot")))
+        batch = matched[:10]
+
+        if not batch:
+            send(chat_id,
+                 "✅ <b>You're all caught up!</b>\n\nNo new matching jobs found right now.\n"
+                 "Fresh listings arrive daily at 9am UTC.",
+                 kb_find_more())
+            return
+
+        hot_count = sum(1 for j in batch if j.get("hot"))
+        sources = list({j["source"] for j in batch})
+        header = f"🔍 <b>{len(batch)} jobs matching your profile</b>"
+        if hot_count:
+            header += f" · 🔥 {hot_count} hot (last 24h)"
+        header += f"\n📡 {', '.join(sources)}"
+        send(chat_id, header)
+
+        for job in batch:
+            send(chat_id, format_job(job))
+            mark_sent(chat_id, job["id"])
+
+        send(chat_id, "That's your batch! New jobs arrive every morning at 9am UTC.",
+             kb_find_more())
+    except Exception as e:
+        print(f"send_jobs_now error: {e}")
+        send(chat_id, "⚠️ Couldn't fetch jobs right now. Try again in a moment.", kb_find_more())
+
 
 def handle_keywords(chat_id, text):
     keywords = text.replace("/keywords", "").strip().lstrip(",").strip()
@@ -376,129 +366,468 @@ def handle_keywords(chat_id, text):
         db_update(chat_id, {"awaiting_keywords": True})
         send(chat_id,
              "✏️ <b>Add Keywords</b>\n\n"
-             "Type your keywords below and send:\n\n"
+             "Type your keywords below (comma-separated) and send:\n\n"
              "<b>Examples:</b>\n"
-             "• <code>moderator, community manager</code>\n"
-             "• <code>ambassador, kol manager, discord mod</code>\n"
-             "• <code>zealy, galxe, telegram moderator</code>")
+             "• <code>moderator, community manager, discord</code>\n"
+             "• <code>ambassador, kol manager, telegram mod</code>\n"
+             "• <code>zealy, galxe, web3 growth</code>\n"
+             "• <code>data engineer, python, remote</code>")
         return
     db_update(chat_id, {"keywords": keywords, "awaiting_keywords": False})
-    send(chat_id, f"✅ Keywords saved: <b>{keywords}</b>")
+    send(chat_id, f"✅ <b>Keywords saved:</b> {keywords}\n\nFinding matching jobs now...")
     user = db_get(chat_id)
     send_jobs_now(chat_id, user)
 
+
+def handle_status(chat_id):
+    user = db_get(chat_id)
+    if not user:
+        send(chat_id, "You haven't set up alerts yet. Send /start to begin.")
+        return
+    ref_count = user.get("referrals", 0)
+    kws = user.get("keywords", "") or "None set"
+    active = "✅ Active" if user.get("active") else "⏸ Paused"
+    invite = f"https://t.me/{BOT_USERNAME}?start=ref_{chat_id}"
+
+    text = (
+        f"📋 <b>Your Preferences</b>\n\n"
+        f"📂 {CAT_LABELS.get(user.get('category','all'),'All Categories')}\n"
+        f"🎯 {SEN_LABELS.get(user.get('seniority','all'),'All Levels')}\n"
+        f"📍 {LOC_LABELS.get(user.get('location_key','worldwide'),'Worldwide')}\n"
+        f"🏢 {CTYPE_LABELS.get(user.get('company_type','any'),'Any')}\n"
+        f"🔑 Keywords: <code>{kws}</code>\n\n"
+        f"📡 Status: {active}\n"
+        f"👥 Referrals: {ref_count}\n\n"
+        f"Use /setup to change preferences\n"
+        f"Use /keywords to update keywords\n"
+        f"Use /find to get jobs now"
+    )
+    send(chat_id, text, [
+        [{"text": "🔍 Find Jobs Now", "callback_data": "find_now"},
+         {"text": "⚙️ Change Setup", "callback_data": "setup_start"}],
+        [{"text": "👥 Share Invite Link", "callback_data": "invite_link"}],
+    ])
+
+
+def handle_find_command(chat_id, text):
+    """Instant search: /find community manager"""
+    query = text.replace("/find", "").strip()
+    if not query:
+        send(chat_id,
+             "🔍 <b>Search Jobs Instantly</b>\n\n"
+             "Usage: <code>/find [role]</code>\n\n"
+             "Examples:\n"
+             "• <code>/find community manager</code>\n"
+             "• <code>/find social media manager crypto</code>\n"
+             "• <code>/find discord moderator web3</code>\n"
+             "• <code>/find marketing manager remote</code>")
+        return
+    send(chat_id, f"🔍 Searching for <b>{query}</b>...")
+    try:
+        from api.jobs import get_all_jobs, matches_keywords
+        all_jobs = get_all_jobs()
+        # Create a fake user with the search query as keywords
+        results = [j for j in all_jobs if matches_keywords(j, query)]
+        results.sort(key=lambda j: not j.get("hot"))
+        results = results[:10]
+
+        if not results:
+            send(chat_id, f"No results found for <b>{query}</b> right now. Try different keywords or check back tomorrow.")
+            return
+
+        send(chat_id, f"🔍 <b>{len(results)} results for '{query}'</b>")
+        for job in results:
+            send(chat_id, format_job(job))
+    except Exception as e:
+        send(chat_id, f"Search failed: {e}")
+
+
+def handle_market(chat_id):
+    """Show market trends — most in-demand roles this week"""
+    send(chat_id, "📊 <b>Market Insights</b> — Fetching data...")
+    try:
+        from api.jobs import get_all_jobs
+        jobs = get_all_jobs()
+
+        # Count titles
+        from collections import Counter
+        words = []
+        for j in jobs:
+            title = j["title"].lower()
+            for kw in ["community manager", "social media", "marketing manager", "customer support",
+                       "developer", "engineer", "product manager", "growth", "sales", "designer",
+                       "data analyst", "devops", "content", "moderator", "ambassador", "operations"]:
+                if kw in title:
+                    words.append(kw.title())
+
+        counts = Counter(words).most_common(10)
+        top = "\n".join([f"  {i+1}. {role} — {count} openings" for i, (role, count) in enumerate(counts)])
+
+        # Sources breakdown
+        src_counts = Counter(j["source"] for j in jobs)
+        src_str = " · ".join([f"{src}: {cnt}" for src, cnt in src_counts.most_common(5)])
+
+        hot_count = sum(1 for j in jobs if j.get("hot"))
+        salary_count = sum(1 for j in jobs if j.get("salary"))
+
+        send(chat_id,
+             f"📊 <b>Market Snapshot — Today</b>\n\n"
+             f"📋 Total openings: <b>{len(jobs)}</b>\n"
+             f"🔥 Posted last 24h: <b>{hot_count}</b>\n"
+             f"💰 With salary info: <b>{salary_count}</b>\n\n"
+             f"🏆 <b>Most In-Demand Roles:</b>\n{top}\n\n"
+             f"📡 Sources: {src_str}",
+             kb_find_more())
+    except Exception as e:
+        send(chat_id, f"⚠️ Couldn't load market data: {e}")
+
+
+def handle_apply(chat_id, text):
+    """Track job application: /applied Job Title at Company"""
+    content = text.replace("/applied", "").strip()
+    if not content:
+        send(chat_id,
+             "✅ <b>Track Your Application</b>\n\n"
+             "Usage: <code>/applied [Job Title] at [Company]</code>\n"
+             "Example: <code>/applied Community Manager at Coinbase</code>\n\n"
+             "Also try:\n"
+             "• <code>/interview Community Manager at Coinbase</code>\n"
+             "• <code>/rejected Community Manager at Coinbase</code>\n"
+             "• <code>/offers</code> — see all your tracked applications")
+        return
+    # Parse "Title at Company"
+    if " at " in content.lower():
+        parts = re.split(r'\s+at\s+', content, 1, re.IGNORECASE)
+        title, company = parts[0].strip(), parts[1].strip()
+    else:
+        title, company = content, ""
+    log_application(chat_id, title, company, "applied")
+    send(chat_id, f"✅ Logged: <b>{title}</b>{f' at {company}' if company else ''}\nStatus: 📤 Applied\n\nUse /offers to see your pipeline.")
+
+
+def handle_interview(chat_id, text):
+    content = text.replace("/interview", "").strip()
+    if not content:
+        send(chat_id, "Usage: <code>/interview [Job Title] at [Company]</code>")
+        return
+    if " at " in content.lower():
+        parts = re.split(r'\s+at\s+', content, 1, re.IGNORECASE)
+        title, company = parts[0].strip(), parts[1].strip()
+    else:
+        title, company = content, ""
+    log_application(chat_id, title, company, "interview")
+    send(chat_id, f"🎉 Interview! <b>{title}</b>{f' at {company}' if company else ''}\nGood luck! 🤞")
+
+
+def handle_rejected(chat_id, text):
+    content = text.replace("/rejected", "").strip()
+    if not content:
+        send(chat_id, "Usage: <code>/rejected [Job Title] at [Company]</code>")
+        return
+    if " at " in content.lower():
+        parts = re.split(r'\s+at\s+', content, 1, re.IGNORECASE)
+        title, company = parts[0].strip(), parts[1].strip()
+    else:
+        title, company = content, ""
+    log_application(chat_id, title, company, "rejected")
+    send(chat_id, f"😔 Logged as rejected: <b>{title}</b>. Keep going — the right role is coming. 💪")
+
+
+def handle_offers(chat_id):
+    """Show application pipeline"""
+    apps = get_applications(chat_id)
+    if not apps:
+        send(chat_id,
+             "📋 <b>Your Application Tracker</b>\n\nNo applications tracked yet.\n\n"
+             "Start tracking:\n"
+             "• <code>/applied Community Manager at Coinbase</code>\n"
+             "• <code>/interview Discord Mod at Uniswap</code>\n"
+             "• <code>/rejected Growth Lead at Binance</code>")
+        return
+
+    STATUS_ICONS = {"applied": "📤", "interview": "🎤", "rejected": "❌", "offer": "🎉"}
+    by_status = {"interview": [], "applied": [], "rejected": []}
+    for a in apps:
+        s = a.get("status", "applied")
+        if s in by_status:
+            by_status[s].append(a)
+
+    lines = ["📋 <b>Your Application Pipeline</b>\n"]
+    for status, emoji_label in [("interview", "🎤 Interviews"), ("applied", "📤 Applied"), ("rejected", "❌ Rejected")]:
+        items = by_status[status]
+        if items:
+            lines.append(f"\n<b>{emoji_label} ({len(items)})</b>")
+            for a in items[:5]:
+                co = f" @ {a['company']}" if a.get("company") else ""
+                lines.append(f"  • {a['job_title']}{co}")
+
+    lines.append(f"\n<b>Total:</b> {len(apps)} tracked")
+    send(chat_id, "\n".join(lines))
+
+
+def handle_watch(chat_id, text):
+    """Watch a company: /watch Coinbase"""
+    company = text.replace("/watch", "").strip()
+    if not company:
+        watchlist = get_watchlist(chat_id)
+        if watchlist:
+            companies = "\n".join([f"  • {c.title()}" for c in watchlist])
+            send(chat_id,
+                 f"👁 <b>Your Watchlist</b>\n\n{companies}\n\n"
+                 "Usage: <code>/watch [Company]</code> to add\n"
+                 "<code>/unwatch [Company]</code> to remove")
+        else:
+            send(chat_id,
+                 "👁 <b>Company Watchlist</b>\n\n"
+                 "Get alerted the moment a company posts a new job.\n\n"
+                 "Usage: <code>/watch Coinbase</code>\n"
+                 "Examples: Coinbase, Binance, OpenAI, Notion, Stripe")
+        return
+    add_watchlist(chat_id, company)
+    send(chat_id,
+         f"👁 Now watching <b>{company.title()}</b>\n\n"
+         f"You'll be notified the moment they post a new job!")
+
+
+def handle_unwatch(chat_id, text):
+    company = text.replace("/unwatch", "").strip()
+    if not company:
+        send(chat_id, "Usage: <code>/unwatch [Company]</code>")
+        return
+    remove_watchlist(chat_id, company)
+    send(chat_id, f"✅ Removed <b>{company.title()}</b> from your watchlist.")
+
+
+def handle_cover(chat_id, text):
+    """AI cover letter: /cover [job URL or description]"""
+    content = text.replace("/cover", "").strip()
+    if not content:
+        send(chat_id,
+             "📝 <b>AI Cover Letter Generator</b>\n\n"
+             "Paste a job URL or job description and I'll write a tailored cover letter.\n\n"
+             "Usage:\n"
+             "<code>/cover https://jobs.lever.co/coinbase/community-manager</code>\n"
+             "or\n"
+             "<code>/cover [paste job description here]</code>")
+        db_update(chat_id, {"awaiting_cover": True})
+        return
+    generate_cover_letter(chat_id, content)
+
+
+def generate_cover_letter(chat_id, content):
+    user = db_get(chat_id)
+    send(chat_id, "✍️ Writing your cover letter...")
+    try:
+        anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if not anthropic_key:
+            # Fallback template
+            send(chat_id,
+                 "📝 <b>Cover Letter Template</b>\n\n"
+                 "Dear Hiring Manager,\n\n"
+                 "I am writing to express my strong interest in this role. With my background in community management, "
+                 "social media, and Web3 ecosystems, I am excited about the opportunity to contribute to your team.\n\n"
+                 "I have experience building and moderating communities on Discord and Telegram, running ambassador "
+                 "programs, and driving engagement across social platforms. I understand the importance of authentic "
+                 "community building in the Web3 space.\n\n"
+                 "I would love to discuss how my skills align with your needs.\n\n"
+                 "Best regards\n\n"
+                 "<i>Tip: Set ANTHROPIC_API_KEY to get AI-personalised cover letters.</i>")
+            return
+
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": anthropic_key, "anthropic-version": "2023-06-01",
+                     "content-type": "application/json"},
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 800,
+                "messages": [{
+                    "role": "user",
+                    "content": f"Write a professional, concise cover letter for this job. Keep it under 250 words. Job info: {content[:1500]}"
+                }]
+            },
+            timeout=30
+        )
+        result = r.json().get("content", [{}])[0].get("text", "")
+        if result:
+            send(chat_id, f"📝 <b>Your Cover Letter</b>\n\n{result}")
+        else:
+            send(chat_id, "⚠️ Couldn't generate cover letter. Try again.")
+    except Exception as e:
+        send(chat_id, f"⚠️ Cover letter generation failed: {e}")
+
+
+def handle_invite(chat_id):
+    invite = f"https://t.me/{BOT_USERNAME}?start=ref_{chat_id}"
+    user = db_get(chat_id)
+    ref_count = user.get("referrals", 0) if user else 0
+    send(chat_id,
+         f"👥 <b>Invite Friends & Grow Together</b>\n\n"
+         f"Share this link with anyone job hunting:\n"
+         f"<code>{invite}</code>\n\n"
+         f"📊 Your referrals: <b>{ref_count}</b>\n\n"
+         f"📤 Ready-to-share message:\n\n"
+         f"<i>Tired of manually searching job boards every day? "
+         f"This free Telegram bot sends you daily remote job alerts — set your preferences once and forget it. "
+         f"Works for every role: Community, Marketing, Tech, Sales, Finance, Executive, Web3 and more.\n\n"
+         f"👉 {invite}</i>",
+         [[{"text": "📤 Share Link", "url": f"https://t.me/share/url?url={invite}&text=Get%20free%20daily%20job%20alerts%20on%20Telegram%21"}]])
+
+
+def handle_stop(chat_id):
+    db_update(chat_id, {"active": False})
+    send(chat_id, "⏸ <b>Alerts paused.</b>\n\nSend /start anytime to reactivate.",
+         [[{"text": "▶️ Resume Alerts", "callback_data": "resume_alerts"}]])
+
+
+def handle_resume(chat_id, cb_id=None):
+    if cb_id: answer(cb_id, "✅ Alerts resumed!")
+    db_update(chat_id, {"active": True})
+    send(chat_id, "✅ <b>Alerts resumed!</b> You'll get your next batch tomorrow at 9am UTC.",
+         kb_find_more())
+
+
+def handle_help(chat_id):
+    send(chat_id,
+         "📖 <b>Remote Radar Commands</b>\n\n"
+         "⚙️ <b>Setup</b>\n"
+         "/start — Welcome & set up alerts\n"
+         "/setup — Change your preferences\n"
+         "/keywords — Add custom keywords\n"
+         "/status — View current settings\n\n"
+         "🔍 <b>Find Jobs</b>\n"
+         "/find [role] — Instant search\n"
+         "Example: <code>/find discord moderator</code>\n\n"
+         "📊 <b>Market</b>\n"
+         "/market — Most in-demand roles today\n\n"
+         "✅ <b>Track Applications</b>\n"
+         "/applied [title] at [company]\n"
+         "/interview [title] at [company]\n"
+         "/rejected [title] at [company]\n"
+         "/offers — View your pipeline\n\n"
+         "👁 <b>Watch Companies</b>\n"
+         "/watch [company] — Get notified when they hire\n"
+         "/unwatch [company] — Remove from watchlist\n\n"
+         "📝 <b>AI Tools</b>\n"
+         "/cover [URL or description] — Generate cover letter\n\n"
+         "👥 <b>Invite</b>\n"
+         "/invite — Share your referral link\n\n"
+         "⏸ /stop — Pause alerts",
+         kb_find_more())
+
+
+# ── Main request handler ──────────────────────────────────────────────────────
+
 def process_update(update):
-    if "message" in update:
-        msg = update["message"]
+    chat_id = None
+    try:
+        if "callback_query" in update:
+            cb  = update["callback_query"]
+            chat_id = cb["message"]["chat"]["id"]
+            msg_id  = cb["message"]["message_id"]
+            data    = cb.get("data", "")
+            cb_id   = cb["id"]
+
+            if data == "setup_start":    handle_setup_start(chat_id, msg_id, cb_id)
+            elif data.startswith("cat_"): handle_category(chat_id, msg_id, data[4:], cb_id)
+            elif data.startswith("sen_"): handle_seniority(chat_id, msg_id, data[4:], cb_id)
+            elif data.startswith("loc_"): handle_location(chat_id, msg_id, data[4:], cb_id)
+            elif data.startswith("ctype_"): handle_ctype(chat_id, msg_id, data[6:], cb_id)
+            elif data == "find_now":     handle_find_now(chat_id, cb_id)
+            elif data == "status":       answer(cb_id); handle_status(chat_id)
+            elif data == "invite_link":  answer(cb_id); handle_invite(chat_id)
+            elif data == "resume_alerts": handle_resume(chat_id, cb_id)
+            return
+
+        if "message" not in update:
+            return
+
+        msg  = update["message"]
         chat_id = msg["chat"]["id"]
         username = msg.get("from", {}).get("username", "")
-        text = msg.get("text", "")
+        text = msg.get("text", "").strip()
+        if not text:
+            return
 
-        # Handle keyword reply state
-        if text and not text.startswith("/"):
-            user = db_get(chat_id)
-            if user.get("awaiting_keywords"):
-                db_update(chat_id, {"keywords": text.strip(), "awaiting_keywords": False})
-                send(chat_id, f"✅ Keywords saved: <b>{text.strip()}</b>")
-                user = db_get(chat_id)
-                send_jobs_now(chat_id, user)
-                return
+        # Check awaiting state
+        user = db_get(chat_id)
 
+        if user.get("awaiting_keywords") and not text.startswith("/"):
+            db_update(chat_id, {"keywords": text, "awaiting_keywords": False})
+            send(chat_id, f"✅ Keywords saved: <b>{text}</b>\n\nFinding matching jobs now...")
+            send_jobs_now(chat_id, user | {"keywords": text})
+            return
+
+        if user.get("awaiting_cover") and not text.startswith("/"):
+            db_update(chat_id, {"awaiting_cover": False})
+            generate_cover_letter(chat_id, text)
+            return
+
+        # Commands
         if text.startswith("/start"):
-            # Extract referral code if present
-            parts = text.split(" ", 1)
-            ref_code = parts[1].strip() if len(parts) > 1 else None
-            handle_start(chat_id, username, ref_code)
-        elif text.startswith("/invite") or text.startswith("/refer"):
-            handle_invite(chat_id)
+            ref = text.replace("/start", "").strip()
+            handle_start(chat_id, username, ref or None)
+        elif text.startswith("/setup"):
+            handle_start(chat_id, username)
         elif text.startswith("/keywords"):
             handle_keywords(chat_id, text)
-        elif text.startswith("/stop"):
-            handle_stop(chat_id)
+        elif text.startswith("/find"):
+            handle_find_command(chat_id, text)
+        elif text.startswith("/market"):
+            handle_market(chat_id)
+        elif text.startswith("/applied"):
+            handle_apply(chat_id, text)
+        elif text.startswith("/interview"):
+            handle_interview(chat_id, text)
+        elif text.startswith("/rejected"):
+            handle_rejected(chat_id, text)
+        elif text.startswith("/offers"):
+            handle_offers(chat_id)
+        elif text.startswith("/watch"):
+            handle_watch(chat_id, text)
+        elif text.startswith("/unwatch"):
+            handle_unwatch(chat_id, text)
+        elif text.startswith("/cover"):
+            handle_cover(chat_id, text)
+        elif text.startswith("/invite"):
+            handle_invite(chat_id)
         elif text.startswith("/status"):
             handle_status(chat_id)
-        elif text.startswith("/setup"):
-            send(chat_id, "Let's update your preferences:", kb_main())
-        elif text.startswith("/find"):
-            user = db_get(chat_id)
-            if user.get("setup_complete"):
-                send_jobs_now(chat_id, user)
-            else:
-                send(chat_id, "Please set up your preferences first.", kb_main())
-        elif text.startswith("/help"):
-            send(chat_id,
-                "📖 <b>Remote Radar Commands</b>\n\n"
-                "/start — Welcome & setup\n"
-                "/setup — Change preferences\n"
-                "/keywords — Add specific role keywords\n"
-                "/find — Find jobs right now\n"
-                "/invite — Get your invite link\n"
-                "/status — View your preferences\n"
-                "/stop — Pause alerts\n"
-                "/help — This message")
-
-    elif "callback_query" in update:
-        cb = update["callback_query"]
-        chat_id = cb["from"]["id"]
-        username = cb["from"].get("username", "")
-        msg_id = cb["message"]["message_id"]
-        data = cb.get("data", "")
-        cb_id = cb["id"]
-
-        if not db_get(chat_id):
-            db_set(chat_id, {"username": username, "active": False, "setup_complete": False})
-
-        if data == "setup_start":
-            answer(cb_id)
-            step1_category(chat_id, msg_id)
-        elif data == "find_jobs":
-            answer(cb_id, "Searching...")
-            user = db_get(chat_id)
-            send_jobs_now(chat_id, user)
-        elif data == "invite":
-            answer(cb_id)
-            handle_invite(chat_id)
-        elif data == "add_keywords":
-            answer(cb_id)
-            db_update(chat_id, {"awaiting_keywords": True})
-            send(chat_id,
-                 "✏️ <b>Add Keywords</b>\n\n"
-                 "Type your keywords below and send:\n\n"
-                 "<b>Examples:</b>\n"
-                 "• <code>moderator, community manager</code>\n"
-                 "• <code>ambassador, kol manager, discord mod</code>\n"
-                 "• <code>zealy, galxe, telegram moderator</code>")
-        elif data == "status":
-            answer(cb_id)
-            handle_status(chat_id)
-        elif data == "stop":
-            answer(cb_id)
+        elif text.startswith("/stop"):
             handle_stop(chat_id)
-        elif data.startswith("cat_"):
-            step2_seniority(chat_id, msg_id, data.replace("cat_",""), cb_id)
-        elif data.startswith("sen_"):
-            step3_location(chat_id, msg_id, data.replace("sen_",""), cb_id)
-        elif data.startswith("loc_"):
-            step4_company_type(chat_id, msg_id, data.replace("loc_",""), cb_id)
-        elif data.startswith("ctype_"):
-            finish_setup(chat_id, msg_id, data.replace("ctype_",""), cb_id)
+        elif text.startswith("/help"):
+            handle_help(chat_id)
+        else:
+            # Unknown message — show help
+            handle_help(chat_id)
+
+    except Exception as e:
+        print(f"process_update error (chat {chat_id}): {e}")
+        if chat_id:
+            try:
+                send(chat_id, "⚠️ Something went wrong. Please try again.")
+            except Exception:
+                pass
+
 
 class handler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(length)
-        try:
-            process_update(json.loads(body))
-        except Exception as e:
-            print(f"Webhook error: {e}")
+        body   = self.rfile.read(length)
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"OK")
+        try:
+            process_update(json.loads(body))
+        except Exception as e:
+            print(f"Handler error: {e}")
 
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Remote Radar is running.")
-
-    def log_message(self, format, *args):
+    def log_message(self, *args):
         pass
+
+
+if __name__ == "__main__":
+    import sys, json as _json
+    if len(sys.argv) > 1:
+        with open(sys.argv[1]) as f:
+            process_update(_json.load(f))
