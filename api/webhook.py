@@ -1,5 +1,5 @@
 """
-Remote Radar — Public Telegram Bot Webhook
+Remote Radar — Public Telegram Bot Webhook with Referral System
 """
 import os, json, requests
 from http.server import BaseHTTPRequestHandler
@@ -8,6 +8,7 @@ BOT_TOKEN    = os.environ.get("JOB_BOT_TOKEN", "")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 TG_API       = f"https://api.telegram.org/bot{BOT_TOKEN}"
+BOT_USERNAME = "RemoteDailyJobBot"
 
 WELCOME = """👋 <b>Welcome to Remote Radar!</b>
 
@@ -49,6 +50,11 @@ def db_update(chat_id, data):
     requests.patch(
         f"{SUPABASE_URL}/rest/v1/users?chat_id=eq.{chat_id}",
         headers=db_headers(), json=data, timeout=10)
+
+def db_increment_referrals(chat_id):
+    user = db_get(chat_id)
+    current = user.get("referrals", 0) or 0
+    db_update(chat_id, {"referrals": current + 1})
 
 def get_sent_ids(chat_id):
     r = requests.get(
@@ -172,7 +178,10 @@ CTYPE_LABELS = {
     "startup": "🚀 Startups", "established": "🏢 Established", "any": "🌍 Any",
 }
 
-def handle_start(chat_id, username):
+def handle_start(chat_id, username, ref_code=None):
+    existing = db_get(chat_id)
+    is_new = not existing
+
     db_set(chat_id, {
         "username": username or "",
         "active": False,
@@ -185,7 +194,27 @@ def handle_start(chat_id, username):
         "remote_only": False,
         "company_type": "any",
         "awaiting_keywords": False,
+        "referrals": existing.get("referrals", 0) if existing else 0,
+        "referred_by": existing.get("referred_by") if existing else None,
     })
+
+    # Handle referral
+    if is_new and ref_code and ref_code.startswith("ref_"):
+        try:
+            referrer_id = int(ref_code.replace("ref_", ""))
+            if referrer_id != chat_id:
+                db_update(chat_id, {"referred_by": referrer_id})
+                db_increment_referrals(referrer_id)
+                # Notify referrer
+                referrer = db_get(referrer_id)
+                ref_count = referrer.get("referrals", 0)
+                send(referrer_id,
+                    f"🎉 Someone joined Remote Radar using your invite link!\n\n"
+                    f"👥 You've now referred <b>{ref_count}</b> {'person' if ref_count == 1 else 'people'}.\n\n"
+                    f"Keep sharing: <code>t.me/{BOT_USERNAME}?start=ref_{referrer_id}</code>")
+        except Exception as e:
+            print(f"Referral error: {e}")
+
     send(chat_id, WELCOME, kb_main())
 
 def handle_status(chat_id):
@@ -195,6 +224,8 @@ def handle_status(chat_id):
         return
     status = "✅ Active" if user.get("active") else "⏸ Paused"
     kws = user.get("keywords", "") or "None set"
+    referrals = user.get("referrals", 0) or 0
+    invite_link = f"t.me/{BOT_USERNAME}?start=ref_{chat_id}"
     send(chat_id,
         f"📋 <b>Your Alert Preferences</b>\n\n"
         f"📂 Category: {CAT_LABELS.get(user.get('category','all'), 'All')}\n"
@@ -203,11 +234,26 @@ def handle_status(chat_id):
         f"🏢 Company: {CTYPE_LABELS.get(user.get('company_type','any'), 'Any')}\n"
         f"🔑 Keywords: {kws}\n"
         f"📡 Status: {status}\n\n"
+        f"👥 <b>Your Referrals: {referrals}</b>\n"
+        f"🔗 Invite link: <code>{invite_link}</code>\n\n"
         f"Alerts arrive daily at 9am UTC.",
         [[{"text": "✏️ Change Preferences", "callback_data": "setup_start"},
           {"text": "⏹ Pause", "callback_data": "stop"}],
-         [{"text": "🔍 Find Jobs Now", "callback_data": "find_jobs"}]]
+         [{"text": "🔍 Find Jobs Now", "callback_data": "find_jobs"},
+          {"text": "👥 My Invite Link", "callback_data": "invite"}]]
     )
+
+def handle_invite(chat_id):
+    user = db_get(chat_id)
+    referrals = user.get("referrals", 0) or 0
+    invite_link = f"t.me/{BOT_USERNAME}?start=ref_{chat_id}"
+    send(chat_id,
+        f"👥 <b>Invite Friends to Remote Radar</b>\n\n"
+        f"Share your personal invite link and get notified every time someone joins!\n\n"
+        f"🔗 Your link:\n<code>{invite_link}</code>\n\n"
+        f"📊 People invited so far: <b>{referrals}</b>\n\n"
+        f"💬 Share this message:\n"
+        f"<i>I use this free Telegram bot to get daily remote job alerts — no spam, just relevant jobs every morning. Check it out: t.me/{BOT_USERNAME}?start=ref_{chat_id}</i>")
 
 def handle_stop(chat_id):
     db_update(chat_id, {"active": False})
@@ -271,8 +317,6 @@ def send_jobs_now(chat_id, user, show_button=True):
         send(chat_id, "🔍 Searching for matching jobs...")
         all_jobs = get_all_jobs()
         keywords = user.get("keywords", "")
-
-        # Filter out already sent jobs
         sent_ids = get_sent_ids(chat_id)
         matched = [j for j in all_jobs
                    if matches_user(j, user) and j["_id"] not in sent_ids]
@@ -282,7 +326,7 @@ def send_jobs_now(chat_id, user, show_button=True):
         if not matched:
             send(chat_id,
                 "📭 <b>No new jobs found today.</b>\n\n"
-                "All matching jobs have already been sent to you. "
+                "All matching jobs have already been sent. "
                 "Check back tomorrow for fresh listings or broaden your preferences.",
                 [[{"text": "⚙️ Change Preferences", "callback_data": "setup_start"},
                   {"text": "🔑 Update Keywords", "callback_data": "add_keywords"}]]
@@ -302,8 +346,7 @@ def send_jobs_now(chat_id, user, show_button=True):
         if show_button:
             send(chat_id,
                 f"✅ <b>That's all for now.</b>\n\nNext batch arrives tomorrow at 9am UTC.",
-                kb_after_jobs()
-            )
+                kb_after_jobs())
 
     except Exception as e:
         print(f"send_jobs_now error: {e}")
@@ -313,18 +356,17 @@ def finish_setup(chat_id, msg_id, ctype, cb_id):
     answer(cb_id, f"✅ {CTYPE_LABELS.get(ctype, ctype)}")
     db_update(chat_id, {"company_type": ctype, "active": True, "setup_complete": True})
     user = db_get(chat_id)
+    invite_link = f"t.me/{BOT_USERNAME}?start=ref_{chat_id}"
     send(chat_id,
         f"🎉 <b>All set! Your daily alerts are live.</b>\n\n"
         f"📂 {CAT_LABELS.get(user.get('category','all'),'All Categories')}\n"
         f"🎯 {SEN_LABELS.get(user.get('seniority','all'),'All Levels')}\n"
         f"📍 {LOC_LABELS.get(user.get('location_key','worldwide'),'Worldwide')}\n"
         f"🏢 {CTYPE_LABELS.get(ctype,'Any')}\n\n"
-        f"💡 <b>Want more specific results?</b>\n"
-        f"Tap /keywords and type your specific roles e.g:\n"
-        f"<code>ambassador, kol manager, discord moderator</code>\n\n"
-        f"Share with friends who need remote jobs! 🚀",
+        f"💡 Add keywords: <code>/keywords ambassador, kol manager, discord mod</code>\n\n"
+        f"👥 <b>Share with friends:</b>\n<code>{invite_link}</code>",
         [[{"text": "📋 My Preferences", "callback_data": "status"},
-          {"text": "🔑 Add Keywords", "callback_data": "add_keywords"}]]
+          {"text": "👥 Invite Friends", "callback_data": "invite"}]]
     )
     send_jobs_now(chat_id, user)
 
@@ -363,7 +405,12 @@ def process_update(update):
                 return
 
         if text.startswith("/start"):
-            handle_start(chat_id, username)
+            # Extract referral code if present
+            parts = text.split(" ", 1)
+            ref_code = parts[1].strip() if len(parts) > 1 else None
+            handle_start(chat_id, username, ref_code)
+        elif text.startswith("/invite") or text.startswith("/refer"):
+            handle_invite(chat_id)
         elif text.startswith("/keywords"):
             handle_keywords(chat_id, text)
         elif text.startswith("/stop"):
@@ -384,13 +431,11 @@ def process_update(update):
                 "/start — Welcome & setup\n"
                 "/setup — Change preferences\n"
                 "/keywords — Add specific role keywords\n"
-                "/find — Find jobs now\n"
+                "/find — Find jobs right now\n"
+                "/invite — Get your invite link\n"
                 "/status — View your preferences\n"
                 "/stop — Pause alerts\n"
-                "/help — This message\n\n"
-                "💡 <b>Keyword examples:</b>\n"
-                "<code>ambassador, kol manager, discord moderator</code>\n"
-                "<code>zealy, galxe, telegram mod, community lead</code>")
+                "/help — This message")
 
     elif "callback_query" in update:
         cb = update["callback_query"]
@@ -410,6 +455,9 @@ def process_update(update):
             answer(cb_id, "Searching...")
             user = db_get(chat_id)
             send_jobs_now(chat_id, user)
+        elif data == "invite":
+            answer(cb_id)
+            handle_invite(chat_id)
         elif data == "add_keywords":
             answer(cb_id)
             db_update(chat_id, {"awaiting_keywords": True})
