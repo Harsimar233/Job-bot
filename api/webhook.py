@@ -289,8 +289,21 @@ def process_update(update):
         username = msg.get("from", {}).get("username", "")
         text = msg.get("text", "")
 
-        if text.startswith("/start"):
-            handle_start(chat_id, username)
+      def handle_start(chat_id, username):
+    # Always reset and restart setup
+    db_set(chat_id, {
+        "username": username or "",
+        "active": False,
+        "setup_complete": False,
+        "category": "all",
+        "seniority": "all",
+        "keywords": "",
+        "location": "Worldwide",
+        "location_key": "worldwide",
+        "remote_only": False,
+        "company_type": "any",
+    })
+    send(chat_id, WELCOME, kb_main())
         elif text.startswith("/keywords"):
             handle_keywords(chat_id, text)
         elif text.startswith("/stop"):
