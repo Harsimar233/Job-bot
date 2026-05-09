@@ -17,9 +17,13 @@ I find remote jobs worldwide and send alerts straight to your Telegram — daily
 📂 Every category — Tech, Marketing, Sales, Finance, Executive & more
 ⚡ Personalised to your exact preferences
 
+💡 After setup, use /keywords to target specific roles like:
+<code>ambassador, kol manager, discord moderator, telegram mod, zealy, galxe</code>
+
 Let's set up your alerts in 4 quick steps 👇
 
 <i>Made by <a href="https://t.me/Harsimarhs">@Harsimarhs</a> · Feel free to reach out for any queries</i>"""
+
 def db_headers():
     return {
         "apikey": SUPABASE_KEY,
@@ -262,7 +266,8 @@ def finish_setup(chat_id, msg_id, ctype, cb_id):
         f"🎯 {SEN_LABELS.get(user.get('seniority','all'),'All Levels')}\n"
         f"📍 {LOC_LABELS.get(user.get('location_key','worldwide'),'Worldwide')}\n"
         f"🏢 {CTYPE_LABELS.get(ctype,'Any')}\n\n"
-        f"💡 Add keywords: <code>/keywords community manager, web3</code>\n\n"
+        f"💡 <b>Want more specific results?</b> Add keywords:\n"
+        f"<code>/keywords ambassador, kol manager, discord moderator, telegram mod, zealy, galxe</code>\n\n"
         f"Share with friends who need remote jobs! 🚀",
         [[{"text": "📋 View My Preferences", "callback_data": "status"}]]
     )
@@ -273,10 +278,13 @@ def handle_keywords(chat_id, text):
     if not keywords:
         send(chat_id,
              "Send your keywords like this:\n\n"
-             "<code>/keywords community manager, web3, discord</code>")
+             "<code>/keywords community manager, web3, discord</code>\n\n"
+             "Examples for specific roles:\n"
+             "<code>/keywords ambassador, kol manager, discord moderator</code>\n"
+             "<code>/keywords zealy, galxe, telegram mod</code>")
         return
     db_update(chat_id, {"keywords": keywords})
-    send(chat_id, f"✅ Keywords saved: <b>{keywords}</b>")
+    send(chat_id, f"✅ Keywords saved: <b>{keywords}</b>\n\nYour alerts will now include jobs matching these terms.")
 
 def process_update(update):
     if "message" in update:
@@ -300,10 +308,13 @@ def process_update(update):
                 "📖 <b>Remote Radar Commands</b>\n\n"
                 "/start — Welcome & setup\n"
                 "/setup — Change preferences\n"
-                "/keywords web3, marketing — Set keywords\n"
-                "/status — View preferences\n"
+                "/keywords — Add specific role keywords\n"
+                "/status — View your preferences\n"
                 "/stop — Pause alerts\n"
-                "/help — This message")
+                "/help — This message\n\n"
+                "💡 <b>Keyword examples:</b>\n"
+                "<code>/keywords ambassador, kol manager, discord moderator</code>\n"
+                "<code>/keywords zealy, galxe, telegram mod, community lead</code>")
 
     elif "callback_query" in update:
         cb = update["callback_query"]
