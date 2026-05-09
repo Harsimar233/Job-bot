@@ -145,7 +145,6 @@ CTYPE_LABELS = {
 }
 
 def handle_start(chat_id, username):
-    # Always reset to fresh state
     db_set(chat_id, {
         "username": username or "",
         "active": False,
@@ -222,6 +221,36 @@ def step4_company_type(chat_id, msg_id, loc_key, cb_id):
          f"⚙️ <b>Step 4 of 4 — Company Type</b>\n\nWhat kind of company do you prefer?",
          kb_company_type())
 
+def send_jobs_now(chat_id, user):
+    try:
+        from api.jobs import get_all_jobs, matches_user, fmt_date, score
+        send(chat_id, "🔍 Finding your first matching jobs now...")
+        all_jobs = get_all_jobs()
+        keywords = user.get("keywords", "")
+        matched = [j for j in all_jobs if matches_user(j, user)]
+        matched.sort(key=lambda j: score(j["title"], keywords), reverse=True)
+        matched = matched[:10]
+        if not matched:
+            send(chat_id, "No matching jobs found right now. You'll get alerts daily at 9am UTC as new jobs are posted.")
+            return
+        sources = list({j["source"] for j in matched})
+        send(chat_id, f"🔍 <b>{len(matched)} jobs matching your profile</b>\nSources: {', '.join(sources)}")
+        for job in matched:
+            date_label = f"\n📅 {fmt_date(job['date'])}" if job.get("date") else ""
+            loc_label = f"\n📍 {job['location']}" if job.get("location") and job["location"].lower() != "remote" else ""
+            funding = f"\n💸 {job['funding']}" if job.get("funding") else ""
+            startup = "\n🚀 Early-stage startup" if job.get("company_type") == "startup" and not job.get("funding") else ""
+            send(chat_id,
+                f"💼 <b>{job['title']}</b>\n"
+                f"🏢 {job['company'] or 'Unknown'}"
+                f"{loc_label}{funding}{startup}{date_label}\n"
+                f"🔗 <a href='{job['url']}'>Apply Now</a>\n"
+                f"📌 via {job['source']}"
+            )
+    except Exception as e:
+        print(f"send_jobs_now error: {e}")
+        send(chat_id, "You'll receive your first alerts tomorrow at 9am UTC.")
+
 def finish_setup(chat_id, msg_id, ctype, cb_id):
     answer(cb_id, f"✅ {CTYPE_LABELS.get(ctype, ctype)}")
     db_update(chat_id, {"company_type": ctype, "active": True, "setup_complete": True})
@@ -232,12 +261,11 @@ def finish_setup(chat_id, msg_id, ctype, cb_id):
         f"🎯 {SEN_LABELS.get(user.get('seniority','all'),'All Levels')}\n"
         f"📍 {LOC_LABELS.get(user.get('location_key','worldwide'),'Worldwide')}\n"
         f"🏢 {CTYPE_LABELS.get(ctype,'Any')}\n\n"
-        f"You'll get your first alerts tomorrow at 9am UTC.\n\n"
-        f"💡 <b>Tip:</b> Add keywords by sending /keywords\n"
-        f"Example: <code>/keywords community manager, web3, discord</code>\n\n"
+        f"💡 Add keywords: <code>/keywords community manager, web3</code>\n\n"
         f"Share with friends who need remote jobs! 🚀",
         [[{"text": "📋 View My Preferences", "callback_data": "status"}]]
     )
+    send_jobs_now(chat_id, user)
 
 def handle_keywords(chat_id, text):
     keywords = text.replace("/keywords", "").strip()
