@@ -1,8 +1,8 @@
 """
 Remote Radar — Daily Job Scanner
-Runs via GitHub Actions at 9am UTC daily.
+Fetches all jobs, stores in Supabase, sends personalized alerts.
 """
-import os, requests
+import os, requests, json
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler
 
@@ -23,21 +23,21 @@ def send(chat_id, text, buttons=None):
     except Exception:
         pass
 
-def sb_get(path, params=None):
+def sb_get(path):
     hdrs = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
     url = SUPABASE_URL.rstrip("/") + "/rest/v1/" + path
     try:
-        r = requests.get(url, headers=hdrs, params=params, timeout=10)
+        r = requests.get(url, headers=hdrs, timeout=10)
         return r.json() if r.status_code == 200 else []
     except Exception:
         return []
 
-def sb_post(path, body):
+def sb_post(path, body, upsert=False):
     hdrs = {
         "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
         "Content-Type": "application/json",
-        "Prefer": "resolution=ignore-duplicates",
+        "Prefer": "resolution=merge-duplicates" if upsert else "resolution=ignore-duplicates",
     }
     url = SUPABASE_URL.rstrip("/") + "/rest/v1/" + path
     try:
@@ -52,47 +52,64 @@ def was_sent(chat_id, job_id):
 def mark_sent(chat_id, job_id):
     sb_post("sent_jobs", {"chat_id": chat_id, "job_id": str(job_id)})
 
+def store_jobs(jobs):
+    """Store all scraped jobs in Supabase for instant retrieval later."""
+    if not jobs:
+        return
+    rows = []
+    for j in jobs:
+        rows.append({
+            "job_id": j["_id"],
+            "title": j.get("title",""),
+            "company": j.get("company",""),
+            "url": j.get("url",""),
+            "source": j.get("source",""),
+            "date_posted": str(j.get("date","")),
+            "location": j.get("location","Remote"),
+            "salary": j.get("salary",""),
+            "funding": j.get("funding",""),
+            "company_type": j.get("company_type",""),
+            "visa": j.get("visa", False),
+            "hot": j.get("hot", False),
+        })
+    # Insert in batches of 100
+    for i in range(0, len(rows), 100):
+        sb_post("jobs", rows[i:i+100], upsert=True)
+    print(f"Stored {len(rows)} jobs in Supabase")
+
 def fmt_date(date_val):
     if not date_val:
         return ""
     try:
         s = str(date_val)
-        # Try ISO format
         dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
         return dt.strftime("%-d %b %Y")
     except Exception:
-        pass
-    try:
-        # Fallback: just take first 10 chars if string
-        s = str(date_val)
-        return s[:10] if len(s) >= 10 else s
-    except Exception:
-        return ""
+        try:
+            s = str(date_val)
+            return s[:10] if len(s) >= 10 else s
+        except Exception:
+            return ""
 
 def format_job(job):
     hot = "🔥 " if job.get("hot") else ""
     lines = [f"💼 {hot}<b>{job.get('title','')}</b>"]
-
     if job.get("company"):
         lines.append(f"🏢 {job['company']}")
-
     loc = job.get("location","")
     if loc and loc.lower() not in ("remote",""):
         lines.append(f"📍 {loc}")
     else:
         lines.append("📍 Remote")
-
     if job.get("salary"):
         lines.append(f"💰 {job['salary']}")
     if job.get("funding"):
         lines.append(f"💸 Funding: {job['funding']}")
     if job.get("visa"):
         lines.append("✈️ Visa sponsorship available")
-    if job.get("date"):
-        d = fmt_date(job["date"])
-        if d:
-            lines.append(f"📅 {d}")
-
+    d = fmt_date(job.get("date") or job.get("date_posted",""))
+    if d:
+        lines.append(f"📅 {d}")
     url = job.get("url","")
     if url:
         lines.append(f"🔗 <a href='{url}'>Apply Now</a>")
@@ -106,6 +123,9 @@ def run():
     from api.jobs import get_all_jobs, matches_user, score
 
     all_jobs = get_all_jobs()
+
+    # Store all jobs in Supabase for instant retrieval
+    store_jobs(all_jobs)
 
     print("Fetching users...")
     users = sb_get("users?active=eq.true&setup_complete=eq.true")
@@ -144,7 +164,7 @@ def run():
             mark_sent(chat_id, job["_id"])
 
         send(chat_id,
-            "✅ That's today's batch! Fresh listings arrive tomorrow at 9am UTC. 🚀",
+            "✅ That's today's batch! Tap below to get more anytime. 🚀",
             FIND_MORE_BTN)
 
     # Watchlist alerts
