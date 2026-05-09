@@ -1,9 +1,9 @@
 """
 Remote Radar — Daily Job Scanner
 Runs via GitHub Actions at 9am UTC daily.
-Sends personalized alerts to all active users + watchlist notifications.
 """
 import os, requests
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler
 
 BOT_TOKEN    = os.environ.get("JOB_BOT_TOKEN", "")
@@ -13,7 +13,7 @@ TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 def send(chat_id, text, buttons=None):
     payload = {
-        "chat_id": chat_id, "text": text[:4096],
+        "chat_id": chat_id, "text": str(text)[:4096],
         "parse_mode": "HTML", "disable_web_page_preview": True,
     }
     if buttons:
@@ -33,8 +33,12 @@ def sb_get(path, params=None):
         return []
 
 def sb_post(path, body):
-    hdrs = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
-            "Content-Type": "application/json", "Prefer": "return=representation"}
+    hdrs = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "resolution=ignore-duplicates",
+    }
     url = SUPABASE_URL.rstrip("/") + "/rest/v1/" + path
     try:
         requests.post(url, headers=hdrs, json=body, timeout=10)
@@ -42,47 +46,60 @@ def sb_post(path, body):
         pass
 
 def was_sent(chat_id, job_id):
-    r = sb_get(f"sent_jobs?chat_id=eq.{chat_id}&job_id=eq.{job_id}")
+    r = sb_get(f"sent_jobs?chat_id=eq.{chat_id}&job_id=eq.{job_id}&select=id&limit=1")
     return bool(r)
 
 def mark_sent(chat_id, job_id):
-    sb_post("sent_jobs", {"chat_id": chat_id, "job_id": job_id})
+    sb_post("sent_jobs", {"chat_id": chat_id, "job_id": str(job_id)})
 
-def get_watchlist_users():
-    """Get all watchlist entries"""
-    return sb_get("watchlist?select=chat_id,company")
+def fmt_date(date_val):
+    if not date_val:
+        return ""
+    try:
+        s = str(date_val)
+        # Try ISO format
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return dt.strftime("%-d %b %Y")
+    except Exception:
+        pass
+    try:
+        # Fallback: just take first 10 chars if string
+        s = str(date_val)
+        return s[:10] if len(s) >= 10 else s
+    except Exception:
+        return ""
 
 def format_job(job):
     hot = "🔥 " if job.get("hot") else ""
-    title = f"{hot}<b>{job['title']}</b>"
-    company = f"🏢 {job['company']}" if job.get("company") else ""
-    loc = f"\n📍 {job['location']}" if job.get("location") and job["location"].lower() not in ("remote","") else ""
-    sal = f"\n💰 {job['salary']}" if job.get("salary") else ""
-    fund = f"\n💸 Funding: {job['funding']}" if job.get("funding") else ""
-    visa = "\n✈️ Visa sponsorship" if job.get("visa") else ""
-    date = f"\n📅 {fmt_date(job['date'])}" if job.get("date") else ""
+    lines = [f"💼 {hot}<b>{job.get('title','')}</b>"]
 
-    lines = [f"💼 {title}"]
-    if company: lines.append(company)
-    if loc: lines.append(loc)
-    if sal: lines.append(sal)
-    if fund: lines.append(fund)
-    if visa: lines.append(visa)
-    if date: lines.append(date)
-    lines.append(f"🔗 <a href='{job.get('url','')}'>Apply Now</a>")
-    lines.append(f"📌 {job['source']}")
+    if job.get("company"):
+        lines.append(f"🏢 {job['company']}")
+
+    loc = job.get("location","")
+    if loc and loc.lower() not in ("remote",""):
+        lines.append(f"📍 {loc}")
+    else:
+        lines.append("📍 Remote")
+
+    if job.get("salary"):
+        lines.append(f"💰 {job['salary']}")
+    if job.get("funding"):
+        lines.append(f"💸 Funding: {job['funding']}")
+    if job.get("visa"):
+        lines.append("✈️ Visa sponsorship available")
+    if job.get("date"):
+        d = fmt_date(job["date"])
+        if d:
+            lines.append(f"📅 {d}")
+
+    url = job.get("url","")
+    if url:
+        lines.append(f"🔗 <a href='{url}'>Apply Now</a>")
+    lines.append(f"📌 {job.get('source','')}")
     return "\n".join(lines)
 
-def fmt_date(date_str):
-    if not date_str: return ""
-    from datetime import datetime
-    try:
-        dt = datetime.strptime(date_str[:10], "%Y-%m-%d")
-        return dt.strftime("%d %b %Y")
-    except Exception:
-        return date_str[:10]
-
-FIND_MORE_BTN = [[{"text": "🔍 Find More Jobs", "callback_data": "find_now"}]]
+FIND_MORE_BTN = [[{"text": "🔍 Find More Jobs", "callback_data": "find_jobs"}]]
 
 def run():
     print("Fetching all jobs...")
@@ -90,7 +107,6 @@ def run():
 
     all_jobs = get_all_jobs()
 
-    # ── Regular user alerts ───────────────────────────────────────────────────
     print("Fetching users...")
     users = sb_get("users?active=eq.true&setup_complete=eq.true")
     print(f"Active users: {len(users)}")
@@ -99,20 +115,19 @@ def run():
         chat_id = user["chat_id"]
         keywords = user.get("keywords", "")
 
-        # Filter matching + unsent jobs
         matched = [j for j in all_jobs
                    if matches_user(j, user) and not was_sent(chat_id, j["_id"])]
-        matched.sort(key=lambda j: (-score(j["title"], keywords), not j.get("hot")))
+        matched.sort(key=lambda j: (-score(j["title"], keywords), not j.get("hot", False)))
         batch = matched[:10]
 
-        print(f"User {chat_id}: sending {len(batch)} jobs")
+        print(f"User {chat_id}: {len(batch)} new jobs")
 
         if not batch:
             send(chat_id,
-                 "✅ <b>All caught up!</b>\n\nNo new matching jobs found today. "
-                 "I'll alert you as soon as fresh ones arrive.\n\n"
-                 "Use /find to search on demand or /market to see today's trends.",
-                 FIND_MORE_BTN)
+                "📭 <b>No new jobs today.</b>\n\n"
+                "All matching jobs have already been sent. "
+                "Fresh listings arrive tomorrow at 9am UTC.",
+                FIND_MORE_BTN)
             continue
 
         hot_count = sum(1 for j in batch if j.get("hot"))
@@ -120,7 +135,7 @@ def run():
 
         header = f"🌅 <b>Your Daily Job Alerts</b> — {len(batch)} new matches"
         if hot_count:
-            header += f" · 🔥 {hot_count} hot"
+            header += f" · 🔥 {hot_count} posted today"
         header += f"\n📡 {', '.join(sources)}"
         send(chat_id, header)
 
@@ -129,27 +144,25 @@ def run():
             mark_sent(chat_id, job["_id"])
 
         send(chat_id,
-             "That's today's batch! See you tomorrow with fresh listings. 🚀\n"
-             "Use /find anytime for on-demand search.",
-             FIND_MORE_BTN)
+            "✅ That's today's batch! Fresh listings arrive tomorrow at 9am UTC. 🚀",
+            FIND_MORE_BTN)
 
-    # ── Watchlist alerts ──────────────────────────────────────────────────────
-    watchlist_entries = get_watchlist_users()
-    if watchlist_entries:
-        # Group by chat_id
+    # Watchlist alerts
+    watchlist = sb_get("watchlist?select=chat_id,company")
+    if watchlist:
         watch_map = {}
-        for w in watchlist_entries:
+        for w in watchlist:
             cid = w["chat_id"]
-            if cid not in watch_map:
-                watch_map[cid] = []
+            watch_map.setdefault(cid, [])
             watch_map[cid].append(w["company"].lower())
 
         for chat_id, companies in watch_map.items():
             watched_jobs = [j for j in all_jobs
-                            if j.get("company", "").lower() in companies
-                            and not was_sent(chat_id, j["id"])]
+                            if j.get("company","").lower() in companies
+                            and not was_sent(chat_id, j["_id"])]
             if watched_jobs:
-                send(chat_id, f"👁 <b>Watchlist Alert!</b> {len(watched_jobs)} new job(s) from companies you're watching:")
+                send(chat_id,
+                    f"👁 <b>Watchlist Alert!</b> {len(watched_jobs)} new job(s) from companies you're tracking:")
                 for job in watched_jobs[:5]:
                     send(chat_id, format_job(job))
                     mark_sent(chat_id, job["_id"])
@@ -157,7 +170,6 @@ def run():
     print("Scan complete.")
 
 
-# Vercel serverless function entry point
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
