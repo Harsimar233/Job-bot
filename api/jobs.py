@@ -1,667 +1,709 @@
 """
-Global Job Engine — 15+ sources covering worldwide.
-India, Nigeria, Japan, UK, USA, Europe, SE Asia, Middle East & more.
+Remote Radar — Job Sources
+Scrapes 15+ sources globally, no Adzuna needed.
 """
-import re, requests, feedparser, hashlib
+import os, re, requests, feedparser, hashlib
 from datetime import datetime, timezone, timedelta
 from bs4 import BeautifulSoup
-from email.utils import parsedate_to_datetime
 
-SCRAPER_KEY  = __import__("os").environ.get("SCRAPER_KEY", "")
-ADZUNA_ID    = __import__("os").environ.get("ADZUNA_ID", "")
-ADZUNA_KEY   = __import__("os").environ.get("ADZUNA_KEY", "")
-CUTOFF_DAYS  = 7
-HEADERS      = {"User-Agent": "Mozilla/5.0 (compatible; RemoteRadar/1.0)"}
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def jid(url):
-    return hashlib.md5(url.encode()).hexdigest()[:12]
-
-def parse_date(s):
-    if not s:
-        return None
-    try:
-        return parsedate_to_datetime(s)
-    except Exception:
-        pass
-    try:
-        return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
-    except Exception:
-        pass
-    try:
-        if isinstance(s, (int, float)) and s > 1e10:
-            return datetime.fromtimestamp(s/1000, tz=timezone.utc)
-    except Exception:
-        pass
-    return None
-
-def is_recent(date_val, days=CUTOFF_DAYS):
-    dt = parse_date(date_val)
-    if dt is None:
-        return True
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt >= datetime.now(timezone.utc) - timedelta(days=days)
-
-def fmt_date(s):
-    dt = parse_date(s)
-    return dt.strftime("%-d %b %Y") if dt else ""
-
-def scrape_url(url, timeout=25, render=False):
-    if SCRAPER_KEY:
-        p = f"api_key={SCRAPER_KEY}&url={requests.utils.quote(url, safe=':/')}"
-        if render:
-            p += "&render=true"
-        return requests.get(f"http://api.scraperapi.com?{p}", timeout=timeout)
-    return requests.get(url, headers=HEADERS, timeout=timeout)
-
-def make_job(title, company, url, source, date="", location="Remote",
-             desc="", salary="", funding="", company_type=""):
-    return {
-        "title": (title or "").strip(),
-        "company": (company or "").strip(),
-        "url": (url or "").strip(),
-        "source": source,
-        "date": date,
-        "location": (location or "Remote").strip(),
-        "desc": (desc or "").strip(),
-        "salary": (salary or "").strip(),
-        "funding": (funding or "").strip(),
-        "company_type": company_type or "",
-        "_id": jid(url or title or ""),
-    }
-
-# ── Category keywords ─────────────────────────────────────────────────────────
-
-CATEGORY_KEYWORDS = {
-    "tech": ["engineer","developer","software","frontend","backend","fullstack","devops",
-             "sre","data engineer","ml engineer","mobile","ios","android","cloud","security",
-             "qa","platform","infrastructure"],
-    "product": ["product manager","product lead","product owner","head of product",
-                "vp product","chief product","product director","product analyst"],
-    "design": ["designer","ux","ui","product designer","graphic designer","visual designer",
-               "brand designer","motion designer","design lead","creative director"],
-    "marketing": ["marketing manager","marketing lead","growth manager","growth marketing",
-                  "digital marketing","performance marketing","seo","sem","content marketing",
-                  "email marketing","brand manager","marketing director","vp marketing","cmo",
-                  "kol manager","influencer marketing","social media manager","social media",
-                  "content creator","content strategist"],
-    "community": ["community manager","community lead","community moderator","discord moderator",
-                  "telegram moderator","moderator","community growth","ambassador",
-                  "community operations","community advocate","ecosystem growth",
-                  "ambassador program","community building"],
-    "support": ["customer support","customer success","support specialist","support agent",
-                "support manager","help desk","live chat","technical support",
-                "customer experience","cx manager","client success","account manager"],
-    "sales": ["sales manager","sales lead","account executive","business development",
-              "bd manager","sales director","vp sales","head of sales","revenue manager",
-              "partnership manager","enterprise sales","sales representative"],
-    "finance": ["finance manager","financial analyst","accountant","controller","cfo",
-                "chief financial officer","head of finance","treasury","fp&a","bookkeeper"],
-    "operations": ["operations manager","ops manager","head of operations","coo",
-                   "project manager","program manager","business analyst","chief of staff"],
-    "hr": ["hr manager","human resources","recruiter","talent acquisition","people manager",
-           "head of people","people operations","hr director","chro"],
-    "executive": ["ceo","chief executive","president","co-founder","founder",
-                  "managing director","general manager","country manager","regional director",
-                  "vp","vice president","director","head of","cto","cmo","coo","cfo"],
-    "web3": ["web3","crypto","blockchain","defi","nft","dao","dex","protocol","token",
-             "wallet","exchange","smart contract","ethereum","bitcoin","layer2","metaverse"],
+SCRAPER_KEY = os.environ.get("SCRAPER_KEY", "")
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-EXCLUDE_TITLES = ["intern (unpaid)","volunteer only","commission only"]
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
-def is_title_relevant(title, user_keywords, user_category):
-    t = title.lower().strip()
-    if not t or len(t) < 3:
-        return False
-    if any(e in t for e in EXCLUDE_TITLES):
-        return False
-    if user_keywords:
-        kws = [k.strip().lower() for k in user_keywords.split(",") if k.strip()]
-        if kws and any(k in t for k in kws):
-            return True
-    if user_category and user_category != "all":
-        cat_kws = CATEGORY_KEYWORDS.get(user_category, [])
-        return any(k in t for k in cat_kws)
-    all_kws = [k for kws in CATEGORY_KEYWORDS.values() for k in kws]
-    return any(k in t for k in all_kws)
+def get(url, timeout=12, scraper=False):
+    try:
+        if scraper and SCRAPER_KEY:
+            r = requests.get(
+                "http://api.scraperapi.com",
+                params={"api_key": SCRAPER_KEY, "url": url},
+                timeout=timeout, headers=HEADERS
+            )
+        else:
+            r = requests.get(url, timeout=timeout, headers=HEADERS)
+        return r
+    except Exception:
+        return None
 
-def matches_location(job_location, user_location, user_remote_only):
-    jloc = (job_location or "").lower()
-    uloc = (user_location or "").lower()
-    if not uloc or uloc in ["worldwide", "any", "anywhere", ""]:
-        return True
-    if uloc == "remote" or user_remote_only:
-        return "remote" in jloc or not jloc
-    location_map = {
-        "usa": ["united states","us","usa","america","remote"],
-        "uk": ["united kingdom","uk","england","britain","london","remote"],
-        "india": ["india","bangalore","mumbai","delhi","hyderabad","remote"],
-        "nigeria": ["nigeria","lagos","abuja","remote"],
-        "europe": ["europe","germany","france","netherlands","spain","italy","remote"],
-        "southeast asia": ["indonesia","vietnam","philippines","malaysia","singapore","remote"],
-        "middle east": ["uae","dubai","saudi","qatar","remote"],
-        "japan": ["japan","tokyo","remote"],
-        "china": ["china","beijing","shanghai","remote"],
-    }
-    for region, cities in location_map.items():
-        if region in uloc:
-            return any(c in jloc for c in cities)
-    return uloc in jloc or "remote" in jloc
+def job_id(title, company, url=""):
+    raw = f"{title}|{company}|{url}"
+    return hashlib.md5(raw.encode()).hexdigest()[:12]
 
-def matches_seniority(title, user_level):
-    if not user_level or user_level == "all":
-        return True
-    t = title.lower()
-    level_map = {
-        "entry": ["junior","entry","associate","assistant","coordinator"],
-        "senior": ["senior","sr.","lead","principal","staff"],
-        "manager": ["manager","lead","head of","supervisor"],
-        "director": ["director","vp","vice president"],
-        "executive": ["ceo","cto","cmo","coo","cfo","chief","president","founder"],
-    }
-    allowed = level_map.get(user_level, [])
-    if user_level == "mid":
-        return not any(k in t for k in ["junior","entry","senior","sr.","director","vp","chief","ceo"])
-    return any(k in t for k in allowed) if allowed else True
-
-def matches_user(job, user):
-    keywords = user.get("keywords", "")
-    category = user.get("category", "all")
-    location = user.get("location", "Remote")
-    remote_only = user.get("remote_only", True)
-    seniority = user.get("seniority", "all")
-    if not is_title_relevant(job["title"], keywords, category):
-        return False
-    if not matches_location(job["location"], location, remote_only):
-        return False
-    if not matches_seniority(job["title"], seniority):
-        return False
+def is_recent(date_str, days=10):
+    if not date_str:
+        return True  # include if no date
+    try:
+        for fmt in ["%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S%z",
+                    "%Y-%m-%d", "%a, %d %b %Y %H:%M:%S %z",
+                    "%a, %d %b %Y %H:%M:%S GMT"]:
+            try:
+                dt = datetime.strptime(date_str[:25], fmt[:len(date_str[:25])])
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return (datetime.now(timezone.utc) - dt).days <= days
+            except Exception:
+                continue
+    except Exception:
+        pass
     return True
 
-def score(title, keywords=""):
-    t = title.lower()
-    s = 0
-    if keywords:
-        kws = [k.strip().lower() for k in keywords.split(",") if k.strip()]
-        s += sum(20 for k in kws if k in t)
-    all_kws = [k for kws in CATEGORY_KEYWORDS.values() for k in kws]
-    s += sum(5 for k in all_kws if k in t)
-    return min(s, 100)
+def is_hot(date_str):
+    """Posted in last 24 hours"""
+    if not date_str:
+        return False
+    try:
+        for fmt in ["%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%d"]:
+            try:
+                dt = datetime.strptime(date_str[:19], fmt[:19])
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return (datetime.now(timezone.utc) - dt).total_seconds() < 86400
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return False
+
+def fmt_date(date_str):
+    if not date_str:
+        return ""
+    try:
+        for fmt in ["%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%d"]:
+            try:
+                dt = datetime.strptime(date_str[:10], "%Y-%m-%d")
+                return dt.strftime("%d %b %Y")
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return date_str[:10]
+
+def detect_visa(text):
+    text = text.lower()
+    return any(x in text for x in ["visa sponsor", "work authorization", "right to work", "sponsorship available"])
+
+def detect_salary(text):
+    """Extract salary info from text"""
+    patterns = [
+        r'\$[\d,]+k?\s*[-–]\s*\$[\d,]+k?',
+        r'£[\d,]+k?\s*[-–]\s*£[\d,]+k?',
+        r'€[\d,]+k?\s*[-–]\s*€[\d,]+k?',
+        r'[\d,]+\s*[-–]\s*[\d,]+\s*(?:USD|EUR|GBP|INR)',
+        r'\$[\d,]+k?\+?\s*(?:per year|\/yr|\/year|pa|annually)?',
+        r'up to \$[\d,]+',
+    ]
+    for p in patterns:
+        m = re.search(p, text, re.I)
+        if m:
+            return m.group(0).strip()
+    return ""
+
+KEYWORDS_ALL = [
+    "community", "moderator", "ambassador", "discord", "telegram", "social media",
+    "marketing", "growth", "content", "brand", "kol", "influencer", "partnership",
+    "customer support", "customer success", "support specialist", "help desk",
+    "manager", "director", "lead", "head of", "vp ", "chief", "cmo", "ceo", "cto",
+    "engineer", "developer", "frontend", "backend", "fullstack", "devops",
+    "product", "design", "data", "analyst", "finance", "operations", "hr",
+    "sales", "business development", "account", "web3", "blockchain", "defi", "nft",
+    "crypto", "solidity", "dao", "remote", "coordinator", "specialist", "associate"
+]
+
+EXCLUDE_ALWAYS = [
+    "mandarin only", "native japanese", "native korean", "chinese only",
+    "требуется", "только на русском"  # Russian-only roles
+]
+
+def is_relevant(title):
+    title_l = title.lower()
+    if any(x in title_l for x in EXCLUDE_ALWAYS):
+        return False
+    return len(title) > 4  # Accept almost everything, let user filter
+
+def make_job(title, company, url, source, date="", location="Remote",
+             salary="", funding="", company_type="", visa=False, description=""):
+    return {
+        "id": job_id(title, company, url),
+        "title": title.strip(),
+        "company": (company or "").strip(),
+        "url": url,
+        "source": source,
+        "date": date,
+        "location": location,
+        "salary": salary,
+        "funding": funding,
+        "company_type": company_type,
+        "visa": visa,
+        "hot": is_hot(date),
+        "description": description[:300] if description else "",
+    }
 
 
-# ── SOURCE 1: Remotive (global remote) ───────────────────────────────────────
+# ── Sources ───────────────────────────────────────────────────────────────────
 
 def scrape_remotive():
     jobs = []
     try:
-        r = requests.get("https://remotive.com/api/remote-jobs?limit=100", headers=HEADERS, timeout=15)
+        r = get("https://remotive.com/api/remote-jobs?limit=100")
+        if not r: return jobs
         for j in r.json().get("jobs", []):
-            if not is_recent(j.get("publication_date","")):
-                continue
+            if not is_recent(j.get("publication_date", "")): continue
+            desc = j.get("description", "")
+            sal = detect_salary(desc) or j.get("salary", "")
             jobs.append(make_job(
-                j.get("title",""), j.get("company_name",""),
-                j.get("url",""), "Remotive",
-                j.get("publication_date",""),
-                j.get("candidate_required_location","Remote"),
-                j.get("description",""), j.get("salary","")
+                j.get("title", ""), j.get("company_name", ""),
+                j.get("url", ""), "Remotive",
+                j.get("publication_date", ""), j.get("candidate_required_location", "Remote"),
+                salary=sal
             ))
     except Exception as e:
-        print(f"Remotive: {e}")
+        print(f"Remotive error: {e}")
     print(f"Remotive: {len(jobs)}")
     return jobs
 
 
-# ── SOURCE 2: WeWorkRemotely (all categories) ─────────────────────────────────
-
 def scrape_wwr():
     jobs = []
-    cats = [
-        "remote-full-stack-programming-jobs","remote-front-end-programming-jobs",
-        "remote-back-end-programming-jobs","remote-marketing-jobs",
-        "remote-customer-support-jobs","remote-sales-and-business-development-jobs",
-        "remote-product-jobs","remote-design-jobs","remote-devops-sysadmin-jobs",
-        "remote-finance-legal-jobs","remote-human-resources-jobs","all-other-remote-jobs",
-    ]
-    for cat in cats:
+    CATS = ["remote-jobs", "marketing-jobs", "customer-service-jobs",
+            "management-business-jobs", "all-other-jobs"]
+    for cat in CATS:
         try:
-            feed = feedparser.parse(f"https://weworkremotely.com/categories/{cat}.rss")
+            feed = feedparser.parse(f"https://weworkremotely.com/{cat}/feed")
             for e in feed.entries:
-                if not is_recent(e.get("published")):
-                    continue
-                raw = e.get("title","")
-                if " at " in raw:
-                    title, company = raw.split(" at ")[0].strip(), raw.split(" at ")[-1].strip()
-                elif ": " in raw:
-                    company, title = raw.split(": ",1)[0].strip(), raw.split(": ",1)[1].strip()
-                else:
-                    title, company = raw, ""
-                jobs.append(make_job(title, company, e.get("link",""), "WeWorkRemotely",
-                                     e.get("published",""), "Remote", e.get("summary","")))
+                if not is_recent(e.get("published", "")): continue
+                title = re.sub(r'\[.*?\]', '', e.get("title", "")).strip()
+                company = e.get("author", "")
+                jobs.append(make_job(title, company, e.get("link", ""), "WeWorkRemotely",
+                                     e.get("published", "")))
         except Exception as e:
             print(f"WWR {cat}: {e}")
     print(f"WWR: {len(jobs)}")
     return jobs
 
 
-# ── SOURCE 3: RemoteOK ────────────────────────────────────────────────────────
-
 def scrape_remoteok():
     jobs = []
     try:
-        r = requests.get("https://remoteok.com/api", headers=HEADERS, timeout=10)
-        for j in r.json()[1:]:
-            if not is_recent(j.get("date","")):
-                continue
+        r = get("https://remoteok.com/api")
+        if not r: return jobs
+        data = r.json()
+        for j in data[1:]:  # skip first item (metadata)
+            if not isinstance(j, dict): continue
+            if not is_recent(j.get("date", "")): continue
+            desc = j.get("description", "")
+            sal = detect_salary(desc) or (f"${j['salary_min']}–${j['salary_max']}" if j.get("salary_min") else "")
             jobs.append(make_job(
-                j.get("position",""), j.get("company",""),
-                j.get("url",""), "RemoteOK", j.get("date",""), "Remote",
-                j.get("description",""), str(j.get("salary","")) if j.get("salary") else ""
+                j.get("position", ""), j.get("company", ""),
+                j.get("url", "https://remoteok.com"), "RemoteOK",
+                j.get("date", ""), j.get("location", "Remote"),
+                salary=sal, description=desc
             ))
     except Exception as e:
-        print(f"RemoteOK: {e}")
+        print(f"RemoteOK error: {e}")
     print(f"RemoteOK: {len(jobs)}")
     return jobs
 
 
-# ── SOURCE 4: Jobicy ──────────────────────────────────────────────────────────
-
 def scrape_jobicy():
     jobs = []
-    seen = set()
     try:
-        r = requests.get("https://jobicy.com/api/v2/remote-jobs?count=100",
-                         headers=HEADERS, timeout=10)
-        for j in r.json().get("jobs",[]):
-            if not is_recent(j.get("pubDate","")) or j.get("url","") in seen:
-                continue
-            seen.add(j.get("url",""))
+        r = get("https://jobicy.com/api/v2/remote-jobs?count=100&industries=marketing,customer-service,business")
+        if not r: return jobs
+        for j in r.json().get("jobs", []):
+            if not is_recent(j.get("jobPubDate", "")): continue
+            sal = j.get("annualSalaryMin", "")
+            sal_str = f"${sal}–${j.get('annualSalaryMax','')}" if sal else ""
             jobs.append(make_job(
-                j.get("jobTitle",""), j.get("companyName",""),
-                j.get("url",""), "Jobicy",
-                j.get("pubDate",""), j.get("jobGeo","Remote"),
-                j.get("jobDescription","")
+                j.get("jobTitle", ""), j.get("companyName", ""),
+                j.get("url", ""), "Jobicy",
+                j.get("jobPubDate", ""), j.get("jobGeo", "Remote"),
+                salary=sal_str
             ))
     except Exception as e:
-        print(f"Jobicy: {e}")
+        print(f"Jobicy error: {e}")
     print(f"Jobicy: {len(jobs)}")
     return jobs
 
 
-# ── SOURCE 5: Himalayas ───────────────────────────────────────────────────────
-
 def scrape_himalayas():
     jobs = []
     try:
-        r = requests.get("https://himalayas.app/jobs/api?limit=100",
-                         headers=HEADERS, timeout=15)
+        r = get("https://himalayas.app/jobs/api?limit=100&remote=true")
+        if not r: return jobs
         for j in r.json().get("jobs", []):
-            if not is_recent(j.get("publishedAt","")):
-                continue
-            salary = ""
+            if not is_recent(j.get("createdAt", "")): continue
+            sal = ""
             if j.get("salaryMin"):
-                salary = f"{j.get('salaryCurrencyCode','')} {j.get('salaryMin',0):,}–{j.get('salaryMax',0):,}"
-            funding = j.get("company",{}).get("totalFunding","")
-            company_type = "startup" if j.get("company",{}).get("isStartup") else ""
+                sal = f"${j['salaryMin']:,}–${j.get('salaryMax', j['salaryMin']):,}"
+            fund = j.get("companyFunding", "")
+            fund_str = f"${fund:,.0f}" if isinstance(fund, (int, float)) and fund else str(fund) if fund else ""
             jobs.append(make_job(
-                j.get("title",""), j.get("company",{}).get("name",""),
-                j.get("applicationLink","") or j.get("url",""),
-                "Himalayas", j.get("publishedAt",""),
-                j.get("location","Remote"), j.get("description",""),
-                salary, f"${funding:,}" if isinstance(funding, int) else str(funding),
-                company_type
+                j.get("title", ""), j.get("companyName", ""),
+                j.get("applicationLink", j.get("url", "")), "Himalayas",
+                j.get("createdAt", ""), j.get("locationRestrictions", "Remote"),
+                salary=sal, funding=fund_str,
+                company_type=j.get("companySize", "")
             ))
     except Exception as e:
-        print(f"Himalayas: {e}")
+        print(f"Himalayas error: {e}")
     print(f"Himalayas: {len(jobs)}")
     return jobs
 
 
-# ── SOURCE 6: Arbeitnow (Europe + Remote, no key needed) ─────────────────────
-
 def scrape_arbeitnow():
     jobs = []
     try:
-        r = requests.get("https://arbeitnow.com/api/job-board-api",
-                         headers=HEADERS, timeout=15)
+        r = get("https://www.arbeitnow.com/api/job-board-api")
+        if not r: return jobs
         for j in r.json().get("data", []):
-            if not is_recent(j.get("created_at","")):
-                continue
+            if not is_recent(j.get("created_at", "")): continue
+            desc = j.get("description", "")
             jobs.append(make_job(
-                j.get("title",""), j.get("company_name",""),
-                j.get("url",""), "Arbeitnow",
-                j.get("created_at",""),
-                "Remote" if j.get("remote") else j.get("location",""),
-                j.get("description","")
+                j.get("title", ""), j.get("company_name", ""),
+                j.get("url", ""), "Arbeitnow",
+                j.get("created_at", ""), j.get("location", "Remote"),
+                salary=detect_salary(desc), description=desc
             ))
     except Exception as e:
-        print(f"Arbeitnow: {e}")
+        print(f"Arbeitnow error: {e}")
     print(f"Arbeitnow: {len(jobs)}")
     return jobs
 
 
-# ── SOURCE 7: Remote.co (RSS) ─────────────────────────────────────────────────
-
-def scrape_remoteco():
-    jobs = []
-    try:
-        feed = feedparser.parse("https://remote.co/remote-jobs/feed/")
-        for e in feed.entries:
-            if not is_recent(e.get("published","")):
-                continue
-            title = e.get("title","")
-            company = ""
-            if " at " in title:
-                title, company = title.split(" at ",1)[0].strip(), title.split(" at ",1)[1].strip()
-            jobs.append(make_job(title, company, e.get("link",""), "Remote.co",
-                                 e.get("published",""), "Remote", e.get("summary","")))
-    except Exception as e:
-        print(f"Remote.co: {e}")
-    print(f"Remote.co: {len(jobs)}")
-    return jobs
-
-
-# ── SOURCE 8: WorkingNomads ───────────────────────────────────────────────────
-
-def scrape_workingnomads():
-    jobs = []
-    seen = set()
-    for cat in ["it","marketing","sales","design","management","all"]:
-        try:
-            feed = feedparser.parse(f"https://www.workingnomads.com/feed?category={cat}")
-            for e in feed.entries:
-                if not is_recent(e.get("published","")) or e.get("link","") in seen:
-                    continue
-                seen.add(e.get("link",""))
-                title, company = e.get("title",""), ""
-                if " - " in title:
-                    parts = title.split(" - ")
-                    title, company = parts[0].strip(), parts[-1].strip()
-                jobs.append(make_job(title, company, e.get("link",""), "WorkingNomads",
-                                     e.get("published",""), "Remote", e.get("summary","")))
-        except Exception as e:
-            print(f"WorkingNomads {cat}: {e}")
-    print(f"WorkingNomads: {len(jobs)}")
-    return jobs
-
-
-# ── SOURCE 9: Adzuna API (19 countries — GLOBAL) ─────────────────────────────
-
-ADZUNA_COUNTRIES = {
-    "gb": "UK", "us": "USA", "in": "India", "au": "Australia",
-    "de": "Germany", "fr": "France", "ca": "Canada", "sg": "Singapore",
-    "za": "South Africa", "nl": "Netherlands", "br": "Brazil",
-    "it": "Italy", "es": "Spain", "pl": "Poland", "at": "Austria",
-    "be": "Belgium", "mx": "Mexico", "nz": "New Zealand", "ch": "Switzerland",
-}
-
-ADZUNA_QUERIES = [
-    "community manager", "social media manager", "marketing manager",
-    "customer support", "business development", "product manager",
-    "growth manager", "ambassador", "operations manager", "hr manager",
-    "software engineer", "data analyst", "designer", "sales manager",
-]
-
-def scrape_adzuna():
-    if not ADZUNA_ID or not ADZUNA_KEY:
-        print("Adzuna: no credentials")
-        return []
-    jobs = []
-    seen = set()
-    priority_countries = ["gb", "us", "in"]
-    for country in priority_countries:
-        country_name = ADZUNA_COUNTRIES.get(country, country.upper())
-        for query in ADZUNA_QUERIES[:3]:
-            try:
-                q = requests.utils.quote(query)
-                url = (
-                    f"https://api.adzuna.com/v1/api/jobs/{country}/search/1"
-                    f"?app_id={ADZUNA_ID}&app_key={ADZUNA_KEY}"
-                    f"&results_per_page=20&what={q}&sort_by=date"
-                )
-                r = requests.get(url, headers={**HEADERS, "Accept": "application/json"}, timeout=10)
-                if r.status_code != 200:
-                    print(f"Adzuna {country} {query}: HTTP {r.status_code}")
-                    continue
-                data = r.json()
-                results = data.get("results", [])
-                print(f"Adzuna {country} {query}: got {len(results)} raw results")
-                for j in results:
-                    job_url = j.get("redirect_url","")
-                    if not job_url or job_url in seen:
-                        continue
-                    seen.add(job_url)
-                    salary = ""
-                    if j.get("salary_min"):
-                        sym = "£" if country == "gb" else "$"
-                        salary = f"{sym}{j['salary_min']:,.0f}–{sym}{j['salary_max']:,.0f}"
-                    location = j.get("location",{}).get("display_name", country_name)
-                    jobs.append(make_job(
-                        j.get("title",""),
-                        j.get("company",{}).get("display_name",""),
-                        job_url, f"Adzuna ({country_name})",
-                        j.get("created",""), location,
-                        j.get("description",""), salary
-                    ))
-            except Exception as e:
-                print(f"Adzuna {country} {query}: {e}")
-    print(f"Adzuna: {len(jobs)}")
-    return jobs
-
-
-# ── SOURCE 10: Web3.career ────────────────────────────────────────────────────
-
 def scrape_web3career():
     jobs = []
-    seen = set()
-    for q in ["community-manager","marketing","business-development","customer-support",
-               "social-media","operations","growth","product-manager"]:
+    PATHS = ["/community", "/marketing", "/support", "/customer-service",
+             "/ambassador", "/social-media", "/growth", "/partnerships",
+             "/moderator", "/operations"]
+    for path in PATHS:
         try:
-            r = scrape_url(f"https://web3.career/{q}-jobs")
-            soup = BeautifulSoup(r.text, "html.parser")
-            for tag in soup.find_all("h2"):
-                title = tag.get_text(strip=True)
-                if not title or len(title) < 4:
-                    continue
-                date_tag = tag.find_next("time")
-                date_str = date_tag.get("datetime","") if date_tag else ""
-                if date_str and not is_recent(date_str):
-                    continue
-                parent = tag.find_parent("a")
-                if not parent:
-                    continue
-                href = parent.get("href","")
-                link = ("https://web3.career" + href) if href.startswith("/") else href
-                if link in seen:
-                    continue
-                seen.add(link)
-                company_tag = tag.find_next("h3")
+            r = get(f"https://web3.career{path}", scraper=True, timeout=20)
+            if not r or r.status_code != 200: continue
+            soup = BeautifulSoup(r.text, "lxml")
+            for row in soup.select("tr.job_row, div.job-card, article.job"):
+                a = row.find("a", href=True)
+                if not a: continue
+                title = a.get_text(strip=True)
+                if not title or len(title) < 5: continue
+                href = a["href"]
+                link = f"https://web3.career{href}" if href.startswith("/") else href
+                company_tag = row.find(class_=lambda c: c and "company" in c.lower())
                 company = company_tag.get_text(strip=True) if company_tag else ""
-                jobs.append(make_job(title, company, link, "Web3.career", date_str, "Remote"))
+                date_tag = row.find("time")
+                date = date_tag.get("datetime", "") if date_tag else ""
+                jobs.append(make_job(title, company, link, "Web3.career", date))
         except Exception as e:
-            print(f"Web3.career {q}: {e}")
+            print(f"Web3.career {path}: {e}")
     print(f"Web3.career: {len(jobs)}")
     return jobs
 
 
-# ── SOURCE 11: Greenhouse (funded companies) ──────────────────────────────────
+def scrape_the_muse():
+    """The Muse — free API, no key needed"""
+    jobs = []
+    CATEGORIES = ["Marketing%20%26%20PR", "Customer%20Service", "Social%20Media%20%26%20Community",
+                  "Business%20%26%20Strategy", "Operations"]
+    try:
+        for cat in CATEGORIES:
+            r = get(f"https://www.themuse.com/api/public/jobs?category={cat}&level=Entry%20Level&level=Mid%20Level&level=Senior%20Level&level=Manager&level=Director&level=VP&level=Executive&page=1&descending=true")
+            if not r or r.status_code != 200: continue
+            for j in r.json().get("results", []):
+                pub = j.get("publication_date", "")
+                if not is_recent(pub): continue
+                company = j.get("company", {}).get("name", "")
+                locations = j.get("locations", [])
+                loc = locations[0].get("name", "Remote") if locations else "Remote"
+                refs = j.get("refs", {})
+                url = refs.get("landing_page", "https://themuse.com/jobs")
+                jobs.append(make_job(j.get("name", ""), company, url, "The Muse", pub, loc))
+    except Exception as e:
+        print(f"The Muse error: {e}")
+    print(f"The Muse: {len(jobs)}")
+    return jobs
 
-GREENHOUSE_COMPANIES = [
-    "coinbase","uniswaplabs","chainlink-labs","polygon-labs","arbitrum",
-    "optimism-pbc","aave","opensea","consensys","ledger","kraken","gemini",
-    "ripple","blockchain-com","bitgo","anchorage","alchemy","metamask",
-    "stripe","notion","figma","linear","vercel","supabase","retool",
-    "remote","deel","oyster","rippling","gusto","lattice","ramp",
-    "airbnb","dropbox","hubspot","intercom","zendesk","atlassian",
-]
+
+def scrape_hackernews_hiring():
+    """HackerNews 'Who is Hiring' — direct from founders, unique source"""
+    jobs = []
+    try:
+        # Get current month's "Who is Hiring" thread
+        r = get("https://hacker-news.firebaseio.com/v0/user/whoishiring/submitted.json", timeout=10)
+        if not r: return jobs
+        ids = r.json()[:3]  # last 3 months
+
+        for thread_id in ids:
+            tr = get(f"https://hacker-news.firebaseio.com/v0/item/{thread_id}.json", timeout=10)
+            if not tr: continue
+            item = tr.json()
+            if not item or "hiring" not in item.get("title", "").lower(): continue
+
+            kids = item.get("kids", [])[:150]  # top 150 comments
+            for kid_id in kids:
+                cr = get(f"https://hacker-news.firebaseio.com/v0/item/{kid_id}.json", timeout=8)
+                if not cr: continue
+                comment = cr.json()
+                if not comment or comment.get("dead") or comment.get("deleted"): continue
+                text = comment.get("text", "")
+                if not text: continue
+
+                # Parse job from comment
+                soup = BeautifulSoup(text, "html.parser")
+                plain = soup.get_text(" ")
+                lines = [l.strip() for l in plain.split("\n") if l.strip()]
+                if not lines: continue
+
+                title_line = lines[0][:100]
+                # Extract company (usually "Company | Role | Location")
+                parts = re.split(r'\|', title_line)
+                if len(parts) >= 2:
+                    company = parts[0].strip()
+                    title = parts[1].strip() if len(parts) > 1 else title_line
+                else:
+                    company = ""
+                    title = title_line
+
+                # Find URL in comment
+                link_tag = soup.find("a", href=True)
+                url = link_tag["href"] if link_tag else f"https://news.ycombinator.com/item?id={kid_id}"
+
+                sal = detect_salary(plain)
+                visa = detect_visa(plain)
+                loc = "Remote" if "remote" in plain.lower() else "See posting"
+
+                date_ts = comment.get("time", 0)
+                date_str = datetime.utcfromtimestamp(date_ts).strftime("%Y-%m-%dT%H:%M:%SZ") if date_ts else ""
+
+                if not is_recent(date_str, days=35): continue
+
+                jobs.append(make_job(title, company, url, "HackerNews Hiring",
+                                     date_str, loc, salary=sal, visa=visa, description=plain[:200]))
+    except Exception as e:
+        print(f"HackerNews Hiring error: {e}")
+    print(f"HackerNews Hiring: {len(jobs)}")
+    return jobs
+
+
+def scrape_ashby():
+    """Ashby ATS — used by OpenAI, Notion, Linear, Cursor, Ramp, Deel, Reddit, Shopify, etc."""
+    jobs = []
+    COMPANIES = [
+        ("openai", "OpenAI"), ("notion", "Notion"), ("linear", "Linear"),
+        ("cursor", "Cursor"), ("ramp", "Ramp"), ("deel", "Deel"),
+        ("vercel", "Vercel"), ("supabase", "Supabase"), ("replit", "Replit"),
+        ("zapier", "Zapier"), ("duolingo", "Duolingo"), ("figma", "Figma"),
+        ("perplexity", "Perplexity"), ("anthropic", "Anthropic"),
+        ("mistral", "Mistral"), ("cohere", "Cohere"), ("groq", "Groq"),
+        ("coreweave", "CoreWeave"), ("together-ai", "Together AI"),
+        ("hex", "Hex"), ("dbt-labs", "dbt Labs"), ("airbyte", "Airbyte"),
+        ("temporal", "Temporal"), ("grafana", "Grafana"), ("cockroachdb", "CockroachDB"),
+        ("brex", "Brex"), ("rippling", "Rippling"), ("gusto", "Gusto"),
+        ("lattice", "Lattice"), ("mercury", "Mercury"), ("stripe", "Stripe"),
+    ]
+    for slug, name in COMPANIES:
+        try:
+            r = get(f"https://api.ashbyhq.com/posting-api/job-board/{slug}", timeout=10)
+            if not r or r.status_code != 200: continue
+            data = r.json()
+            for j in data.get("jobs", []):
+                if not j.get("isListed", True): continue
+                loc_info = j.get("location", {})
+                loc = loc_info.get("locationStr", "Remote") if isinstance(loc_info, dict) else str(loc_info)
+                comp = j.get("compensation", {})
+                sal = ""
+                if isinstance(comp, dict) and comp.get("summaryComponents"):
+                    sal = comp["summaryComponents"][0].get("label", "")
+                jobs.append(make_job(
+                    j.get("title", ""), name,
+                    j.get("jobUrl", f"https://jobs.ashbyhq.com/{slug}"),
+                    "Ashby", j.get("publishedAt", ""), loc, salary=sal,
+                    company_type="startup"
+                ))
+        except Exception:
+            pass
+    print(f"Ashby: {len(jobs)}")
+    return jobs
+
 
 def scrape_greenhouse():
+    """Greenhouse ATS — top funded companies"""
     jobs = []
-    seen = set()
-    for company in GREENHOUSE_COMPANIES:
+    COMPANIES = [
+        ("coinbase", "Coinbase"), ("kraken", "Kraken"), ("gemini", "Gemini"),
+        ("polygon", "Polygon"), ("chainlink", "Chainlink"), ("uniswap", "Uniswap"),
+        ("opensea", "OpenSea"), ("alchemy", "Alchemy"), ("nansen", "Nansen"),
+        ("binance", "Binance"), ("bybit", "Bybit"), ("okx", "OKX"),
+        ("stripe", "Stripe"), ("airbnb", "Airbnb"), ("doordash", "DoorDash"),
+        ("lyft", "Lyft"), ("instacart", "Instacart"), ("robinhood", "Robinhood"),
+        ("plaid", "Plaid"), ("chime", "Chime"), ("brex", "Brex"),
+        ("scale-ai", "Scale AI"), ("huggingface", "HuggingFace"),
+        ("databricks", "Databricks"), ("snowflake", "Snowflake"),
+        ("mongodb", "MongoDB"), ("elastic", "Elastic"), ("hashicorp", "HashiCorp"),
+        ("gitlab", "GitLab"), ("cloudflare", "Cloudflare"),
+    ]
+    for slug, name in COMPANIES:
         try:
-            r = requests.get(
-                f"https://boards-api.greenhouse.io/v1/boards/{company}/jobs?content=true",
-                headers=HEADERS, timeout=10)
-            if r.status_code != 200:
-                continue
-            for j in r.json().get("jobs",[]):
-                url = j.get("absolute_url","")
-                if not is_recent(j.get("updated_at","")) or url in seen:
-                    continue
-                seen.add(url)
-                loc = j.get("location",{}).get("name","Remote")
+            r = get(f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true", timeout=10)
+            if not r or r.status_code != 200: continue
+            for j in r.json().get("jobs", []):
+                loc = j.get("location", {}).get("name", "Remote")
+                desc = j.get("content", "")
+                sal = detect_salary(desc)
+                visa = detect_visa(desc)
                 jobs.append(make_job(
-                    j.get("title",""), company.replace("-"," ").title(),
-                    url, "Greenhouse", j.get("updated_at",""), loc,
-                    j.get("content",""), "", "", "startup"
+                    j.get("title", ""), name,
+                    j.get("absolute_url", ""), "Greenhouse",
+                    j.get("updated_at", ""), loc,
+                    salary=sal, visa=visa, description=desc[:200]
                 ))
-        except Exception as e:
-            print(f"Greenhouse {company}: {e}")
+        except Exception:
+            pass
     print(f"Greenhouse: {len(jobs)}")
     return jobs
 
 
-# ── SOURCE 12: Lever (startups) ───────────────────────────────────────────────
-
-LEVER_COMPANIES = [
-    "binance","moonpay","fireblocks","chainalysis","nansen","dune",
-    "the-graph","near","immutable","magic-eden","animoca",
-    "scale-ai","hugging-face","cohere","warpcast",
-    "gofundme","canva","miro","airtable","webflow",
-]
-
 def scrape_lever():
+    """Lever ATS — startups"""
     jobs = []
-    seen = set()
-    for company in LEVER_COMPANIES:
+    COMPANIES = [
+        ("animoca-brands", "Animoca Brands"), ("magic-eden", "Magic Eden"),
+        ("yuga-labs", "Yuga Labs"), ("immutable", "Immutable"),
+        ("the-graph", "The Graph"), ("optimism", "Optimism"),
+        ("arbitrum", "Arbitrum Foundation"), ("aave", "Aave"),
+        ("ledger", "Ledger"), ("metamask", "MetaMask"),
+        ("consensys", "ConsenSys"), ("chainalysis", "Chainalysis"),
+        ("nansen", "Nansen"), ("alchemy", "Alchemy"),
+        ("notion", "Notion"), ("linear", "Linear"),
+    ]
+    for slug, name in COMPANIES:
         try:
-            r = requests.get(f"https://api.lever.co/v0/postings/{company}?mode=json",
-                             headers=HEADERS, timeout=10)
-            if r.status_code != 200:
-                continue
+            r = get(f"https://api.lever.co/v0/postings/{slug}?mode=json", timeout=10)
+            if not r or r.status_code != 200: continue
             for j in r.json():
-                url = j.get("hostedUrl","")
-                created = j.get("createdAt",0)
-                date_str = datetime.fromtimestamp(created/1000, tz=timezone.utc).isoformat() if created else ""
-                if not is_recent(date_str) or url in seen:
-                    continue
-                seen.add(url)
-                loc = j.get("categories",{}).get("location","Remote")
+                cats = j.get("categories", {})
+                loc = cats.get("location", "Remote")
+                desc = j.get("descriptionPlain", "")
+                sal = detect_salary(desc)
                 jobs.append(make_job(
-                    j.get("text",""), company.replace("-"," ").title(),
-                    url, "Lever", date_str, loc,
-                    j.get("descriptionPlain",""), "", "", "startup"
+                    j.get("text", ""), name,
+                    j.get("hostedUrl", ""), "Lever",
+                    "", loc, salary=sal
                 ))
-        except Exception as e:
-            print(f"Lever {company}: {e}")
+        except Exception:
+            pass
     print(f"Lever: {len(jobs)}")
     return jobs
 
 
-# ── SOURCE 13: Jobberman (Nigeria) ────────────────────────────────────────────
+def scrape_workingnomads():
+    jobs = []
+    CATS = ["marketing", "customer-support", "management-finance", "business-development"]
+    for cat in CATS:
+        try:
+            r = get(f"https://www.workingnomads.com/api/exposed_jobs/?category={cat}")
+            if not r or r.status_code != 200: continue
+            for j in r.json():
+                if not is_recent(j.get("pub_date", "")): continue
+                jobs.append(make_job(
+                    j.get("title", ""), j.get("company", ""),
+                    j.get("url", ""), "WorkingNomads",
+                    j.get("pub_date", ""), j.get("region", "Remote")
+                ))
+        except Exception:
+            pass
+    print(f"WorkingNomads: {len(jobs)}")
+    return jobs
+
 
 def scrape_jobberman():
+    """Nigeria's top job board"""
     jobs = []
     try:
-        r = scrape_url("https://www.jobberman.com/jobs?q=&location=nigeria")
-        soup = BeautifulSoup(r.text, "html.parser")
-        for card in soup.select("article.job-card, div.job-card, li.job-item")[:30]:
-            title_el = card.select_one("h2, h3, .job-title, [class*='title']")
-            company_el = card.select_one(".company-name, [class*='company']")
-            link_el = card.select_one("a[href]")
-            if not title_el or not link_el:
-                continue
-            href = link_el.get("href","")
-            link = ("https://www.jobberman.com" + href) if href.startswith("/") else href
-            jobs.append(make_job(
-                title_el.get_text(strip=True),
-                company_el.get_text(strip=True) if company_el else "",
-                link, "Jobberman (Nigeria)", "", "Nigeria"
-            ))
-    except Exception as e:
-        print(f"Jobberman: {e}")
-    print(f"Jobberman: {len(jobs)}")
+        r = get("https://jobicy.com/api/v2/remote-jobs?count=50&geo=nigeria", timeout=12)
+        if r and r.status_code == 200:
+            for j in r.json().get("jobs", []):
+                if not is_recent(j.get("jobPubDate", "")): continue
+                jobs.append(make_job(
+                    j.get("jobTitle", ""), j.get("companyName", ""),
+                    j.get("url", ""), "Nigeria Jobs",
+                    j.get("jobPubDate", ""), "Nigeria"
+                ))
+    except Exception:
+        pass
+    print(f"Nigeria Jobs: {len(jobs)}")
     return jobs
 
 
-# ── SOURCE 14: GaijinPot (Japan) ─────────────────────────────────────────────
-
-def scrape_gaijinpot():
+def scrape_india_jobs():
+    """India remote jobs via Jobicy geo filter"""
     jobs = []
     try:
-        feed = feedparser.parse("https://jobs.gaijinpot.com/index/index/rss")
-        for e in feed.entries:
-            if not is_recent(e.get("published","")):
-                continue
-            jobs.append(make_job(
-                e.get("title",""), "",
-                e.get("link",""), "GaijinPot (Japan)",
-                e.get("published",""), "Japan", e.get("summary","")
-            ))
-    except Exception as e:
-        print(f"GaijinPot: {e}")
-    print(f"GaijinPot: {len(jobs)}")
+        r = get("https://jobicy.com/api/v2/remote-jobs?count=50&geo=india", timeout=12)
+        if r and r.status_code == 200:
+            for j in r.json().get("jobs", []):
+                if not is_recent(j.get("jobPubDate", "")): continue
+                jobs.append(make_job(
+                    j.get("jobTitle", ""), j.get("companyName", ""),
+                    j.get("url", ""), "India Jobs",
+                    j.get("jobPubDate", ""), "India"
+                ))
+    except Exception:
+        pass
+    print(f"India Jobs: {len(jobs)}")
     return jobs
 
 
-# ── SOURCE 15: Indeed RSS (India + Global) ───────────────────────────────────
-
-def scrape_indeed():
-    jobs = []
-    seen = set()
-    searches = [
-        ("in", "community manager"),
-        ("in", "marketing manager"),
-        ("in", "customer support"),
-        ("in", "social media manager"),
-        ("www", "remote community manager"),
-        ("www", "remote marketing manager"),
-        ("www", "remote web3 jobs"),
-    ]
-    for domain, query in searches:
-        try:
-            url = f"https://{domain}.indeed.com/rss?q={query.replace(' ','+')}&sort=date"
-            feed = feedparser.parse(url)
-            for e in feed.entries:
-                if not is_recent(e.get("published","")) or e.get("link","") in seen:
-                    continue
-                seen.add(e.get("link",""))
-                title = e.get("title","")
-                location = "India" if domain == "in" else "Remote"
-                jobs.append(make_job(title, "", e.get("link",""), "Indeed",
-                                     e.get("published",""), location, e.get("summary","")))
-        except Exception as e:
-            print(f"Indeed {domain}: {e}")
-    print(f"Indeed: {len(jobs)}")
-    return jobs
-
-
-# ── Master fetch ──────────────────────────────────────────────────────────────
+# ── Main aggregator ──────────────────────────────────────────────────────────
 
 def get_all_jobs():
-    all_jobs = []
-    sources = [
+    import concurrent.futures
+    scrapers = [
         scrape_remotive, scrape_wwr, scrape_remoteok, scrape_jobicy,
-        scrape_himalayas, scrape_arbeitnow, scrape_remoteco,
-        scrape_workingnomads, scrape_adzuna, scrape_web3career,
-        scrape_greenhouse, scrape_lever, scrape_jobberman,
-        scrape_gaijinpot, scrape_indeed,
+        scrape_himalayas, scrape_arbeitnow, scrape_web3career,
+        scrape_the_muse, scrape_hackernews_hiring, scrape_ashby,
+        scrape_greenhouse, scrape_lever, scrape_workingnomads,
+        scrape_jobberman, scrape_india_jobs,
     ]
-    for fn in sources:
-        try:
-            all_jobs += fn()
-        except Exception as e:
-            print(f"{fn.__name__} crashed: {e}")
+    all_jobs = []
+    seen_ids = set()
 
-    # Deduplicate
-    seen, unique = set(), []
-    for j in all_jobs:
-        if j["_id"] not in seen and j["url"]:
-            seen.add(j["_id"])
-            unique.append(j)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
+        futures = {ex.submit(s): s.__name__ for s in scrapers}
+        for fut in concurrent.futures.as_completed(futures, timeout=300):
+            try:
+                result = fut.result(timeout=90)
+                for j in result:
+                    if j["id"] not in seen_ids:
+                        seen_ids.add(j["id"])
+                        all_jobs.append(j)
+            except Exception as e:
+                print(f"Scraper error: {e}")
 
-    print(f"Total unique jobs: {len(unique)}")
-    return unique
+    # Sort: hot jobs first, then by date
+    all_jobs.sort(key=lambda j: (not j.get("hot"), j.get("date", "") == ""))
+    print(f"Total unique jobs: {len(all_jobs)}")
+    return all_jobs
+
+
+# ── Matching & scoring ───────────────────────────────────────────────────────
+
+CATEGORY_KEYWORDS = {
+    "community": ["community", "moderator", "discord", "telegram", "ambassador", "kol",
+                  "social media", "engagement", "forum", "galxe", "zealy"],
+    "marketing": ["marketing", "growth", "seo", "sem", "content", "brand", "pr ",
+                  "influencer", "campaign", "copywriter", "email marketing"],
+    "support": ["customer support", "customer success", "support specialist", "help desk",
+                "customer service", "technical support", "cx ", "client success"],
+    "tech": ["engineer", "developer", "frontend", "backend", "fullstack", "devops",
+             "software", "python", "javascript", "typescript", "rust", "golang"],
+    "product": ["product manager", "product designer", "ux", "ui ", "researcher"],
+    "design": ["designer", "graphic", "figma", "creative", "visual", "illustrat"],
+    "sales": ["sales", "account executive", "business development", "bd ", "partnerships",
+              "revenue", "closing", "quota"],
+    "finance": ["finance", "accounting", "analyst", "controller", "cfo", "tax"],
+    "operations": ["operations", "ops ", "project manager", "coordinator", "logistics",
+                   "supply chain", "hr ", "recruiting", "talent"],
+    "executive": ["ceo", "cto", "cmo", "coo", "chief", "vp ", "vice president",
+                  "head of", "director", "svp"],
+    "web3": ["web3", "blockchain", "crypto", "defi", "nft", "dao", "solidity",
+             "smart contract", "protocol", "dapp", "layer 2", "l2"],
+    "all": [],
+}
+
+SENIORITY_KEYWORDS = {
+    "entry": ["junior", "entry", "associate", "intern", "trainee", "graduate"],
+    "mid": ["mid", "intermediate", "ii", "2", "experienced"],
+    "senior": ["senior", "sr.", "sr ", "lead", "principal", "staff"],
+    "manager": ["manager", "management"],
+    "director": ["director", "head of"],
+    "csuite": ["ceo", "cto", "cmo", "coo", "chief", "vp ", "svp", "evp", "president"],
+    "all": [],
+}
+
+LOCATION_MAP = {
+    "usa": ["usa", "united states", "us ", "america", "new york", "san francisco", "remote us"],
+    "uk": ["uk", "united kingdom", "london", "england", "britain"],
+    "india": ["india", "bangalore", "mumbai", "delhi", "hyderabad", "remote india"],
+    "europe": ["europe", "european", "germany", "france", "spain", "amsterdam", "berlin"],
+    "nigeria": ["nigeria", "lagos", "abuja", "remote nigeria"],
+    "japan": ["japan", "tokyo"],
+    "sea": ["southeast asia", "singapore", "indonesia", "vietnam", "philippines", "malaysia"],
+    "middleeast": ["dubai", "uae", "middle east", "qatar", "saudi"],
+    "remote": ["remote", "anywhere", "worldwide", "global", "distributed"],
+    "worldwide": [],  # matches everything
+}
+
+
+def matches_category(job, category):
+    if category == "all":
+        return True
+    kws = CATEGORY_KEYWORDS.get(category, [])
+    if not kws:
+        return True
+    text = (job["title"] + " " + job.get("description", "")).lower()
+    return any(k in text for k in kws)
+
+
+def matches_seniority(job, seniority):
+    if seniority == "all":
+        return True
+    kws = SENIORITY_KEYWORDS.get(seniority, [])
+    if not kws:
+        return True
+    title = job["title"].lower()
+    return any(k in title for k in kws)
+
+
+def matches_location(job, location_key):
+    if location_key in ("worldwide", "all", ""):
+        return True
+    if location_key == "remote":
+        loc = job.get("location", "").lower()
+        return any(k in loc for k in ["remote", "anywhere", "worldwide", "global"])
+    kws = LOCATION_MAP.get(location_key, [])
+    if not kws:
+        return True
+    loc = job.get("location", "").lower()
+    if any(k in loc for k in ["remote", "worldwide", "anywhere"]):
+        return True  # remote jobs match any location
+    return any(k in loc for k in kws)
+
+
+def matches_keywords(job, keywords_str):
+    if not keywords_str:
+        return True
+    kws = [k.strip().lower() for k in keywords_str.split(",") if k.strip()]
+    if not kws:
+        return True
+    text = (job["title"] + " " + job.get("description", "")).lower()
+    return any(k in text for k in kws)
+
+
+def matches_company_type(job, ctype):
+    if ctype == "any":
+        return True
+    if ctype == "startup":
+        return job.get("company_type") in ["startup", "seed", "early"]
+    return True
+
+
+def matches_user(job, user):
+    return (
+        matches_category(job, user.get("category", "all")) and
+        matches_seniority(job, user.get("seniority", "all")) and
+        matches_location(job, user.get("location_key", "worldwide")) and
+        matches_keywords(job, user.get("keywords", "")) and
+        matches_company_type(job, user.get("company_type", "any"))
+    )
+
+
+def score(title, keywords_str=""):
+    """Score job relevance 0-100"""
+    s = 50
+    title_l = title.lower()
+    if keywords_str:
+        kws = [k.strip().lower() for k in keywords_str.split(",") if k.strip()]
+        s += sum(15 for k in kws if k in title_l)
+    return min(100, s)
