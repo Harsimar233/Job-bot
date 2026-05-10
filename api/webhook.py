@@ -459,8 +459,6 @@ def handle_start(chat_id, username, ref_code=None):
         # Only update username — never touch FSM flags for existing users
         update_user(chat_id, {"username": username or ""})
 
-        # Fix #23: if user is mid-setup, resume where they left off
-        # instead of showing the welcome screen and confusing them
         step = get_current_step(existing)
         if step == "awaiting_role":
             send(chat_id,
@@ -476,7 +474,6 @@ def handle_start(chat_id, username, ref_code=None):
                  [[{"text": "❌ Cancel", "callback_data": "status"}]])
             return
         elif step in ("awaiting_seniority", "awaiting_location", "awaiting_ctype"):
-            # Mid-setup but past step 1 — restart cleanly from step 1
             update_user(chat_id, {
                 "awaiting_role":      True,
                 "awaiting_seniority": False,
@@ -492,7 +489,8 @@ def handle_start(chat_id, username, ref_code=None):
                  [[{"text": "❌ Cancel", "callback_data": "status"}]])
             return
     else:
-        # Brand new user — write all defaults
+        # FIX #1: Brand new user — set awaiting_role=True immediately
+        # so the very next message is captured by the FSM
         set_user(chat_id, {
             "username":           username or "",
             "active":             False,
@@ -505,7 +503,7 @@ def handle_start(chat_id, username, ref_code=None):
             "remote_only":        False,
             "company_type":       "any",
             "awaiting_keywords":  False,
-            "awaiting_role":      False,
+            "awaiting_role":      True,   # ← TRUE: user is about to type their role
             "awaiting_seniority": False,
             "awaiting_location":  False,
             "awaiting_ctype":     False,
@@ -642,30 +640,22 @@ def handle_keywords(chat_id, text):
 # ── Onboarding steps ──────────────────────────────────────────────────────────
 
 def step1_role(chat_id, msg_id):
-    """
-    Fix #21 + #22 + #23:
-    - Ensure user row EXISTS before setting awaiting_role (upsert, not just patch)
-    - Clear ALL awaiting flags, then set awaiting_role=True
-    - Use send() for the prompt so it always arrives as a new message
-    - Collapse the button message so stale buttons don't remain
-    """
-    # CRITICAL: use sb_post (upsert) not sb_patch here.
-    # If the user row doesn't exist yet (e.g. bot restarted, DB wiped),
-    # sb_patch silently does nothing and awaiting_role is never saved.
-    sb_post("users", {
-        "chat_id":            chat_id,
+    # FIX #2: use update_user (PATCH) not sb_post (upsert)
+    # sb_post with merge-duplicates requires a unique constraint on chat_id in Supabase.
+    # Without it, it inserts a second row — get_user then reads the old row with
+    # awaiting_role=False. update_user does a direct PATCH on chat_id=eq.{id},
+    # always hits the correct row regardless of DB constraints.
+    update_user(chat_id, {
         "awaiting_role":      True,
         "awaiting_seniority": False,
         "awaiting_location":  False,
         "awaiting_ctype":     False,
         "awaiting_keywords":  False,
     })
-    # Collapse the tapped button message to avoid stale buttons
     try:
         edit(chat_id, msg_id, "⚙️ Setting up your alerts...")
     except Exception:
         pass
-    # Send the step prompt as a fresh message — guaranteed to arrive
     send(chat_id,
          "⚙️ <b>Step 1 of 4 — Your Role</b>\n\n"
          "What job role are you looking for?\n\n"
@@ -745,11 +735,10 @@ def process_update(update):
                     if not role:
                         send(chat_id, "Please type a role name.")
                         return
-                    # Use upsert (sb_post) not patch, in case row vanished
-                    sb_post("users", {
-                        "chat_id":      chat_id,
-                        "keywords":     role,
-                        "category":     "all",
+                    # FIX #3: use update_user (PATCH) not sb_post (upsert)
+                    update_user(chat_id, {
+                        "keywords":      role,
+                        "category":      "all",
                         "awaiting_role": False,
                     })
                     step2_seniority(chat_id, role)
@@ -757,13 +746,13 @@ def process_update(update):
 
                 if user.get("awaiting_keywords"):
                     kw = sanitize(text.strip(), max_len=300)
-                    sb_post("users", {
-                        "chat_id":           chat_id,
+                    # FIX #3 (same): use update_user not sb_post
+                    update_user(chat_id, {
                         "keywords":          kw,
                         "awaiting_keywords": False,
                     })
                     send(chat_id, f"✅ Keywords updated: <b>{kw}</b>")
-                    fresh_user = get_user(chat_id)  # re-fetch so cache search uses new keywords
+                    fresh_user = get_user(chat_id)
                     send_jobs_from_cache(chat_id, fresh_user)
                     return
 
@@ -878,7 +867,6 @@ def process_update(update):
 
             elif data == "setup_start":
                 answer(cb_id)
-                # Fix #21: don't rely on update_user here — step1_role sets the flag itself
                 step1_role(chat_id, msg_id)
 
             elif data == "find_jobs":
