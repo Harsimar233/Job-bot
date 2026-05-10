@@ -27,13 +27,18 @@ TG_API       = f"https://api.telegram.org/bot{BOT_TOKEN}"
 BOT_USERNAME = os.environ.get("BOT_USERNAME", "RemoteDailyJobBot")
 FIND_COOLDOWN = 60   # seconds between /find calls
 
+# Canonical difficulty_score lives in jobs.py — import lazily to avoid circular deps
+def difficulty_score(job):
+    from api.jobs import difficulty_score as _ds
+    return _ds(job)
+
 WELCOME = """👋 <b>Welcome to Remote Radar!</b>
 
 Set your preferences once. Get fresh remote job alerts every morning — automatically, free, forever.
 
 🌍 Jobs from 12 sources globally
 📂 Every role — Community, Marketing, Tech, Sales, Finance, Executive & more
-⏰ Daily alerts at 9am UTC
+⏰ Alerts 3× daily: 9am, 3pm & 9pm UTC
 🔥 Hot jobs flagged if posted in last 24h
 💰 Salary & funding info included
 
@@ -148,19 +153,19 @@ def inc_referrals(chat_id):
     user = get_user(chat_id)
     update_user(chat_id, {"referrals": (user.get("referrals") or 0) + 1})
 
-def check_rate_limit(chat_id):
-    user = get_user(chat_id)
+def get_rate_limit_remaining(user):
+    """Returns seconds until user can search again. 0 means ready now."""
     last = user.get("last_find_at")
     if not last:
-        return True
+        return 0
     try:
         last_dt = datetime.fromisoformat(str(last).replace("Z", "+00:00"))
         if last_dt.tzinfo is None:
             last_dt = last_dt.replace(tzinfo=timezone.utc)
         elapsed = (datetime.now(timezone.utc) - last_dt).total_seconds()
-        return elapsed >= FIND_COOLDOWN
+        return max(0, int(FIND_COOLDOWN - elapsed))
     except Exception:
-        return True
+        return 0
 
 def save_job(chat_id, job):
     sb_post("saved_jobs", {
@@ -225,20 +230,6 @@ def answer(cb_id, text=""):
         logger.error(f"answerCallbackQuery: {e}")
 
 # ── Job formatting ────────────────────────────────────────────────────────────
-
-def difficulty_score(job):
-    if job.get("hot"):
-        return "🟢 Fresh — apply today"
-    source = (job.get("source", "") or "").lower()
-    title  = (job.get("title", "")  or "").lower()
-    niche  = any(k in title for k in ["moderator", "ambassador", "kol", "discord mod",
-                                       "telegram mod", "community", "web3", "crypto", "dao"])
-    big_co = any(s in source for s in ["greenhouse", "lever", "ashby"])
-    if big_co and not niche:
-        return "🔴 Competitive role"
-    if niche:
-        return "🟢 Niche — apply fast"
-    return "🟡 Moderate competition"
 
 def fmt_date(date_val):
     if not date_val:
@@ -391,8 +382,9 @@ def job_matches_user(job, user):
 
 def send_jobs_from_cache(chat_id, user, page=0):
     """page=0 is first 5, page=1 is next 5, etc."""
-    if not check_rate_limit(chat_id):
-        send(chat_id, f"⏳ Please wait {FIND_COOLDOWN} seconds between searches.")
+    remaining = get_rate_limit_remaining(user)
+    if remaining > 0:
+        send(chat_id, f"⏳ Please wait {remaining}s before searching again.")
         return
 
     send(chat_id, "🔍 Finding matching jobs...")
@@ -602,8 +594,10 @@ def handle_invite(chat_id):
 def handle_stop(chat_id):
     update_user(chat_id, {"active": False})
     track(chat_id, "paused")
-    send(chat_id, "⏸ Alerts paused. Tap below to restart.",
-         [[{"text": "▶️ Restart Alerts", "callback_data": "setup_start"}]])
+    send(chat_id,
+         "⏸ <b>Alerts paused.</b> Your preferences are saved — tap Resume whenever you're ready.",
+         [[{"text": "▶️ Resume Alerts",       "callback_data": "resume_alerts"},
+           {"text": "⚙️ Change Preferences", "callback_data": "setup_start"}]])
 
 def handle_delete(chat_id):
     try:
@@ -765,7 +759,8 @@ def process_update(update):
                         "awaiting_keywords": False,
                     })
                     send(chat_id, f"✅ Keywords updated: <b>{kw}</b>")
-                    send_jobs_from_cache(chat_id, user)
+                    fresh_user = get_user(chat_id)  # re-fetch so cache search uses new keywords
+                    send_jobs_from_cache(chat_id, fresh_user)
                     return
 
                 # No active FSM state — guide the user
@@ -902,6 +897,15 @@ def process_update(update):
             elif data == "stop":
                 answer(cb_id)
                 handle_stop(chat_id)
+            elif data == "resume_alerts":
+                update_user(chat_id, {"active": True})
+                track(chat_id, "resumed")
+                answer(cb_id, "✅ Alerts resumed!")
+                send(chat_id,
+                     "▶️ <b>Alerts resumed!</b> You're back in the queue.\n\n"
+                     "Your next batch arrives at the next scan time (9am, 3pm, or 9pm UTC).",
+                     [[{"text": "🔍 Find Jobs Now",   "callback_data": "find_jobs"},
+                       {"text": "📋 My Preferences", "callback_data": "status"}]])
             elif data == "confirm_delete":
                 answer(cb_id)
                 handle_delete(chat_id)
