@@ -1,34 +1,33 @@
 """
 Remote Radar — Telegram Webhook
 Fixes applied:
-  #1  Structured logging — no more silent failures
-  #3  UX: jobs sent as individual cards with action buttons
-  #4  Rate limiting hardened — FIND_COOLDOWN enforced per user
-  #5  Referral anti-abuse: verify referrer exists + is active user
-  #8  Onboarding FSM: step validated before advancing
-  #9  HTML injection: all external data double-sanitised before Telegram
-  #10 Analytics stub: key events tracked to Supabase analytics table
-  #14 Full account delete with confirmation (GDPR-safe)
-  #15 Engagement loop: streak shown, daily tip on /find
-  #18 Pagination: /find returns 5 jobs + "Load more" button
-  #21 FSM bug fix: handle_start no longer resets awaiting_role
-  #22 step1_role now uses send() so prompt always arrives
-  #24 handle_start existing-user path now routes correctly for all states
+  #1  Structured logging
+  #3  Jobs as individual cards with action buttons
+  #4  Rate limiting — FIND_COOLDOWN enforced per user
+  #5  Referral anti-abuse
+  #8  Onboarding FSM
+  #9  HTML injection: double-sanitised before Telegram
+  #10 Analytics tracked to Supabase
+  #14 Full account delete (GDPR-safe)
+  #18 Pagination: 5 jobs + "Load more"
+  #25 FIX: callback set_user now includes all FSM fields (was missing awaiting_role)
+  #26 FIX: fallback role capture — accepts text if setup incomplete & no keywords
+  #27 FIX: handle_start new-user path no longer falls through to WELCOME before setup
 """
 import os, json, time, requests, re
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 from http.server import BaseHTTPRequestHandler
 from api import logger
 
-BOT_TOKEN    = os.environ.get("JOB_BOT_TOKEN", "")
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
-TG_API       = f"https://api.telegram.org/bot{BOT_TOKEN}"
-BOT_USERNAME = os.environ.get("BOT_USERNAME", "RemoteDailyJobBot")
-FIND_COOLDOWN = 60   # seconds between /find calls
+BOT_TOKEN     = os.environ.get("JOB_BOT_TOKEN", "")
+SUPABASE_URL  = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY  = os.environ.get("SUPABASE_KEY", "")
+TG_API        = f"https://api.telegram.org/bot{BOT_TOKEN}"
+BOT_USERNAME  = os.environ.get("BOT_USERNAME", "RemoteDailyJobBot")
+FIND_COOLDOWN = 60
 
-# Canonical difficulty_score lives in jobs.py — import lazily to avoid circular deps
+# Lazy import to avoid circular deps
 def difficulty_score(job):
     from api.jobs import difficulty_score as _ds
     return _ds(job)
@@ -47,6 +46,44 @@ Let's set up in 4 quick steps 👇
 
 <i>Made by <a href="https://t.me/Harsimarhs">@Harsimarhs</a> · Feel free to reach out</i>"""
 
+STEP1_TEXT = (
+    "⚙️ <b>Step 1 of 4 — Your Role</b>\n\n"
+    "What job role are you looking for?\n\n"
+    "<b>Examples:</b>\n"
+    "• <code>Community Manager</code>\n"
+    "• <code>Web3 Marketing Manager</code>\n"
+    "• <code>Discord Moderator</code>\n"
+    "• <code>Software Engineer</code>\n"
+    "• <code>Customer Support</code>\n\n"
+    "Just type your role below and send 👇"
+)
+STEP1_KB = [[{"text": "❌ Cancel", "callback_data": "status"}]]
+
+# Full default user record — used everywhere a new row is needed
+# so we never create a partial row missing FSM columns
+def _default_user(chat_id, username=""):
+    return {
+        "chat_id":            chat_id,
+        "username":           username or "",
+        "active":             False,
+        "setup_complete":     False,
+        "category":           "all",
+        "seniority":          "all",
+        "keywords":           "",
+        "location":           "Worldwide",
+        "location_key":       "worldwide",
+        "remote_only":        False,
+        "company_type":       "any",
+        "awaiting_keywords":  False,
+        "awaiting_role":      False,
+        "awaiting_seniority": False,
+        "awaiting_location":  False,
+        "awaiting_ctype":     False,
+        "streak":             0,
+        "referrals":          0,
+        "referred_by":        None,
+    }
+
 # ── Sanitization ──────────────────────────────────────────────────────────────
 
 def sanitize(text, max_len=200):
@@ -63,7 +100,8 @@ def sanitize_url(url):
         parsed = urlparse(str(url))
         if parsed.scheme not in ("http", "https"):
             return ""
-        return str(url).replace("'", "%27").replace('"', "%22").replace("<", "%3C").replace(">", "%3E")
+        return (str(url).replace("'", "%27").replace('"', "%22")
+                        .replace("<", "%3C").replace(">", "%3E"))
     except Exception:
         return ""
 
@@ -113,18 +151,18 @@ def sb_delete(path):
     except Exception as e:
         logger.error(f"sb_delete {path}: {e}")
 
-# ── Analytics (Fix #10) ───────────────────────────────────────────────────────
+# ── Analytics ─────────────────────────────────────────────────────────────────
 
 def track(chat_id, event, meta=None):
     try:
         sb_post("analytics", {
             "chat_id": chat_id,
-            "event": event,
-            "meta": json.dumps(meta or {}),
-            "ts": datetime.now(timezone.utc).isoformat(),
+            "event":   event,
+            "meta":    json.dumps(meta or {}),
+            "ts":      datetime.now(timezone.utc).isoformat(),
         }, prefer="return=minimal")
     except Exception:
-        pass  # analytics failure must never affect UX
+        pass
 
 # ── User helpers ──────────────────────────────────────────────────────────────
 
@@ -138,6 +176,11 @@ def set_user(chat_id, data):
 
 def update_user(chat_id, data):
     sb_patch(f"bot_users?chat_id=eq.{chat_id}", data)
+
+def ensure_user(chat_id, username=""):
+    """Create a full user row only if one doesn't exist yet."""
+    if not get_user(chat_id):
+        set_user(chat_id, _default_user(chat_id, username))
 
 def was_sent(chat_id, job_id):
     r = sb_get(f"sent_jobs?chat_id=eq.{chat_id}&job_id=eq.{job_id}&select=id&limit=1")
@@ -155,7 +198,6 @@ def inc_referrals(chat_id):
     update_user(chat_id, {"referrals": (user.get("referrals") or 0) + 1})
 
 def get_rate_limit_remaining(user):
-    """Returns seconds until user can search again. 0 means ready now."""
     last = user.get("last_find_at")
     if not last:
         return 0
@@ -185,7 +227,7 @@ def save_feedback(chat_id, job_id, feedback):
 # ── Telegram helpers ──────────────────────────────────────────────────────────
 
 def send(chat_id, text, keyboard=None, retries=3):
-    text = str(text)[:4096]
+    text    = str(text)[:4096]
     payload = {"chat_id": chat_id, "text": text,
                 "parse_mode": "HTML", "disable_web_page_preview": True}
     if keyboard:
@@ -216,7 +258,7 @@ def edit(chat_id, msg_id, text, keyboard=None):
         payload["reply_markup"] = {"inline_keyboard": keyboard}
     try:
         r = requests.post(f"{TG_API}/editMessageText", json=payload, timeout=10)
-        if r.status_code not in (200, 400):  # 400 = "message not modified", ok
+        if r.status_code not in (200, 400):
             logger.error(f"edit message {chat_id}/{msg_id}: {r.status_code}")
     except Exception as e:
         logger.error(f"edit {chat_id}/{msg_id}: {e}")
@@ -236,17 +278,12 @@ def fmt_date(date_val):
     if not date_val:
         return ""
     try:
-        s  = str(date_val)
-        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(str(date_val).replace("Z", "+00:00"))
         return dt.strftime("%-d %b %Y")
     except Exception:
-        try:
-            return str(date_val)[:10]
-        except Exception:
-            return ""
+        return str(date_val)[:10]
 
 def format_job_card(job, show_actions=True):
-    """Full job card with action buttons — used for /find flow."""
     hot     = "🔥 " if job.get("hot") else ""
     title   = sanitize(job.get("title", ""))
     company = sanitize(job.get("company", ""))
@@ -272,21 +309,20 @@ def format_job_card(job, show_actions=True):
     if url:
         lines.append(f'🔗 <a href="{url}">Apply Now</a>  •  📌 {source}')
 
-    text    = "\n".join(lines)
     buttons = None
     if show_actions and job_id:
         buttons = [
-            [{"text": "👍 Good match", "callback_data": f"like_{job_id}"},
+            [{"text": "👍 Good match",   "callback_data": f"like_{job_id}"},
              {"text": "👎 Not relevant", "callback_data": f"dislike_{job_id}"}],
-            [{"text": "🔖 Save job", "callback_data": f"save_{job_id}"},
-             {"text": "📤 Share",    "callback_data": f"share_{job_id}"}],
+            [{"text": "🔖 Save job",     "callback_data": f"save_{job_id}"},
+             {"text": "📤 Share",        "callback_data": f"share_{job_id}"}],
         ]
-    return text, buttons
+    return "\n".join(lines), buttons
 
 # ── Keyboards ─────────────────────────────────────────────────────────────────
 
 def kb_main():
-    return [[{"text": "⚙️ Setup Alerts", "callback_data": "setup_start"}],
+    return [[{"text": "⚙️ Setup Alerts",  "callback_data": "setup_start"}],
             [{"text": "📋 My Preferences", "callback_data": "status"},
              {"text": "⏹ Pause Alerts",   "callback_data": "stop"}]]
 
@@ -326,19 +362,19 @@ def kb_company_type():
 def kb_after_jobs():
     return [
         [{"text": "🔍 Find More Jobs", "callback_data": "find_jobs"}],
-        [{"text": "🔖 Saved Jobs", "callback_data": "show_saved"},
-         {"text": "📋 Preferences", "callback_data": "status"}],
+        [{"text": "🔖 Saved Jobs",     "callback_data": "show_saved"},
+         {"text": "📋 Preferences",    "callback_data": "status"}],
     ]
 
 SEN_LABELS = {
-    "entry": "🌱 Entry Level", "mid": "📈 Mid Level", "senior": "⭐ Senior",
+    "entry": "🌱 Entry Level",  "mid": "📈 Mid Level",       "senior": "⭐ Senior",
     "manager": "👥 Manager / Lead", "director": "🏆 Director / VP",
-    "executive": "👑 C-Suite", "all": "🌍 All Levels",
+    "executive": "👑 C-Suite",  "all": "🌍 All Levels",
 }
 LOC_LABELS = {
-    "remote":    "🌍 Remote Only", "usa": "🇺🇸 USA", "uk": "🇬🇧 UK",
+    "remote":    "🌍 Remote Only", "usa": "🇺🇸 USA",      "uk": "🇬🇧 UK",
     "india":     "🇮🇳 India",      "nigeria": "🇳🇬 Nigeria", "japan": "🇯🇵 Japan",
-    "china":     "🇨🇳 China",      "sea": "🌏 SE Asia",      "me": "🕌 Middle East",
+    "china":     "🇨🇳 China",      "sea": "🌏 SE Asia",    "me": "🕌 Middle East",
     "europe":    "🇪🇺 Europe",     "worldwide": "🌐 Worldwide",
 }
 CTYPE_LABELS = {
@@ -372,7 +408,7 @@ def job_matches_user(job, user):
         if not matches_seniority(title, user.get("seniority", "all")):
             return False
         ctype = user.get("company_type", "any")
-        if ctype == "startup" and job.get("company_type", "") != "startup":
+        if ctype == "startup"     and job.get("company_type", "") != "startup":
             return False
         if ctype == "established" and job.get("company_type", "") == "startup":
             return False
@@ -382,7 +418,6 @@ def job_matches_user(job, user):
         return False
 
 def send_jobs_from_cache(chat_id, user, page=0):
-    """page=0 is first 5, page=1 is next 5, etc."""
     remaining = get_rate_limit_remaining(user)
     if remaining > 0:
         send(chat_id, f"⏳ Please wait {remaining}s before searching again.")
@@ -397,7 +432,7 @@ def send_jobs_from_cache(chat_id, user, page=0):
 
     cached = get_cached_jobs()
     if not cached:
-        send(chat_id, "No jobs cached yet. Daily scan runs at 9am UTC.", kb_main())
+        send(chat_id, "No jobs cached yet. Alerts run 3× daily at 9am, 3pm & 9pm UTC.", kb_main())
         return
 
     from api.jobs import score
@@ -414,7 +449,7 @@ def send_jobs_from_cache(chat_id, user, page=0):
     if not batch:
         send(chat_id,
              "📭 <b>No new jobs found.</b>\n\nYou've seen all matching jobs. "
-             "Fresh listings arrive tomorrow at 9am UTC.",
+             "Fresh listings arrive at the next scan (9am, 3pm or 9pm UTC).",
              [[{"text": "⚙️ Change Preferences", "callback_data": "setup_start"},
                {"text": "🔑 Update Keywords",    "callback_data": "add_keywords"}]])
         return
@@ -437,10 +472,9 @@ def send_jobs_from_cache(chat_id, user, page=0):
     if has_more:
         footer_kb = [[{"text": f"➡️ Load More ({len(matched) - start - per_page} left)",
                        "callback_data": f"find_page_{page+1}"}]] + footer_kb
-
     send(chat_id, "✅ Tap a button on any job above to save, share or give feedback.", footer_kb)
 
-# ── Onboarding FSM ────────────────────────────────────────────────────────────
+# ── Onboarding steps ──────────────────────────────────────────────────────────
 
 SETUP_STEPS = ["awaiting_role", "awaiting_seniority", "awaiting_location", "awaiting_ctype"]
 
@@ -450,36 +484,78 @@ def get_current_step(user):
             return step
     return None
 
-# ── Handlers ──────────────────────────────────────────────────────────────────
+def step1_role(chat_id, msg_id=None):
+    update_user(chat_id, {
+        "awaiting_role":      True,
+        "awaiting_seniority": False,
+        "awaiting_location":  False,
+        "awaiting_ctype":     False,
+        "awaiting_keywords":  False,
+    })
+    if msg_id:
+        try:
+            edit(chat_id, msg_id, "⚙️ Setting up your alerts...")
+        except Exception:
+            pass
+    send(chat_id, STEP1_TEXT, STEP1_KB)
+
+def step2_seniority(chat_id, role):
+    update_user(chat_id, {"awaiting_role": False})
+    send(chat_id,
+         f"✅ Role: <b>{sanitize(role)}</b>\n\n"
+         f"⚙️ <b>Step 2 of 4 — Seniority Level</b>\n\nWhat level are you targeting?",
+         kb_seniority())
+
+def step3_location(chat_id, msg_id, seniority, cb_id):
+    answer(cb_id, f"✅ {SEN_LABELS.get(seniority, seniority)}")
+    update_user(chat_id, {"seniority": seniority})
+    edit(chat_id, msg_id,
+         f"✅ Level: {SEN_LABELS.get(seniority, seniority)}\n\n"
+         f"⚙️ <b>Step 3 of 4 — Location</b>\n\nWhere are you looking to work?",
+         kb_location())
+
+def step4_company_type(chat_id, msg_id, loc_key, cb_id):
+    loc_name, remote_only = LOC_MAP.get(loc_key, ("Worldwide", False))
+    answer(cb_id, f"✅ {LOC_LABELS.get(loc_key, loc_key)}")
+    update_user(chat_id, {"location": loc_name, "location_key": loc_key,
+                           "remote_only": remote_only})
+    edit(chat_id, msg_id,
+         f"✅ Location: {LOC_LABELS.get(loc_key, loc_key)}\n\n"
+         f"⚙️ <b>Step 4 of 4 — Company Type</b>\n\nWhat kind of company do you prefer?",
+         kb_company_type())
+
+def finish_setup(chat_id, msg_id, ctype, cb_id):
+    answer(cb_id, f"✅ {CTYPE_LABELS.get(ctype, ctype)}")
+    update_user(chat_id, {"company_type": ctype, "active": True,
+                           "setup_complete": True, "awaiting_ctype": False})
+    user   = get_user(chat_id)
+    invite = f"t.me/{BOT_USERNAME}?start=ref_{chat_id}"
+    track(chat_id, "setup_complete")
+    send(chat_id,
+         f"🎉 <b>All set! Your daily alerts are live.</b>\n\n"
+         f"🎯 Role: {sanitize(user.get('keywords', ''))}\n"
+         f"🎓 {SEN_LABELS.get(user.get('seniority', 'all'), 'All Levels')}\n"
+         f"📍 {LOC_LABELS.get(user.get('location_key', 'worldwide'), 'Worldwide')}\n"
+         f"🏢 {CTYPE_LABELS.get(ctype, 'Any')}\n\n"
+         f"👥 Share: <code>{invite}</code>",
+         [[{"text": "🔍 Find Jobs Now",  "callback_data": "find_jobs"},
+           {"text": "👥 Invite Friends", "callback_data": "invite"}]])
+
+# ── Main handlers ─────────────────────────────────────────────────────────────
 
 def handle_start(chat_id, username, ref_code=None):
     existing = get_user(chat_id)
     is_new   = not existing
 
     if existing:
-        # Only update username — never touch other FSM flags
         update_user(chat_id, {"username": username or ""})
-
         step = get_current_step(existing)
 
-        # FIX #24: handle all 4 possible states for existing users
         if step == "awaiting_role":
-            # Mid setup at step 1 — just re-prompt
-            send(chat_id,
-                 "⚙️ <b>Step 1 of 4 — Your Role</b>\n\n"
-                 "What job role are you looking for?\n\n"
-                 "<b>Examples:</b>\n"
-                 "• <code>Community Manager</code>\n"
-                 "• <code>Web3 Marketing Manager</code>\n"
-                 "• <code>Discord Moderator</code>\n"
-                 "• <code>Software Engineer</code>\n"
-                 "• <code>Customer Support</code>\n\n"
-                 "Just type your role below and send 👇",
-                 [[{"text": "❌ Cancel", "callback_data": "status"}]])
+            send(chat_id, STEP1_TEXT, STEP1_KB)
             return
-
         elif step in ("awaiting_seniority", "awaiting_location", "awaiting_ctype"):
-            # Mid setup past step 1 — restart from step 1
+            # Past step 1 but incomplete — restart from step 1
             update_user(chat_id, {
                 "awaiting_role":      True,
                 "awaiting_seniority": False,
@@ -487,47 +563,15 @@ def handle_start(chat_id, username, ref_code=None):
                 "awaiting_ctype":     False,
                 "awaiting_keywords":  False,
             })
-            send(chat_id,
-                 "⚙️ Let's pick up where you left off.\n\n"
-                 "<b>Step 1 of 4 — Your Role</b>\n\n"
-                 "What job role are you looking for?\n\n"
-                 "Just type your role below and send 👇",
-                 [[{"text": "❌ Cancel", "callback_data": "status"}]])
+            send(chat_id, STEP1_TEXT, STEP1_KB)
             return
-
-        else:
-            # FIX #24: setup_complete=True (or no step active) — show welcome
-            # with main menu. Setup re-runs only via "⚙️ Setup Alerts" button
-            # which calls step1_role and correctly sets awaiting_role=True.
-            track(chat_id, "start", {"is_new": False})
-            send(chat_id, WELCOME, kb_main())
-            return
+        # else: setup complete or no step active — fall through to welcome
 
     else:
-        # Brand new user — write all defaults with awaiting_role=True
-        # so the very next typed message is captured by the FSM
-        set_user(chat_id, {
-            "username":           username or "",
-            "active":             False,
-            "setup_complete":     False,
-            "category":           "all",
-            "seniority":          "all",
-            "keywords":           "",
-            "location":           "Worldwide",
-            "location_key":       "worldwide",
-            "remote_only":        False,
-            "company_type":       "any",
-            "awaiting_keywords":  False,
-            "awaiting_role":      True,   # ← TRUE so first reply is captured
-            "awaiting_seniority": False,
-            "awaiting_location":  False,
-            "awaiting_ctype":     False,
-            "streak":             0,
-            "referrals":          0,
-            "referred_by":        None,
-        })
+        # Brand new user — write full default row
+        set_user(chat_id, _default_user(chat_id, username))
 
-    # Fix #5: referral anti-abuse (new users only)
+    # Fix #5: referral (new users only)
     if is_new and ref_code and ref_code.startswith("ref_"):
         try:
             referrer_id = int(ref_code.replace("ref_", ""))
@@ -540,10 +584,11 @@ def handle_start(chat_id, username, ref_code=None):
                     count = (referrer.get("referrals") or 0) + 1
                     send(referrer_id,
                          f"🎉 Someone joined using your invite link!\n\n"
-                         f"👥 You've referred <b>{count}</b> {'person' if count == 1 else 'people'}.\n\n"
+                         f"👥 You've referred <b>{count}</b> "
+                         f"{'person' if count == 1 else 'people'}.\n\n"
                          f"Keep sharing: <code>t.me/{BOT_USERNAME}?start=ref_{referrer_id}</code>")
                 else:
-                    logger.warn(f"Referral ignored — referrer {referrer_id} not found or not setup")
+                    logger.warn(f"Referral ignored — referrer {referrer_id} not setup")
         except (ValueError, TypeError) as e:
             logger.warn(f"Bad referral code '{ref_code}': {e}")
 
@@ -568,9 +613,9 @@ def handle_status(chat_id):
          f"📍 {LOC_LABELS.get(user.get('location_key', 'worldwide'), 'Worldwide')}\n"
          f"🏢 {CTYPE_LABELS.get(user.get('company_type', 'any'), 'Any')}\n"
          f"📡 Status: {status}\n"
-         + (f"{streak_text}\n" if streak_text else "") +
-         f"\n👥 Referrals: <b>{referrals}</b>\n"
-         f"🔗 <code>{invite}</code>",
+         + (f"{streak_text}\n" if streak_text else "")
+         + f"\n👥 Referrals: <b>{referrals}</b>\n"
+           f"🔗 <code>{invite}</code>",
          [[{"text": "✏️ Change Preferences", "callback_data": "setup_start"},
            {"text": "⏹ Pause",              "callback_data": "stop"}],
           [{"text": "🔍 Find Jobs Now",      "callback_data": "find_jobs"},
@@ -652,76 +697,6 @@ def handle_keywords(chat_id, text):
     user = get_user(chat_id)
     send_jobs_from_cache(chat_id, user)
 
-# ── Onboarding steps ──────────────────────────────────────────────────────────
-
-def step1_role(chat_id, msg_id):
-    # Use update_user (PATCH) not sb_post (upsert) — PATCH always hits the
-    # correct row via chat_id=eq.{id}, no unique constraint needed.
-    update_user(chat_id, {
-        "awaiting_role":      True,
-        "awaiting_seniority": False,
-        "awaiting_location":  False,
-        "awaiting_ctype":     False,
-        "awaiting_keywords":  False,
-    })
-    try:
-        edit(chat_id, msg_id, "⚙️ Setting up your alerts...")
-    except Exception:
-        pass
-    send(chat_id,
-         "⚙️ <b>Step 1 of 4 — Your Role</b>\n\n"
-         "What job role are you looking for?\n\n"
-         "<b>Examples:</b>\n"
-         "• <code>Community Manager</code>\n"
-         "• <code>Web3 Marketing Manager</code>\n"
-         "• <code>Discord Moderator</code>\n"
-         "• <code>Software Engineer</code>\n"
-         "• <code>Customer Support</code>\n\n"
-         "Just type your role below and send 👇",
-         [[{"text": "❌ Cancel", "callback_data": "status"}]])
-
-def step2_seniority(chat_id, role):
-    update_user(chat_id, {"awaiting_role": False})
-    send(chat_id,
-         f"✅ Role: <b>{sanitize(role)}</b>\n\n"
-         f"⚙️ <b>Step 2 of 4 — Seniority Level</b>\n\nWhat level are you targeting?",
-         kb_seniority())
-
-def step3_location(chat_id, msg_id, seniority, cb_id):
-    answer(cb_id, f"✅ {SEN_LABELS.get(seniority, seniority)}")
-    update_user(chat_id, {"seniority": seniority})
-    edit(chat_id, msg_id,
-         f"✅ Level: {SEN_LABELS.get(seniority, seniority)}\n\n"
-         f"⚙️ <b>Step 3 of 4 — Location</b>\n\nWhere are you looking to work?",
-         kb_location())
-
-def step4_company_type(chat_id, msg_id, loc_key, cb_id):
-    loc_name, remote_only = LOC_MAP.get(loc_key, ("Worldwide", False))
-    answer(cb_id, f"✅ {LOC_LABELS.get(loc_key, loc_key)}")
-    update_user(chat_id, {"location": loc_name, "location_key": loc_key,
-                           "remote_only": remote_only})
-    edit(chat_id, msg_id,
-         f"✅ Location: {LOC_LABELS.get(loc_key, loc_key)}\n\n"
-         f"⚙️ <b>Step 4 of 4 — Company Type</b>\n\nWhat kind of company do you prefer?",
-         kb_company_type())
-
-def finish_setup(chat_id, msg_id, ctype, cb_id):
-    answer(cb_id, f"✅ {CTYPE_LABELS.get(ctype, ctype)}")
-    update_user(chat_id, {"company_type": ctype, "active": True, "setup_complete": True,
-                           "awaiting_ctype": False})
-    user   = get_user(chat_id)
-    invite = f"t.me/{BOT_USERNAME}?start=ref_{chat_id}"
-    track(chat_id, "setup_complete")
-    send(chat_id,
-         f"🎉 <b>All set! Your daily alerts are live.</b>\n\n"
-         f"🎯 Role: {sanitize(user.get('keywords', ''))}\n"
-         f"🎓 {SEN_LABELS.get(user.get('seniority', 'all'), 'All Levels')}\n"
-         f"📍 {LOC_LABELS.get(user.get('location_key', 'worldwide'), 'Worldwide')}\n"
-         f"🏢 {CTYPE_LABELS.get(ctype, 'Any')}\n\n"
-         f"👥 Share: <code>{invite}</code>",
-         [[{"text": "🔍 Find Jobs Now",  "callback_data": "find_jobs"},
-           {"text": "👥 Invite Friends", "callback_data": "invite"}]])
-
 # ── Main update processor ─────────────────────────────────────────────────────
 
 def process_update(update):
@@ -735,34 +710,44 @@ def process_update(update):
             if text and not text.startswith("/"):
                 user = get_user(chat_id)
 
-                logger.info(f"Text from {chat_id}: '{text[:40]}' | "
-                            f"awaiting_role={user.get('awaiting_role')} "
-                            f"awaiting_keywords={user.get('awaiting_keywords')} "
-                            f"user_exists={bool(user)}")
+                logger.info(
+                    f"TEXT {chat_id}: awaiting_role={user.get('awaiting_role')} "
+                    f"awaiting_kw={user.get('awaiting_keywords')} "
+                    f"setup_complete={user.get('setup_complete')} "
+                    f"keywords={user.get('keywords')!r} "
+                    f"text={text[:30]!r}"
+                )
 
                 if user.get("awaiting_role"):
                     role = sanitize(text.strip(), max_len=150)
                     if not role:
                         send(chat_id, "Please type a role name.")
                         return
-                    update_user(chat_id, {
-                        "keywords":      role,
-                        "category":      "all",
-                        "awaiting_role": False,
-                    })
+                    update_user(chat_id, {"keywords": role, "category": "all",
+                                          "awaiting_role": False})
                     step2_seniority(chat_id, role)
                     return
 
                 if user.get("awaiting_keywords"):
                     kw = sanitize(text.strip(), max_len=300)
-                    update_user(chat_id, {
-                        "keywords":          kw,
-                        "awaiting_keywords": False,
-                    })
+                    update_user(chat_id, {"keywords": kw, "awaiting_keywords": False})
                     send(chat_id, f"✅ Keywords updated: <b>{kw}</b>")
                     fresh_user = get_user(chat_id)
                     send_jobs_from_cache(chat_id, fresh_user)
                     return
+
+                # ── Fix #26: fallback role capture ────────────────────────────
+                # If user exists, setup is not complete, and they have no keywords
+                # yet — treat ANY free text as their role answer.
+                # This handles the case where awaiting_role flag was lost
+                # (e.g. DB write failed silently, cold Vercel instance, etc.)
+                if user and not user.get("setup_complete") and not user.get("keywords"):
+                    role = sanitize(text.strip(), max_len=150)
+                    if role:
+                        update_user(chat_id, {"keywords": role, "category": "all",
+                                              "awaiting_role": False})
+                        step2_seniority(chat_id, role)
+                        return
 
                 send(chat_id,
                      "Not sure what you mean. Use the buttons or try /help.",
@@ -821,9 +806,9 @@ def process_update(update):
             data     = cb.get("data", "")
             cb_id    = cb["id"]
 
-            if not get_user(chat_id):
-                set_user(chat_id, {"username": username, "active": False,
-                                   "setup_complete": False})
+            # Fix #25: ensure_user writes a FULL row (all FSM columns included)
+            # Old code wrote only 3 fields, leaving awaiting_role as NULL in DB
+            ensure_user(chat_id, username)
 
             if data.startswith("like_"):
                 job_id = data.replace("like_", "")
@@ -848,8 +833,8 @@ def process_update(update):
                     answer(cb_id, "Could not save — job not found.")
 
             elif data.startswith("share_"):
-                job_id = data.replace("share_", "")
-                cached = sb_get(f"jobs?job_id=eq.{job_id}&select=*&limit=1")
+                job_id  = data.replace("share_", "")
+                cached  = sb_get(f"jobs?job_id=eq.{job_id}&select=*&limit=1")
                 answer(cb_id)
                 if cached:
                     j       = cached[0]
@@ -880,22 +865,28 @@ def process_update(update):
                 answer(cb_id, "Searching...")
                 user = get_user(chat_id)
                 send_jobs_from_cache(chat_id, user)
+
             elif data == "show_saved":
                 answer(cb_id)
                 handle_saved(chat_id)
+
             elif data == "invite":
                 answer(cb_id)
                 handle_invite(chat_id)
+
             elif data == "add_keywords":
                 answer(cb_id)
                 update_user(chat_id, {"awaiting_keywords": True})
                 send(chat_id, "✏️ Type your new keywords and send:")
+
             elif data == "status":
                 answer(cb_id)
                 handle_status(chat_id)
+
             elif data == "stop":
                 answer(cb_id)
                 handle_stop(chat_id)
+
             elif data == "resume_alerts":
                 update_user(chat_id, {"active": True})
                 track(chat_id, "resumed")
@@ -905,13 +896,17 @@ def process_update(update):
                      "Your next batch arrives at the next scan time (9am, 3pm, or 9pm UTC).",
                      [[{"text": "🔍 Find Jobs Now",   "callback_data": "find_jobs"},
                        {"text": "📋 My Preferences", "callback_data": "status"}]])
+
             elif data == "confirm_delete":
                 answer(cb_id)
                 handle_delete(chat_id)
+
             elif data.startswith("sen_"):
                 step3_location(chat_id, msg_id, data.replace("sen_", ""), cb_id)
+
             elif data.startswith("loc_"):
                 step4_company_type(chat_id, msg_id, data.replace("loc_", ""), cb_id)
+
             elif data.startswith("ctype_"):
                 finish_setup(chat_id, msg_id, data.replace("ctype_", ""), cb_id)
 
