@@ -79,7 +79,7 @@ def parse_date(s):
 def is_recent(date_val, days=CUTOFF_DAYS):
     dt = parse_date(date_val)
     if dt is None:
-        return True  # unknown date → include it
+        return False  # unknown date → exclude to prevent stale recycled listings
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt >= datetime.now(timezone.utc) - timedelta(days=days)
@@ -179,6 +179,45 @@ CATEGORY_KEYWORDS = {
 }
 
 EXCLUDE_TITLES = ["intern (unpaid)", "volunteer only", "commission only"]
+
+# ── Company type helpers (Fix #6) ─────────────────────────────────────────────
+# These companies are large/established — hardcoding "startup" for all
+# Greenhouse/Lever/Ashby listings was breaking the company_type filter.
+
+ESTABLISHED_COMPANIES = {
+    "coinbase", "kraken", "gemini", "stripe", "airbnb", "hubspot",
+    "intercom", "zendesk", "dropbox", "notion", "figma", "canva",
+    "miro", "airtable", "webflow", "ramp", "rippling", "deel",
+    "lattice", "zapier", "brex", "mercury", "vanta", "posthog",
+    "openai", "perplexity", "cursor", "retool", "replit",
+    "linear", "vercel", "supabase", "beehiiv", "phantom",
+    "gofundme", "chainalysis", "nansen", "immutable",
+    "binance", "moonpay", "fireblocks", "cohere", "warpcast",
+    "uniswaplabs", "chainlinklabs", "ripple", "alchemy",
+}
+
+def _company_type(slug):
+    """Derive company_type from a slug/name. Defaults to startup."""
+    key = re.sub(r"[^a-z0-9]", "", (slug or "").lower())
+    return "established" if key in ESTABLISHED_COMPANIES else "startup"
+
+# ── Difficulty score (Fix #15) ────────────────────────────────────────────────
+# Single canonical version — imported by both webhook.py and scan.py.
+# Previously each file had a slightly different copy causing inconsistent labels.
+
+def difficulty_score(job):
+    if job.get("hot"):
+        return "🟢 Fresh — apply today"
+    source = (job.get("source", "") or "").lower()
+    title  = (job.get("title",  "") or "").lower()
+    niche  = any(k in title for k in ["moderator", "ambassador", "kol", "discord",
+                                       "telegram mod", "community", "web3", "crypto", "dao"])
+    big_co = any(s in source for s in ["greenhouse", "lever", "ashby"])
+    if big_co and not niche:
+        return "🔴 Competitive role"
+    if niche:
+        return "🟢 Niche — apply fast"
+    return "🟡 Moderate competition"
 
 def is_title_relevant(title, user_keywords, user_category):
     t = (title or "").lower().strip()
@@ -471,7 +510,7 @@ def _fetch_greenhouse(company):
             loc = j.get("location",{}).get("name","Remote")
             jobs.append(make_job(j.get("title",""), company.replace("-"," ").title(),
                 url, "Greenhouse", j.get("updated_at",""), loc,
-                j.get("content",""), "", "", "startup"))
+                j.get("content",""), "", "", _company_type(company)))
     except Exception as e:
         logger.error(f"Greenhouse [{company}]", exc=e)
     return jobs
@@ -513,7 +552,7 @@ def _fetch_lever(company):
                 continue
             loc = j.get("categories",{}).get("location","Remote")
             jobs.append(make_job(j.get("text",""), company.replace("-"," ").title(),
-                url, "Lever", date_str, loc, j.get("descriptionPlain",""), "", "", "startup"))
+                url, "Lever", date_str, loc, j.get("descriptionPlain",""), "", "", _company_type(company)))
     except Exception as e:
         logger.error(f"Lever [{company}]", exc=e)
     return jobs
@@ -550,7 +589,7 @@ def _fetch_ashby(company):
             salary = j.get("compensation",{}).get("scrapeableCompensationSalarySummary","")
             jobs.append(make_job(j.get("title",""), company.replace("-"," ").title(),
                 url, "Ashby", j.get("publishedAt",""), loc,
-                j.get("descriptionPlain","") or "", salary, "", "startup"))
+                j.get("descriptionPlain","") or "", salary, "", _company_type(company)))
     except Exception as e:
         logger.error(f"Ashby [{company}]", exc=e)
     return jobs
@@ -593,6 +632,8 @@ def scrape_hn_hiring():
             if not text or len(text) < 50:
                 continue
             created = comment.get("created_at","")
+            # HN "Who is Hiring" threads are posted monthly, so we use 35 days
+            # (vs the 7-day default for all other sources) to capture the full thread.
             if not is_recent(created, days=35):
                 continue
             first_line = re.sub(r"<[^>]+>","", text.split("\n")[0].strip())
