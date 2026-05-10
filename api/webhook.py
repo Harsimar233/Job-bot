@@ -463,13 +463,40 @@ def handle_start(chat_id, username, ref_code=None):
     existing = get_user(chat_id)
     is_new   = not existing
 
-    # Fix #21: preserve ALL existing state — do NOT reset FSM flags or user prefs.
-    # /start is just a welcome re-send; it must never wipe an in-progress setup.
     if existing:
-        # Only update username (may have changed) and ensure record exists
+        # Only update username — never touch FSM flags for existing users
         update_user(chat_id, {"username": username or ""})
+
+        # Fix #23: if user is mid-setup, resume where they left off
+        # instead of showing the welcome screen and confusing them
+        step = get_current_step(existing)
+        if step == "awaiting_role":
+            send(chat_id,
+                 "⚙️ <b>Step 1 of 4 — Your Role</b>\n\n"
+                 "What job role are you looking for?\n\n"
+                 "<b>Examples:</b>\n"
+                 "• <code>Community Manager</code>\n"
+                 "• <code>Web3 Marketing Manager</code>\n"
+                 "• <code>Discord Moderator</code>\n"
+                 "• <code>Software Engineer</code>\n"
+                 "• <code>Customer Support</code>\n\n"
+                 "Just type your role below and send 👇",
+                 [[{"text": "❌ Cancel", "callback_data": "status"}]])
+            return
+        elif step in ("awaiting_seniority", "awaiting_location", "awaiting_ctype"):
+            # Mid-setup but past step 1 — restart cleanly from step 1
+            sb_post("users", {"chat_id": chat_id, "awaiting_role": True,
+                               "awaiting_seniority": False, "awaiting_location": False,
+                               "awaiting_ctype": False, "awaiting_keywords": False})
+            send(chat_id,
+                 "⚙️ Let's pick up where you left off.\n\n"
+                 "<b>Step 1 of 4 — Your Role</b>\n\n"
+                 "What job role are you looking for?\n\n"
+                 "Just type your role below and send 👇",
+                 [[{"text": "❌ Cancel", "callback_data": "status"}]])
+            return
     else:
-        # Brand new user — safe to write all defaults
+        # Brand new user — write all defaults
         set_user(chat_id, {
             "username":           username or "",
             "active":             False,
@@ -618,13 +645,17 @@ def handle_keywords(chat_id, text):
 
 def step1_role(chat_id, msg_id):
     """
-    Fix #21 + #22:
-    - Clear ALL awaiting flags first, then set awaiting_role=True
+    Fix #21 + #22 + #23:
+    - Ensure user row EXISTS before setting awaiting_role (upsert, not just patch)
+    - Clear ALL awaiting flags, then set awaiting_role=True
     - Use send() for the prompt so it always arrives as a new message
-      (edit() would silently fail if the button message was already gone)
-    - Also collapse the button message so stale buttons don't remain
+    - Collapse the button message so stale buttons don't remain
     """
-    update_user(chat_id, {
+    # CRITICAL: use sb_post (upsert) not sb_patch here.
+    # If the user row doesn't exist yet (e.g. bot restarted, DB wiped),
+    # sb_patch silently does nothing and awaiting_role is never saved.
+    sb_post("users", {
+        "chat_id":            chat_id,
         "awaiting_role":      True,
         "awaiting_seniority": False,
         "awaiting_location":  False,
@@ -702,22 +733,37 @@ def process_update(update):
             text     = msg.get("text", "") or ""
 
             if text and not text.startswith("/"):
-                # Fix #21: always do a fresh DB read for FSM state
+                # Always do a fresh DB read for FSM state
                 user = get_user(chat_id)
+
+                # DEBUG: log what state we see (remove after confirming fix works)
+                logger.info(f"Text from {chat_id}: '{text[:40]}' | "
+                            f"awaiting_role={user.get('awaiting_role')} "
+                            f"awaiting_keywords={user.get('awaiting_keywords')} "
+                            f"user_exists={bool(user)}")
 
                 if user.get("awaiting_role"):
                     role = sanitize(text.strip(), max_len=150)
                     if not role:
                         send(chat_id, "Please type a role name.")
                         return
-                    update_user(chat_id, {"keywords": role, "category": "all",
-                                          "awaiting_role": False})
+                    # Use upsert (sb_post) not patch, in case row vanished
+                    sb_post("users", {
+                        "chat_id":      chat_id,
+                        "keywords":     role,
+                        "category":     "all",
+                        "awaiting_role": False,
+                    })
                     step2_seniority(chat_id, role)
                     return
 
                 if user.get("awaiting_keywords"):
                     kw = sanitize(text.strip(), max_len=300)
-                    update_user(chat_id, {"keywords": kw, "awaiting_keywords": False})
+                    sb_post("users", {
+                        "chat_id":           chat_id,
+                        "keywords":          kw,
+                        "awaiting_keywords": False,
+                    })
                     send(chat_id, f"✅ Keywords updated: <b>{kw}</b>")
                     send_jobs_from_cache(chat_id, user)
                     return
