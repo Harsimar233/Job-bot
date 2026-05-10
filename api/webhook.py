@@ -129,15 +129,15 @@ def track(chat_id, event, meta=None):
 # ── User helpers ──────────────────────────────────────────────────────────────
 
 def get_user(chat_id):
-    r = sb_get(f"users?chat_id=eq.{chat_id}&select=*")
+    r = sb_get(f"bot_users?chat_id=eq.{chat_id}&select=*")
     return r[0] if r else {}
 
 def set_user(chat_id, data):
     data["chat_id"] = chat_id
-    sb_post("users", data)
+    sb_post("bot_users", data)
 
 def update_user(chat_id, data):
-    sb_patch(f"users?chat_id=eq.{chat_id}", data)
+    sb_patch(f"bot_users?chat_id=eq.{chat_id}", data)
 
 def was_sent(chat_id, job_id):
     r = sb_get(f"sent_jobs?chat_id=eq.{chat_id}&job_id=eq.{job_id}&select=id&limit=1")
@@ -618,7 +618,7 @@ def handle_stop(chat_id):
 
 def handle_delete(chat_id):
     try:
-        sb_delete(f"users?chat_id=eq.{chat_id}")
+        sb_delete(f"bot_users?chat_id=eq.{chat_id}")
         sb_delete(f"sent_jobs?chat_id=eq.{chat_id}")
         sb_delete(f"watchlist?chat_id=eq.{chat_id}")
         sb_delete(f"saved_jobs?chat_id=eq.{chat_id}")
