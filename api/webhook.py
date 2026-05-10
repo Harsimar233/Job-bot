@@ -445,6 +445,7 @@ def handle_start(chat_id, username, ref_code=None):
         "remote_only": False,
         "company_type": "any",
         "awaiting_keywords": False,
+        "awaiting_role": False,
         "referrals": existing.get("referrals", 0) if existing else 0,
         "referred_by": existing.get("referred_by") if existing else None,
     })
@@ -543,18 +544,18 @@ def handle_unwatch(chat_id, text):
 
 def step1(chat_id, msg_id):
     edit(chat_id, msg_id,
-         "⚙️ <b>Step 1 of 4 — Job Category</b>\n\nWhat type of jobs are you looking for?",
-         kb_category())
+         "⚙️ <b>Step 1 of 4 — Your Role</b>\n\n"
+         "What job role are you looking for?\n\n"
+         "<b>Examples:</b>\n"
+         "• <code>Community Manager</code>\n"
+         "• <code>Web3 Marketing Manager</code>\n"
+         "• <code>Discord Moderator</code>\n"
+         "• <code>Customer Support</code>\n"
+         "• <code>Software Engineer</code>\n\n"
+         "Type your role below and send 👇",
+         [[{"text": "❌ Cancel", "callback_data": "status"}]])
 
-def step2(chat_id, msg_id, category, cb_id):
-    answer(cb_id, f"✅ {CAT_LABELS.get(category, category)}")
-    update_user(chat_id, {"category": category})
-    edit(chat_id, msg_id,
-         f"✅ Category: {CAT_LABELS.get(category, category)}\n\n"
-         f"⚙️ <b>Step 2 of 4 — Seniority Level</b>\n\nWhat level are you targeting?",
-         kb_seniority())
-
-def step3(chat_id, msg_id, seniority, cb_id):
+def step2(chat_id, msg_id, seniority, cb_id):
     answer(cb_id, f"✅ {SEN_LABELS.get(seniority, seniority)}")
     update_user(chat_id, {"seniority": seniority})
     edit(chat_id, msg_id,
@@ -562,7 +563,7 @@ def step3(chat_id, msg_id, seniority, cb_id):
          f"⚙️ <b>Step 3 of 4 — Location</b>\n\nWhere are you looking to work?",
          kb_location())
 
-def step4(chat_id, msg_id, loc_key, cb_id):
+def step3(chat_id, msg_id, loc_key, cb_id):
     loc_name, remote_only = LOC_MAP.get(loc_key, ("Worldwide", False))
     answer(cb_id, f"✅ {LOC_LABELS.get(loc_key, loc_key)}")
     update_user(chat_id, {"location": loc_name, "location_key": loc_key, "remote_only": remote_only})
@@ -613,9 +614,17 @@ def process_update(update):
             username = msg.get("from",{}).get("username","")
             text = msg.get("text","") or ""
 
-            # Handle free-text keyword input
+            # Handle free-text role input (setup step 1)
             if text and not text.startswith("/"):
                 user = get_user(chat_id)
+                if user.get("awaiting_role"):
+                    role = sanitize_text(text.strip())
+                    update_user(chat_id, {"keywords": role, "category": "all", "awaiting_role": False})
+                    send(chat_id,
+                        f"✅ Role: <b>{role}</b>\n\n"
+                        f"⚙️ <b>Step 2 of 4 — Seniority Level</b>\n\nWhat level are you targeting?",
+                        kb_seniority())
+                    return
                 if user.get("awaiting_keywords"):
                     kw = sanitize_text(text.strip())
                     update_user(chat_id, {"keywords": kw, "awaiting_keywords": False})
@@ -683,6 +692,7 @@ def process_update(update):
 
             if data == "setup_start":
                 answer(cb_id)
+                update_user(chat_id, {"awaiting_role": True})
                 step1(chat_id, msg_id)
             elif data == "find_jobs":
                 answer(cb_id, "Searching...")
@@ -707,12 +717,10 @@ def process_update(update):
             elif data == "confirm_delete":
                 answer(cb_id)
                 handle_delete(chat_id)
-            elif data.startswith("cat_"):
-                step2(chat_id, msg_id, data.replace("cat_",""), cb_id)
             elif data.startswith("sen_"):
-                step3(chat_id, msg_id, data.replace("sen_",""), cb_id)
+                step2(chat_id, msg_id, data.replace("sen_",""), cb_id)
             elif data.startswith("loc_"):
-                step4(chat_id, msg_id, data.replace("loc_",""), cb_id)
+                step3(chat_id, msg_id, data.replace("loc_",""), cb_id)
             elif data.startswith("ctype_"):
                 finish_setup(chat_id, msg_id, data.replace("ctype_",""), cb_id)
 
