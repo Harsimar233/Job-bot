@@ -1,89 +1,127 @@
-# 🤖 Job Bot
+# 🤖 Remote Radar — Job Alert Bot
 
-Automatically finds crypto/web3 jobs from LinkedIn, CryptoJobsList, Web3.career, and Wellfound.
-Sends the best matches to your Telegram — 3 times a day.
-
----
-
-## Setup (10 minutes, no coding)
-
-### Step 1 — Get your Telegram Bot token
-
-1. Open Telegram and search for **@BotFather**
-2. Send him: `/newbot`
-3. Choose any name (e.g. `My Job Bot`)
-4. Choose any username ending in `bot` (e.g. `myjobs_bot`)
-5. BotFather sends you a token that looks like: `7123456789:AAFxxx...`
-6. **Copy and save this token**
+Automatically finds remote jobs from 12 global sources.
+Sends personalised daily alerts to users on Telegram — 3× per day.
 
 ---
 
-### Step 2 — Get your Telegram Chat ID
+## Stack
 
-1. Open Telegram and search for **@userinfobot**
-2. Press Start
-3. It replies with your ID, something like: `123456789`
-4. **Copy and save this number**
-
----
-
-### Step 3 — Put the bot on GitHub
-
-1. Go to this GitHub repo and click **Fork** (top right)
-2. That creates a copy in your own GitHub account
+| Layer | Tool | Cost |
+|-------|------|------|
+| Hosting | Vercel (serverless) | Free |
+| Database | Supabase | Free |
+| Bot | Telegram Bot API | Free |
 
 ---
 
-### Step 4 — Deploy to Vercel
+## Setup (15 minutes)
 
-1. Go to [vercel.com](https://vercel.com) and log in with GitHub
-2. Click **Add New Project**
-3. Choose the forked repo (`job-bot`)
-4. Before clicking Deploy, click **Environment Variables** and add these 3:
+### Step 1 — Create your Telegram bot
+
+1. Open Telegram → search **@BotFather**
+2. Send `/newbot` → choose a name → choose a username ending in `bot`
+3. Copy the token it gives you (looks like `7123456789:AAFxxx...`)
+
+### Step 2 — Get your Chat ID (for testing)
+
+1. Search **@userinfobot** → press Start
+2. It shows your ID (e.g. `123456789`)
+
+### Step 3 — Set up Supabase
+
+1. Go to [supabase.com](https://supabase.com) → create a new project
+2. Go to **SQL Editor** → paste the contents of `supabase_schema.sql` → click Run
+3. Go to **Settings > API** → copy:
+   - **Project URL** (looks like `https://xxxx.supabase.co`)
+   - **anon/public key**
+
+### Step 4 — Fork & deploy to Vercel
+
+1. Fork this repo on GitHub
+2. Go to [vercel.com](https://vercel.com) → Add New Project → pick your fork
+3. Under **Environment Variables**, add these:
 
 | Name | Value |
 |------|-------|
-| `BOT_TOKEN` | The token from BotFather |
-| `CHAT_ID` | Your ID from userinfobot |
-| `KEYWORDS` | `web3,crypto,blockchain,solidity,react,typescript,telegram,defi,nft,dao` |
+| `JOB_BOT_TOKEN` | Your BotFather token |
+| `SUPABASE_URL` | Your Supabase project URL |
+| `SUPABASE_KEY` | Your Supabase anon key |
+| `BOT_USERNAME` | Your bot's username (without @) |
+| `LOG_LEVEL` | `INFO` (use `DEBUG` while testing) |
+| `SCRAPER_KEY` | Optional: ScraperAPI key for Web3.career |
 
-5. Click **Deploy**
+4. Click **Deploy**
 
----
+### Step 5 — Register the webhook
 
-### Step 5 — Test it
+After deploy, open this URL in your browser (replace values):
 
-1. In your Vercel project, go to the **Functions** tab
-2. Find `api/scan` and click **Test**
-3. Check your Telegram — you should get job matches within 30 seconds
+```
+https://api.telegram.org/bot<YOUR_TOKEN>/setWebhook?url=https://<YOUR_VERCEL_DOMAIN>/api/webhook
+```
+
+### Step 6 — Test
+
+1. In Vercel → **Functions** tab → find `api/scan` → click **Test**
+2. Open your bot on Telegram and send `/start`
+3. You should receive a welcome message within seconds
 
 ---
 
 ## When does it run?
 
-Automatically 3 times a day:
-- 9:00 AM UTC
-- 3:00 PM UTC
-- 9:00 PM UTC
+Automatically 3 times a day (UTC):
+- **9:00 AM**
+- **3:00 PM**
+- **9:00 PM**
 
-You can also trigger it manually anytime from the Vercel Functions tab.
-
----
-
-## Customizing keywords
-
-In Vercel, go to **Settings > Environment Variables** and edit `KEYWORDS`.
-Add or remove skills/topics separated by commas. No spaces needed.
-
-Example (already set for your profile):
-```
-community,ambassador,growth,web3,discord,telegram,dao,defi,nft,kol,galxe,zealy,moderator,ecosystem,protocol
-```
+Trigger manually any time from the Vercel Functions tab.
 
 ---
 
-## Something not working?
+## Bot commands
 
-- **No messages in Telegram**: Double check `BOT_TOKEN` and `CHAT_ID` are correct in Vercel env vars
-- **Bot found but no jobs**: Try broadening your `KEYWORDS` (fewer, more generic terms)
-- **Vercel errors**: Check the Function Logs in your Vercel dashboard
+| Command | What it does |
+|---------|-------------|
+| `/start` | Welcome + onboarding |
+| `/find` | Find jobs right now |
+| `/keywords web3, community` | Update your keywords |
+| `/saved` | View bookmarked jobs |
+| `/watch Coinbase` | Get alerts when Coinbase posts |
+| `/status` | View your preferences |
+| `/invite` | Get your referral link |
+| `/stop` | Pause alerts |
+| `/delete` | Delete all your data |
+| `/help` | Show all commands |
+
+---
+
+## Troubleshooting
+
+- **No messages**: Check `JOB_BOT_TOKEN` and `SUPABASE_KEY` in Vercel env vars
+- **No jobs matched**: Broaden your keywords or change seniority to "All Levels"
+- **Vercel errors**: Check Function Logs in your Vercel dashboard — errors are now properly logged
+- **Webhook not responding**: Re-run the `setWebhook` URL above
+
+---
+
+## Architecture
+
+```
+Telegram User
+     │
+     ▼
+api/webhook.py  ← handles all messages & button taps
+     │
+     ▼
+Supabase        ← stores users, jobs, sent history, analytics
+
+[Cron 3×/day]
+     │
+     ▼
+api/scan.py     ← fetches jobs, matches users, sends alerts
+     │
+     ▼
+api/jobs.py     ← scrapes 12 job sources in parallel
+```
