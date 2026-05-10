@@ -64,6 +64,13 @@ def send(chat_id, text, buttons=None, retries=3):
                 time.sleep(1)
     return False
 
+_REQUEST_METHODS = {
+    "get":    requests.get,
+    "post":   requests.post,
+    "patch":  requests.patch,
+    "delete": requests.delete,
+}
+
 def sb(method, path, body=None, prefer=None):
     hdrs = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
             "Content-Type": "application/json"}
@@ -71,7 +78,10 @@ def sb(method, path, body=None, prefer=None):
         hdrs["Prefer"] = prefer
     url = SUPABASE_URL.rstrip("/") + "/rest/v1/" + path
     try:
-        fn     = getattr(requests, method)
+        fn = _REQUEST_METHODS.get(method)
+        if fn is None:
+            logger.error(f"sb: unknown HTTP method '{method}'")
+            return [] if method == "get" else None
         kwargs = {"headers": hdrs, "timeout": 15}
         if body is not None:
             kwargs["json"] = body
@@ -81,7 +91,7 @@ def sb(method, path, body=None, prefer=None):
                 return r.json()
             logger.sb_error(method, path, r.status_code, r.text)
             return []
-        if r.status_code not in (200,201,204):
+        if r.status_code not in (200, 201, 204):
             logger.sb_error(method, path, r.status_code, r.text)
         return r
     except Exception as e:
@@ -160,20 +170,6 @@ def was_alerted_recently(user):
     except Exception:
         return False
 
-def difficulty_score(job):
-    if job.get("hot"):
-        return "🟢 Fresh — apply today"
-    source = (job.get("source","") or "").lower()
-    title  = (job.get("title","")  or "").lower()
-    niche  = any(k in title for k in ["moderator","ambassador","kol","discord","telegram mod",
-                                       "community","web3"])
-    big_co = any(s in source for s in ["greenhouse","lever","ashby"])
-    if big_co and not niche:
-        return "🔴 Competitive role"
-    if niche:
-        return "🟢 Niche — apply fast"
-    return "🟡 Moderate competition"
-
 def fmt_date(date_val):
     if not date_val:
         return ""
@@ -184,7 +180,7 @@ def fmt_date(date_val):
     except Exception:
         return str(date_val)[:10] if date_val else ""
 
-def format_job_compact(job, show_divider=False):
+def format_job_compact(job):
     hot     = "🔥 " if job.get("hot") else ""
     title   = sanitize(job.get("title",""))
     company = sanitize(job.get("company",""))
@@ -201,24 +197,29 @@ def format_job_compact(job, show_divider=False):
     lines.append(f"📊 {difficulty_score(job)}")
     if url:
         lines.append(f'🔗 <a href="{url}">Apply Now</a>  •  📌 {source}')
-    if show_divider:
-        lines.append("\n─────────────────")
     return "\n".join(lines)
 
-# Fix #3: always group jobs — reduces notification count dramatically
-def send_jobs_grouped(chat_id, jobs, batch_size=3):
-    for i in range(0, len(jobs), batch_size):
-        group = jobs[i:i+batch_size]
-        parts = [format_job_compact(j, show_divider=idx < len(group)-1)
-                 for idx, j in enumerate(group)]
-        send(chat_id, "\n".join(parts))
-        time.sleep(0.5)   # respect Telegram rate limits
+# Fix #7: Send each job individually with action buttons so users can save/like/dislike
+# from their daily alerts — previously the morning batch had zero action buttons.
+def send_jobs_grouped(chat_id, jobs):
+    for job in jobs:
+        text    = format_job_compact(job)
+        job_id  = job.get("_id", "")
+        buttons = None
+        if job_id:
+            buttons = [[
+                {"text": "🔖 Save",  "callback_data": f"save_{job_id}"},
+                {"text": "👍",       "callback_data": f"like_{job_id}"},
+                {"text": "👎",       "callback_data": f"dislike_{job_id}"},
+            ]]
+        send(chat_id, text, buttons)
+        time.sleep(0.4)  # respect Telegram rate limits
 
 FIND_MORE_BTN = [[{"text": "🔍 Find More Jobs", "callback_data": "find_jobs"}]]
 
 def run():
     logger.info("=== Scan started ===")
-    from api.jobs import get_all_jobs, matches_user, score
+    from api.jobs import get_all_jobs, matches_user, score, difficulty_score
 
     logger.info("Fetching all jobs from sources...")
     all_jobs = get_all_jobs()
@@ -259,10 +260,14 @@ def run():
                 except Exception as e:
                     logger.error(f"Re-engagement for {chat_id}: {e}")
             else:
+                # First-time scan for this user — they haven't received anything yet
                 send(chat_id,
-                    "📭 <b>No new jobs today.</b>\n\n"
-                    "All matching jobs have been sent. Fresh listings arrive tomorrow.",
-                    FIND_MORE_BTN)
+                    "👋 <b>You're all set and in the queue!</b>\n\n"
+                    "No matches in today's scan for your current keywords. "
+                    "We scan 1,200+ jobs daily and will alert you as soon as something matches.\n\n"
+                    "Try broadening your keywords or search manually now:",
+                    [[{"text": "🔑 Update Keywords",    "callback_data": "add_keywords"},
+                      {"text": "🔍 Find Jobs Now",      "callback_data": "find_jobs"}]])
             skipped_count += 1
             continue
 
