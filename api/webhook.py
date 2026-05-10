@@ -537,9 +537,9 @@ def finish_setup(chat_id, msg_id, ctype, cb_id):
          f"🎓 {SEN_LABELS.get(user.get('seniority', 'all'), 'All Levels')}\n"
          f"📍 {LOC_LABELS.get(user.get('location_key', 'worldwide'), 'Worldwide')}\n"
          f"🏢 {CTYPE_LABELS.get(ctype, 'Any')}\n\n"
-         f"👥 Share: <code>{invite}</code>",
-         [[{"text": "🔍 Find Jobs Now",  "callback_data": "find_jobs"},
-           {"text": "👥 Invite Friends", "callback_data": "invite"}]])
+         f"👥 Share: <code>{invite}</code>")
+    # Auto-search jobs immediately after setup
+    send_jobs_from_cache(chat_id, user)
 
 # ── Main handlers ─────────────────────────────────────────────────────────────
 
