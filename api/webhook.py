@@ -13,6 +13,7 @@ Fixes applied:
   #18 Pagination: /find returns 5 jobs + "Load more" button
   #21 FSM bug fix: handle_start no longer resets awaiting_role
   #22 step1_role now uses send() so prompt always arrives
+  #24 handle_start existing-user path now routes correctly for all states
 """
 import os, json, time, requests, re
 from datetime import datetime, timezone, timedelta
@@ -456,11 +457,14 @@ def handle_start(chat_id, username, ref_code=None):
     is_new   = not existing
 
     if existing:
-        # Only update username — never touch FSM flags for existing users
+        # Only update username — never touch other FSM flags
         update_user(chat_id, {"username": username or ""})
 
         step = get_current_step(existing)
+
+        # FIX #24: handle all 4 possible states for existing users
         if step == "awaiting_role":
+            # Mid setup at step 1 — just re-prompt
             send(chat_id,
                  "⚙️ <b>Step 1 of 4 — Your Role</b>\n\n"
                  "What job role are you looking for?\n\n"
@@ -473,7 +477,9 @@ def handle_start(chat_id, username, ref_code=None):
                  "Just type your role below and send 👇",
                  [[{"text": "❌ Cancel", "callback_data": "status"}]])
             return
+
         elif step in ("awaiting_seniority", "awaiting_location", "awaiting_ctype"):
+            # Mid setup past step 1 — restart from step 1
             update_user(chat_id, {
                 "awaiting_role":      True,
                 "awaiting_seniority": False,
@@ -488,9 +494,18 @@ def handle_start(chat_id, username, ref_code=None):
                  "Just type your role below and send 👇",
                  [[{"text": "❌ Cancel", "callback_data": "status"}]])
             return
+
+        else:
+            # FIX #24: setup_complete=True (or no step active) — show welcome
+            # with main menu. Setup re-runs only via "⚙️ Setup Alerts" button
+            # which calls step1_role and correctly sets awaiting_role=True.
+            track(chat_id, "start", {"is_new": False})
+            send(chat_id, WELCOME, kb_main())
+            return
+
     else:
-        # FIX #1: Brand new user — set awaiting_role=True immediately
-        # so the very next message is captured by the FSM
+        # Brand new user — write all defaults with awaiting_role=True
+        # so the very next typed message is captured by the FSM
         set_user(chat_id, {
             "username":           username or "",
             "active":             False,
@@ -503,7 +518,7 @@ def handle_start(chat_id, username, ref_code=None):
             "remote_only":        False,
             "company_type":       "any",
             "awaiting_keywords":  False,
-            "awaiting_role":      True,   # ← TRUE: user is about to type their role
+            "awaiting_role":      True,   # ← TRUE so first reply is captured
             "awaiting_seniority": False,
             "awaiting_location":  False,
             "awaiting_ctype":     False,
@@ -512,7 +527,7 @@ def handle_start(chat_id, username, ref_code=None):
             "referred_by":        None,
         })
 
-    # Fix #5: referral anti-abuse
+    # Fix #5: referral anti-abuse (new users only)
     if is_new and ref_code and ref_code.startswith("ref_"):
         try:
             referrer_id = int(ref_code.replace("ref_", ""))
@@ -640,11 +655,8 @@ def handle_keywords(chat_id, text):
 # ── Onboarding steps ──────────────────────────────────────────────────────────
 
 def step1_role(chat_id, msg_id):
-    # FIX #2: use update_user (PATCH) not sb_post (upsert)
-    # sb_post with merge-duplicates requires a unique constraint on chat_id in Supabase.
-    # Without it, it inserts a second row — get_user then reads the old row with
-    # awaiting_role=False. update_user does a direct PATCH on chat_id=eq.{id},
-    # always hits the correct row regardless of DB constraints.
+    # Use update_user (PATCH) not sb_post (upsert) — PATCH always hits the
+    # correct row via chat_id=eq.{id}, no unique constraint needed.
     update_user(chat_id, {
         "awaiting_role":      True,
         "awaiting_seniority": False,
@@ -721,10 +733,8 @@ def process_update(update):
             text     = msg.get("text", "") or ""
 
             if text and not text.startswith("/"):
-                # Always do a fresh DB read for FSM state
                 user = get_user(chat_id)
 
-                # DEBUG: log what state we see (remove after confirming fix works)
                 logger.info(f"Text from {chat_id}: '{text[:40]}' | "
                             f"awaiting_role={user.get('awaiting_role')} "
                             f"awaiting_keywords={user.get('awaiting_keywords')} "
@@ -735,7 +745,6 @@ def process_update(update):
                     if not role:
                         send(chat_id, "Please type a role name.")
                         return
-                    # FIX #3: use update_user (PATCH) not sb_post (upsert)
                     update_user(chat_id, {
                         "keywords":      role,
                         "category":      "all",
@@ -746,7 +755,6 @@ def process_update(update):
 
                 if user.get("awaiting_keywords"):
                     kw = sanitize(text.strip(), max_len=300)
-                    # FIX #3 (same): use update_user not sb_post
                     update_user(chat_id, {
                         "keywords":          kw,
                         "awaiting_keywords": False,
@@ -756,7 +764,6 @@ def process_update(update):
                     send_jobs_from_cache(chat_id, fresh_user)
                     return
 
-                # No active FSM state — guide the user
                 send(chat_id,
                      "Not sure what you mean. Use the buttons or try /help.",
                      kb_main())
@@ -845,10 +852,10 @@ def process_update(update):
                 cached = sb_get(f"jobs?job_id=eq.{job_id}&select=*&limit=1")
                 answer(cb_id)
                 if cached:
-                    j      = cached[0]
-                    invite = f"t.me/{BOT_USERNAME}?start=ref_{chat_id}"
-                    url    = sanitize_url(j.get("url", ""))
-                    title  = sanitize(j.get("title", ""))
+                    j       = cached[0]
+                    invite  = f"t.me/{BOT_USERNAME}?start=ref_{chat_id}"
+                    url     = sanitize_url(j.get("url", ""))
+                    title   = sanitize(j.get("title", ""))
                     company = sanitize(j.get("company", ""))
                     send(chat_id,
                          f"📤 <b>Share this job:</b>\n\n"
