@@ -1,9 +1,10 @@
 """
 Remote Radar — Daily Job Scanner
-Fetches all jobs, stores in Supabase, sends personalized alerts.
+Production: grouped messages, rate limiting, error logging, retry logic.
 """
-import os, requests, json
-from datetime import datetime
+import os, re, time, requests
+from datetime import datetime, timezone
+from urllib.parse import urlparse
 from http.server import BaseHTTPRequestHandler
 
 BOT_TOKEN    = os.environ.get("JOB_BOT_TOKEN", "")
@@ -11,17 +12,47 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-def send(chat_id, text, buttons=None):
-    payload = {
-        "chat_id": chat_id, "text": str(text)[:4096],
-        "parse_mode": "HTML", "disable_web_page_preview": True,
-    }
+def log(msg):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+
+def sanitize_url(url):
+    if not url:
+        return ""
+    try:
+        parsed = urlparse(str(url))
+        if parsed.scheme not in ("http","https"):
+            return ""
+        return str(url).replace("'","%27").replace('"',"%22")
+    except Exception:
+        return ""
+
+def sanitize_text(text):
+    if not text:
+        return ""
+    return re.sub(r"<[^>]+>","",str(text)).strip()[:200]
+
+def send(chat_id, text, buttons=None, retries=3):
+    payload = {"chat_id": chat_id, "text": str(text)[:4096],
+                "parse_mode": "HTML", "disable_web_page_preview": True}
     if buttons:
         payload["reply_markup"] = {"inline_keyboard": buttons}
-    try:
-        requests.post(f"{TG_API}/sendMessage", json=payload, timeout=10)
-    except Exception:
-        pass
+    for attempt in range(retries):
+        try:
+            r = requests.post(f"{TG_API}/sendMessage", json=payload, timeout=10)
+            if r.status_code == 200:
+                return True
+            if r.status_code == 429:
+                wait = r.json().get("parameters",{}).get("retry_after",5)
+                log(f"Rate limited — waiting {wait}s")
+                time.sleep(wait)
+                continue
+            log(f"Send failed {r.status_code}: {r.text[:100]}")
+            return False
+        except Exception as e:
+            log(f"Send error: {e}")
+            if attempt < retries - 1:
+                time.sleep(1)
+    return False
 
 def sb_get(path):
     hdrs = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
@@ -29,21 +60,20 @@ def sb_get(path):
     try:
         r = requests.get(url, headers=hdrs, timeout=10)
         return r.json() if r.status_code == 200 else []
-    except Exception:
+    except Exception as e:
+        log(f"sb_get error {path}: {e}")
         return []
 
-def sb_post(path, body, upsert=False):
-    hdrs = {
-        "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}",
-        "Content-Type": "application/json",
-        "Prefer": "resolution=merge-duplicates" if upsert else "resolution=ignore-duplicates",
-    }
+def sb_post(path, body, prefer="resolution=ignore-duplicates"):
+    hdrs = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Content-Type": "application/json", "Prefer": prefer}
     url = SUPABASE_URL.rstrip("/") + "/rest/v1/" + path
     try:
-        requests.post(url, headers=hdrs, json=body, timeout=10)
-    except Exception:
-        pass
+        r = requests.post(url, headers=hdrs, json=body, timeout=15)
+        if r.status_code not in (200, 201):
+            log(f"sb_post error {r.status_code} {path}: {r.text[:100]}")
+    except Exception as e:
+        log(f"sb_post error {path}: {e}")
 
 def was_sent(chat_id, job_id):
     r = sb_get(f"sent_jobs?chat_id=eq.{chat_id}&job_id=eq.{job_id}&select=id&limit=1")
@@ -53,31 +83,27 @@ def mark_sent(chat_id, job_id):
     sb_post("sent_jobs", {"chat_id": chat_id, "job_id": str(job_id)})
 
 def store_jobs(jobs):
-    """Store all scraped jobs in Supabase for instant retrieval later."""
     if not jobs:
         return
     rows = []
     for j in jobs:
         rows.append({
             "job_id": j["_id"],
-            "title": j.get("title",""),
-            "company": j.get("company",""),
-            "url": j.get("url",""),
-            "source": j.get("source",""),
+            "title": sanitize_text(j.get("title","")),
+            "company": sanitize_text(j.get("company","")),
+            "url": sanitize_url(j.get("url","")),
+            "source": sanitize_text(j.get("source","")),
             "date_posted": str(j.get("date","")),
-            "location": j.get("location","Remote"),
-            "salary": j.get("salary",""),
-            "funding": j.get("funding",""),
+            "location": sanitize_text(j.get("location","Remote")),
+            "salary": sanitize_text(j.get("salary","")),
+            "funding": sanitize_text(j.get("funding","")),
             "company_type": j.get("company_type",""),
             "visa": bool(j.get("visa", False)),
             "hot": bool(j.get("hot", False)),
         })
-    hdrs = {
-        "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}",
-        "Content-Type": "application/json",
-        "Prefer": "resolution=merge-duplicates,return=minimal",
-    }
+    hdrs = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Content-Type": "application/json",
+            "Prefer": "resolution=merge-duplicates,return=minimal"}
     url = SUPABASE_URL.rstrip("/") + "/rest/v1/jobs"
     total = 0
     for i in range(0, len(rows), 100):
@@ -87,17 +113,17 @@ def store_jobs(jobs):
             if r.status_code in (200, 201):
                 total += len(batch)
             else:
-                print(f"store_jobs batch error: {r.status_code} {r.text[:200]}")
+                log(f"store_jobs batch error: {r.status_code} {r.text[:200]}")
         except Exception as e:
-            print(f"store_jobs error: {e}")
-    print(f"Stored {total} jobs in Supabase")
+            log(f"store_jobs error: {e}")
+    log(f"Stored {total} jobs in Supabase")
 
 def fmt_date(date_val):
     if not date_val:
         return ""
     try:
         s = str(date_val)
-        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(s.replace("Z","+00:00"))
         return dt.strftime("%-d %b %Y")
     except Exception:
         try:
@@ -106,56 +132,69 @@ def fmt_date(date_val):
         except Exception:
             return ""
 
-def format_job(job):
+def format_job_compact(job, show_divider=False):
     hot = "🔥 " if job.get("hot") else ""
-    lines = [f"💼 {hot}<b>{job.get('title','')}</b>"]
-    if job.get("company"):
-        lines.append(f"🏢 {job['company']}")
-    loc = job.get("location","")
+    title = sanitize_text(job.get("title",""))
+    company = sanitize_text(job.get("company",""))
+    loc = sanitize_text(job.get("location",""))
+    url = sanitize_url(job.get("url",""))
+    source = sanitize_text(job.get("source",""))
+
+    lines = [f"💼 {hot}<b>{title}</b>"]
+    if company:
+        lines.append(f"🏢 {company}")
     if loc and loc.lower() not in ("remote",""):
         lines.append(f"📍 {loc}")
     else:
         lines.append("📍 Remote")
     if job.get("salary"):
-        lines.append(f"💰 {job['salary']}")
+        lines.append(f"💰 {sanitize_text(job['salary'])}")
     if job.get("funding"):
-        lines.append(f"💸 Funding: {job['funding']}")
+        lines.append(f"💸 {sanitize_text(job['funding'])}")
     if job.get("visa"):
-        lines.append("✈️ Visa sponsorship available")
-    d = fmt_date(job.get("date") or job.get("date_posted",""))
+        lines.append("✈️ Visa sponsorship")
+    d = fmt_date(job.get("date",""))
     if d:
         lines.append(f"📅 {d}")
-    url = job.get("url","")
     if url:
-        lines.append(f"🔗 <a href='{url}'>Apply Now</a>")
-    lines.append(f"📌 {job.get('source','')}")
+        lines.append(f"🔗 <a href='{url}'>Apply Now</a>  •  📌 {source}")
+    if show_divider:
+        lines.append("\n─────────────────")
     return "\n".join(lines)
+
+def send_jobs_grouped(chat_id, jobs, batch_size=3):
+    for i in range(0, len(jobs), batch_size):
+        group = jobs[i:i+batch_size]
+        parts = []
+        for idx, job in enumerate(group):
+            parts.append(format_job_compact(job, show_divider=idx < len(group)-1))
+        send(chat_id, "\n".join(parts))
+        time.sleep(0.5)  # Prevent rate limiting during broadcasts
 
 FIND_MORE_BTN = [[{"text": "🔍 Find More Jobs", "callback_data": "find_jobs"}]]
 
 def run():
-    print("Fetching all jobs...")
+    log("Fetching all jobs...")
     from api.jobs import get_all_jobs, matches_user, score
 
     all_jobs = get_all_jobs()
 
-    # Store all jobs in Supabase for instant retrieval
+    # Store all jobs in Supabase
     store_jobs(all_jobs)
 
-    print("Fetching users...")
+    log("Fetching users...")
     users = sb_get("users?active=eq.true&setup_complete=eq.true")
-    print(f"Active users: {len(users)}")
+    log(f"Active users: {len(users)}")
 
     for user in users:
         chat_id = user["chat_id"]
-        keywords = user.get("keywords", "")
+        keywords = user.get("keywords","")
 
-        matched = [j for j in all_jobs
-                   if matches_user(j, user) and not was_sent(chat_id, j["_id"])]
+        matched = [j for j in all_jobs if matches_user(j, user) and not was_sent(chat_id, j["_id"])]
         matched.sort(key=lambda j: (-score(j["title"], keywords), not j.get("hot", False)))
-        batch = matched[:10]
+        batch = matched[:9]  # 9 = 3 groups of 3
 
-        print(f"User {chat_id}: {len(batch)} new jobs")
+        log(f"User {chat_id}: {len(batch)} new jobs")
 
         if not batch:
             send(chat_id,
@@ -171,38 +210,38 @@ def run():
         header = f"🌅 <b>Your Daily Job Alerts</b> — {len(batch)} new matches"
         if hot_count:
             header += f" · 🔥 {hot_count} posted today"
-        header += f"\n📡 {', '.join(sources)}"
+        header += f"\n📡 {', '.join(sources[:4])}"
         send(chat_id, header)
 
+        send_jobs_grouped(chat_id, batch)
+
         for job in batch:
-            send(chat_id, format_job(job))
             mark_sent(chat_id, job["_id"])
 
-        send(chat_id,
-            "✅ That's today's batch! Tap below to get more anytime. 🚀",
-            FIND_MORE_BTN)
+        send(chat_id, "✅ That's today's batch! Tap below anytime for more. 🚀", FIND_MORE_BTN)
+
+        time.sleep(0.5)  # Space between users
 
     # Watchlist alerts
     watchlist = sb_get("watchlist?select=chat_id,company")
     if watchlist:
         watch_map = {}
         for w in watchlist:
-            cid = w["chat_id"]
-            watch_map.setdefault(cid, [])
-            watch_map[cid].append(w["company"].lower())
+            watch_map.setdefault(w["chat_id"], [])
+            watch_map[w["chat_id"]].append(w["company"].lower())
 
         for chat_id, companies in watch_map.items():
-            watched_jobs = [j for j in all_jobs
-                            if j.get("company","").lower() in companies
-                            and not was_sent(chat_id, j["_id"])]
-            if watched_jobs:
+            watched = [j for j in all_jobs
+                       if sanitize_text(j.get("company","")).lower() in companies
+                       and not was_sent(chat_id, j["_id"])]
+            if watched:
                 send(chat_id,
-                    f"👁 <b>Watchlist Alert!</b> {len(watched_jobs)} new job(s) from companies you're tracking:")
-                for job in watched_jobs[:5]:
-                    send(chat_id, format_job(job))
+                    f"👁 <b>Watchlist Alert!</b> {len(watched)} new job(s) from your watched companies:")
+                send_jobs_grouped(chat_id, watched[:6])
+                for job in watched[:6]:
                     mark_sent(chat_id, job["_id"])
 
-    print("Scan complete.")
+    log("Scan complete.")
 
 
 class handler(BaseHTTPRequestHandler):
