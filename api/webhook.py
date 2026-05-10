@@ -477,9 +477,13 @@ def handle_start(chat_id, username, ref_code=None):
             return
         elif step in ("awaiting_seniority", "awaiting_location", "awaiting_ctype"):
             # Mid-setup but past step 1 — restart cleanly from step 1
-            sb_post("users", {"chat_id": chat_id, "awaiting_role": True,
-                               "awaiting_seniority": False, "awaiting_location": False,
-                               "awaiting_ctype": False, "awaiting_keywords": False})
+            update_user(chat_id, {
+                "awaiting_role":      True,
+                "awaiting_seniority": False,
+                "awaiting_location":  False,
+                "awaiting_ctype":     False,
+                "awaiting_keywords":  False,
+            })
             send(chat_id,
                  "⚙️ Let's pick up where you left off.\n\n"
                  "<b>Step 1 of 4 — Your Role</b>\n\n"
