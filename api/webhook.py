@@ -1,9 +1,11 @@
 """
 Remote Radar — Telegram Webhook
-All job fetching pulls from Supabase — no scraping on webhook.
+Production-grade: retry logic, rate limiting, grouped messages,
+company_type filtering, sanitized HTML, error logging.
 """
-import os, json, requests
-from datetime import datetime
+import os, json, time, requests, re
+from datetime import datetime, timezone, timedelta
+from urllib.parse import urlparse
 from http.server import BaseHTTPRequestHandler
 
 BOT_TOKEN    = os.environ.get("JOB_BOT_TOKEN", "")
@@ -11,6 +13,8 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 TG_API       = f"https://api.telegram.org/bot{BOT_TOKEN}"
 BOT_USERNAME = "RemoteDailyJobBot"
+
+FIND_COOLDOWN_SECONDS = 60  # 1 minute between /find requests
 
 WELCOME = """👋 <b>Welcome to Remote Radar!</b>
 
@@ -29,6 +33,31 @@ Let's set up in 4 quick steps 👇
 
 <i>Made by <a href="https://t.me/Harsimarhs">@Harsimarhs</a> · Feel free to reach out</i>"""
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def sanitize_url(url):
+    """Validate URL is safe to embed in HTML."""
+    if not url:
+        return ""
+    try:
+        parsed = urlparse(str(url))
+        if parsed.scheme not in ("http", "https"):
+            return ""
+        return str(url).replace("'", "%27").replace('"', "%22")
+    except Exception:
+        return ""
+
+def sanitize_text(text):
+    """Strip HTML tags from scraped text."""
+    if not text:
+        return ""
+    return re.sub(r"<[^>]+>", "", str(text)).strip()[:200]
+
+def log_error(context, error, chat_id=None):
+    ts = datetime.now().strftime("%H:%M:%S")
+    cid = f" [user:{chat_id}]" if chat_id else ""
+    print(f"[ERROR {ts}]{cid} {context}: {error}")
+
 # ── Supabase ──────────────────────────────────────────────────────────────────
 
 def _hdr(extra=None):
@@ -41,29 +70,37 @@ def _hdr(extra=None):
 def sb_get(path):
     try:
         r = requests.get(f"{SUPABASE_URL}/rest/v1/{path}", headers=_hdr(), timeout=10)
-        return r.json() if r.status_code == 200 else []
-    except Exception:
+        if r.status_code == 200:
+            return r.json()
+        log_error("sb_get", f"{r.status_code} {path}")
+        return []
+    except Exception as e:
+        log_error("sb_get", e)
         return []
 
 def sb_post(path, body, prefer="resolution=merge-duplicates"):
     try:
-        requests.post(f"{SUPABASE_URL}/rest/v1/{path}",
-                      headers=_hdr({"Prefer": prefer}), json=body, timeout=10)
-    except Exception:
-        pass
+        r = requests.post(f"{SUPABASE_URL}/rest/v1/{path}",
+                          headers=_hdr({"Prefer": prefer}), json=body, timeout=10)
+        if r.status_code not in (200, 201):
+            log_error("sb_post", f"{r.status_code} {path} {r.text[:100]}")
+    except Exception as e:
+        log_error("sb_post", e)
 
 def sb_patch(path, body):
     try:
-        requests.patch(f"{SUPABASE_URL}/rest/v1/{path}",
-                       headers=_hdr(), json=body, timeout=10)
-    except Exception:
-        pass
+        r = requests.patch(f"{SUPABASE_URL}/rest/v1/{path}",
+                           headers=_hdr(), json=body, timeout=10)
+        if r.status_code not in (200, 204):
+            log_error("sb_patch", f"{r.status_code} {path}")
+    except Exception as e:
+        log_error("sb_patch", e)
 
 def sb_delete(path):
     try:
         requests.delete(f"{SUPABASE_URL}/rest/v1/{path}", headers=_hdr(), timeout=10)
-    except Exception:
-        pass
+    except Exception as e:
+        log_error("sb_delete", e)
 
 def get_user(chat_id):
     r = sb_get(f"users?chat_id=eq.{chat_id}&select=*")
@@ -84,25 +121,54 @@ def mark_sent(chat_id, job_id):
     sb_post("sent_jobs", {"chat_id": chat_id, "job_id": str(job_id)},
             prefer="resolution=ignore-duplicates")
 
-def get_all_cached_jobs():
-    """Pull all jobs stored by daily scan — instant, no scraping."""
+def get_cached_jobs():
     return sb_get("jobs?select=*&order=scraped_at.desc&limit=2000")
 
 def inc_referrals(chat_id):
     user = get_user(chat_id)
     update_user(chat_id, {"referrals": (user.get("referrals") or 0) + 1})
 
+def check_rate_limit(chat_id):
+    """Returns True if user can search, False if on cooldown."""
+    user = get_user(chat_id)
+    last_find = user.get("last_find_at")
+    if not last_find:
+        return True
+    try:
+        last_dt = datetime.fromisoformat(str(last_find).replace("Z", "+00:00"))
+        if last_dt.tzinfo is None:
+            last_dt = last_dt.replace(tzinfo=timezone.utc)
+        elapsed = (datetime.now(timezone.utc) - last_dt).total_seconds()
+        return elapsed >= FIND_COOLDOWN_SECONDS
+    except Exception:
+        return True
+
+def update_last_find(chat_id):
+    update_user(chat_id, {"last_find_at": datetime.now(timezone.utc).isoformat()})
+
 # ── Telegram ──────────────────────────────────────────────────────────────────
 
-def send(chat_id, text, keyboard=None):
+def send(chat_id, text, keyboard=None, retries=3):
     payload = {"chat_id": chat_id, "text": str(text)[:4096],
                 "parse_mode": "HTML", "disable_web_page_preview": True}
     if keyboard:
         payload["reply_markup"] = {"inline_keyboard": keyboard}
-    try:
-        requests.post(f"{TG_API}/sendMessage", json=payload, timeout=10)
-    except Exception:
-        pass
+    for attempt in range(retries):
+        try:
+            r = requests.post(f"{TG_API}/sendMessage", json=payload, timeout=10)
+            if r.status_code == 200:
+                return True
+            if r.status_code == 429:  # Rate limited
+                retry_after = r.json().get("parameters", {}).get("retry_after", 5)
+                time.sleep(retry_after)
+                continue
+            log_error("send", f"{r.status_code} {r.text[:100]}", chat_id)
+            return False
+        except Exception as e:
+            log_error("send", e, chat_id)
+            if attempt < retries - 1:
+                time.sleep(1)
+    return False
 
 def edit(chat_id, msg_id, text, keyboard=None):
     payload = {"chat_id": chat_id, "message_id": msg_id,
@@ -111,15 +177,15 @@ def edit(chat_id, msg_id, text, keyboard=None):
         payload["reply_markup"] = {"inline_keyboard": keyboard}
     try:
         requests.post(f"{TG_API}/editMessageText", json=payload, timeout=10)
-    except Exception:
-        pass
+    except Exception as e:
+        log_error("edit", e, chat_id)
 
 def answer(cb_id, text=""):
     try:
         requests.post(f"{TG_API}/answerCallbackQuery",
                       json={"callback_query_id": cb_id, "text": text}, timeout=5)
-    except Exception:
-        pass
+    except Exception as e:
+        log_error("answer_callback", e)
 
 # ── Keyboards ─────────────────────────────────────────────────────────────────
 
@@ -216,24 +282,38 @@ LOC_MAP = {
     "europe": ("Europe", False), "worldwide": ("Worldwide", False),
 }
 
-# ── Job matching (for cached jobs from Supabase) ──────────────────────────────
+# ── Job matching ──────────────────────────────────────────────────────────────
 
 def job_matches_user(job, user):
-    """Match a cached Supabase job row against user preferences."""
-    from api.jobs import is_title_relevant, matches_location, matches_seniority
-    title = job.get("title","")
-    keywords = user.get("keywords","")
-    category = user.get("category","all")
-    location = user.get("location","Remote")
-    remote_only = user.get("remote_only", True)
-    seniority = user.get("seniority","all")
-    if not is_title_relevant(title, keywords, category):
+    try:
+        from api.jobs import is_title_relevant, matches_location, matches_seniority
+        title = sanitize_text(job.get("title",""))
+        keywords = user.get("keywords","")
+        category = user.get("category","all")
+        location = user.get("location","Remote")
+        remote_only = user.get("remote_only", True)
+        seniority = user.get("seniority","all")
+        company_type_pref = user.get("company_type","any")
+
+        if not is_title_relevant(title, keywords, category):
+            return False
+        if not matches_location(job.get("location","Remote"), location, remote_only):
+            return False
+        if not matches_seniority(title, seniority):
+            return False
+
+        # Company type filter — actually enforced now
+        if company_type_pref == "startup":
+            if job.get("company_type","") not in ("startup",):
+                return False
+        elif company_type_pref == "established":
+            if job.get("company_type","") == "startup":
+                return False
+
+        return True
+    except Exception as e:
+        log_error("job_matches_user", e)
         return False
-    if not matches_location(job.get("location","Remote"), location, remote_only):
-        return False
-    if not matches_seniority(title, seniority):
-        return False
-    return True
 
 def fmt_date(date_val):
     if not date_val:
@@ -249,82 +329,104 @@ def fmt_date(date_val):
         except Exception:
             return ""
 
-def format_job(job):
+def format_job_compact(job, show_divider=False):
+    """Compact single job format for grouped messages."""
     hot = "🔥 " if job.get("hot") else ""
-    lines = [f"💼 {hot}<b>{job.get('title','')}</b>"]
-    if job.get("company"):
-        lines.append(f"🏢 {job['company']}")
-    loc = job.get("location","")
+    title = sanitize_text(job.get("title",""))
+    company = sanitize_text(job.get("company",""))
+    loc = sanitize_text(job.get("location",""))
+    url = sanitize_url(job.get("url",""))
+    source = sanitize_text(job.get("source",""))
+
+    lines = [f"💼 {hot}<b>{title}</b>"]
+    if company:
+        lines.append(f"🏢 {company}")
     if loc and loc.lower() not in ("remote",""):
         lines.append(f"📍 {loc}")
     else:
         lines.append("📍 Remote")
     if job.get("salary"):
-        lines.append(f"💰 {job['salary']}")
+        lines.append(f"💰 {sanitize_text(job['salary'])}")
     if job.get("funding"):
-        lines.append(f"💸 Funding: {job['funding']}")
+        lines.append(f"💸 {sanitize_text(job['funding'])}")
     if job.get("visa"):
-        lines.append("✈️ Visa sponsorship available")
+        lines.append("✈️ Visa sponsorship")
     d = fmt_date(job.get("date") or job.get("date_posted",""))
     if d:
         lines.append(f"📅 {d}")
-    url = job.get("url","")
     if url:
-        lines.append(f"🔗 <a href='{url}'>Apply Now</a>")
-    lines.append(f"📌 {job.get('source','')}")
+        lines.append(f"🔗 <a href='{url}'>Apply Now</a>  •  📌 {source}")
+    if show_divider:
+        lines.append("\n─────────────────")
     return "\n".join(lines)
 
-# ── Find jobs from Supabase cache ─────────────────────────────────────────────
+def send_jobs_grouped(chat_id, jobs, batch_size=3):
+    """Send jobs grouped 3 per message — reduces notification spam."""
+    if not jobs:
+        return
+    for i in range(0, len(jobs), batch_size):
+        group = jobs[i:i+batch_size]
+        parts = []
+        for idx, job in enumerate(group):
+            show_div = idx < len(group) - 1
+            parts.append(format_job_compact(job, show_divider=show_div))
+        msg = "\n".join(parts)
+        send(chat_id, msg)
+        time.sleep(0.3)  # Avoid Telegram rate limits
+
+# ── Find jobs from cache ──────────────────────────────────────────────────────
 
 def send_jobs_from_cache(chat_id, user):
-    from api.jobs import score
-    send(chat_id, "🔍 Finding matching jobs...")
+    # Rate limit check
+    if not check_rate_limit(chat_id):
+        send(chat_id, f"⏳ Please wait {FIND_COOLDOWN_SECONDS} seconds between searches.")
+        return
 
-    cached = get_all_cached_jobs()
+    send(chat_id, "🔍 Finding matching jobs...")
+    update_last_find(chat_id)
+
+    cached = get_cached_jobs()
     if not cached:
         send(chat_id,
-            "No jobs in cache yet. The daily scan runs at 9am UTC. "
-            "Come back then or ask @Harsimarhs to run it manually.",
+            "No jobs in cache yet. Daily scan runs at 9am UTC. "
+            "Come back then or tap Find More Jobs tomorrow.",
             [[{"text": "⚙️ Update Preferences", "callback_data": "setup_start"}]])
         return
 
+    from api.jobs import score
     keywords = user.get("keywords","")
+
     matched = [j for j in cached
                if job_matches_user(j, user)
                and not was_sent(chat_id, j["job_id"])]
 
     matched.sort(key=lambda j: (-score(j.get("title",""), keywords),
                                 not j.get("hot", False)))
-    batch = matched[:10]
+    batch = matched[:9]  # 9 = 3 groups of 3
 
     if not batch:
         send(chat_id,
             "📭 <b>No new jobs found.</b>\n\n"
-            "You've seen all matching jobs from today's scan. "
+            "You've seen all matching jobs from today's cache. "
             "Fresh listings arrive tomorrow at 9am UTC.",
             [[{"text": "⚙️ Change Preferences", "callback_data": "setup_start"},
               {"text": "🔑 Update Keywords", "callback_data": "add_keywords"}]])
         return
 
-    sources = list({j["source"] for j in batch})
     hot_count = sum(1 for j in batch if j.get("hot"))
+    sources = list({j["source"] for j in batch})
     header = f"🔍 <b>{len(batch)} jobs matching your profile</b>"
     if hot_count:
         header += f" · 🔥 {hot_count} hot"
-    header += f"\nSources: {', '.join(sources)}"
+    header += f"\nSources: {', '.join(sources[:4])}"
     send(chat_id, header)
 
-    new_ids = []
+    send_jobs_grouped(chat_id, batch)
+
     for job in batch:
-        send(chat_id, format_job(job))
-        new_ids.append(job["job_id"])
+        mark_sent(chat_id, job["job_id"])
 
-    for jid in new_ids:
-        mark_sent(chat_id, jid)
-
-    send(chat_id,
-        f"✅ <b>That's your batch.</b>\n\nTap below for more anytime.",
-        kb_after_jobs())
+    send(chat_id, "✅ <b>That's your batch.</b> Tap below for more.", kb_after_jobs())
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
 
@@ -343,24 +445,24 @@ def handle_start(chat_id, username, ref_code=None):
         "remote_only": False,
         "company_type": "any",
         "awaiting_keywords": False,
-        "awaiting_cover": False,
         "referrals": existing.get("referrals", 0) if existing else 0,
         "referred_by": existing.get("referred_by") if existing else None,
     })
+    # Referral tracking with basic anti-abuse
     if is_new and ref_code and ref_code.startswith("ref_"):
         try:
             referrer_id = int(ref_code.replace("ref_",""))
-            if referrer_id != chat_id:
+            if referrer_id != chat_id:  # Can't refer yourself
                 update_user(chat_id, {"referred_by": referrer_id})
                 inc_referrals(referrer_id)
                 ref = get_user(referrer_id)
                 count = ref.get("referrals", 0)
                 send(referrer_id,
                     f"🎉 Someone joined using your invite link!\n\n"
-                    f"👥 You've now referred <b>{count}</b> {'person' if count==1 else 'people'}.\n\n"
+                    f"👥 You've referred <b>{count}</b> {'person' if count==1 else 'people'}.\n\n"
                     f"Keep sharing: <code>t.me/{BOT_USERNAME}?start=ref_{referrer_id}</code>")
-        except Exception:
-            pass
+        except Exception as e:
+            log_error("referral", e, chat_id)
     send(chat_id, WELCOME, kb_main())
 
 def handle_status(chat_id):
@@ -394,16 +496,50 @@ def handle_invite(chat_id):
     invite = f"t.me/{BOT_USERNAME}?start=ref_{chat_id}"
     send(chat_id,
         f"👥 <b>Invite Friends to Remote Radar</b>\n\n"
-        f"Share your link and get notified when someone joins!\n\n"
+        f"Share your link — get notified when someone joins!\n\n"
         f"🔗 Your link:\n<code>{invite}</code>\n\n"
         f"📊 People invited: <b>{referrals}</b>\n\n"
-        f"<i>I use this free bot to get daily remote job alerts — no spam, just relevant jobs every morning. "
-        f"Check it out: {invite}</i>")
+        f"<i>Get daily remote job alerts on Telegram — free forever. "
+        f"Setup takes 60 seconds: {invite}</i>")
 
 def handle_stop(chat_id):
     update_user(chat_id, {"active": False})
-    send(chat_id, "⏸ Alerts paused.\n\nTap below to restart.",
+    send(chat_id, "⏸ Alerts paused. Tap below to restart anytime.",
          [[{"text": "▶️ Restart Alerts", "callback_data": "setup_start"}]])
+
+def handle_delete(chat_id):
+    sb_delete(f"users?chat_id=eq.{chat_id}")
+    sb_delete(f"sent_jobs?chat_id=eq.{chat_id}")
+    sb_delete(f"watchlist?chat_id=eq.{chat_id}")
+    send(chat_id,
+        "🗑 Your account and all data have been deleted.\n\n"
+        "Send /start anytime to set up again.")
+
+def handle_watch(chat_id, text):
+    company = text.replace("/watch","").strip()
+    if not company:
+        send(chat_id,
+            "Usage: <code>/watch Coinbase</code>\n\n"
+            "You'll be notified when that company posts new jobs.\n"
+            "Send <code>/unwatch Coinbase</code> to remove.")
+        return
+    sb_post("watchlist", {"chat_id": chat_id, "company": company},
+            prefer="resolution=ignore-duplicates")
+    send(chat_id, f"👁 Now watching <b>{sanitize_text(company)}</b>\n\n"
+                  f"You'll be alerted when they post new jobs.")
+
+def handle_unwatch(chat_id, text):
+    company = text.replace("/unwatch","").strip()
+    if not company:
+        watching = sb_get(f"watchlist?chat_id=eq.{chat_id}&select=company")
+        if not watching:
+            send(chat_id, "You're not watching any companies.")
+            return
+        companies = ", ".join(w["company"] for w in watching)
+        send(chat_id, f"👁 You're watching: <b>{companies}</b>\n\nUse <code>/unwatch [company]</code> to remove.")
+        return
+    sb_delete(f"watchlist?chat_id=eq.{chat_id}&company=eq.{company}")
+    send(chat_id, f"Removed <b>{sanitize_text(company)}</b> from your watchlist.")
 
 def step1(chat_id, msg_id):
     edit(chat_id, msg_id,
@@ -447,12 +583,13 @@ def finish_setup(chat_id, msg_id, ctype, cb_id):
         f"📍 {LOC_LABELS.get(user.get('location_key','worldwide'),'Worldwide')}\n"
         f"🏢 {CTYPE_LABELS.get(ctype,'Any')}\n\n"
         f"💡 Add keywords: <code>/keywords ambassador, kol manager, discord mod</code>\n\n"
-        f"👥 Share with friends:\n<code>{invite}</code>",
+        f"👥 Share: <code>{invite}</code>",
         [[{"text": "🔍 Find Jobs Now", "callback_data": "find_jobs"},
           {"text": "👥 Invite Friends", "callback_data": "invite"}]])
 
 def handle_keywords(chat_id, text):
     keywords = text.replace("/keywords","").strip().lstrip(",").strip()
+    keywords = sanitize_text(keywords)
     if not keywords:
         update_user(chat_id, {"awaiting_keywords": True})
         send(chat_id,
@@ -466,112 +603,121 @@ def handle_keywords(chat_id, text):
     user = get_user(chat_id)
     send_jobs_from_cache(chat_id, user)
 
-def handle_find(chat_id):
-    user = get_user(chat_id)
-    if not user.get("setup_complete"):
-        send(chat_id, "Please set up your preferences first.", kb_main())
-        return
-    send_jobs_from_cache(chat_id, user)
-
-def handle_watch(chat_id, text):
-    company = text.replace("/watch","").strip()
-    if not company:
-        send(chat_id, "Usage: <code>/watch Coinbase</code>\n\nI'll alert you when that company posts new jobs.")
-        return
-    sb_post("watchlist", {"chat_id": chat_id, "company": company},
-            prefer="resolution=ignore-duplicates")
-    send(chat_id, f"👁 Watching <b>{company}</b>\n\nYou'll be notified when they post new jobs.")
-
 # ── Main processor ────────────────────────────────────────────────────────────
 
 def process_update(update):
-    if "message" in update:
-        msg = update["message"]
-        chat_id = msg["chat"]["id"]
-        username = msg.get("from",{}).get("username","")
-        text = msg.get("text","") or ""
+    try:
+        if "message" in update:
+            msg = update["message"]
+            chat_id = msg["chat"]["id"]
+            username = msg.get("from",{}).get("username","")
+            text = msg.get("text","") or ""
 
-        if text and not text.startswith("/"):
-            user = get_user(chat_id)
-            if user.get("awaiting_keywords"):
-                update_user(chat_id, {"keywords": text.strip(), "awaiting_keywords": False})
-                send(chat_id, f"✅ Keywords saved: <b>{text.strip()}</b>")
+            # Handle free-text keyword input
+            if text and not text.startswith("/"):
+                user = get_user(chat_id)
+                if user.get("awaiting_keywords"):
+                    kw = sanitize_text(text.strip())
+                    update_user(chat_id, {"keywords": kw, "awaiting_keywords": False})
+                    send(chat_id, f"✅ Keywords saved: <b>{kw}</b>")
+                    send_jobs_from_cache(chat_id, user)
+                    return
+
+            if text.startswith("/start"):
+                parts = text.split(" ", 1)
+                ref = parts[1].strip() if len(parts) > 1 else None
+                handle_start(chat_id, username, ref)
+            elif text.startswith("/keywords"):
+                handle_keywords(chat_id, text)
+            elif text.startswith("/find"):
+                user = get_user(chat_id)
+                if user.get("setup_complete"):
+                    send_jobs_from_cache(chat_id, user)
+                else:
+                    send(chat_id, "Please set up your preferences first.", kb_main())
+            elif text.startswith("/watch "):
+                handle_watch(chat_id, text)
+            elif text.startswith("/unwatch"):
+                handle_unwatch(chat_id, text)
+            elif text.startswith("/invite") or text.startswith("/refer"):
+                handle_invite(chat_id)
+            elif text.startswith("/stop"):
+                handle_stop(chat_id)
+            elif text.startswith("/delete"):
+                send(chat_id,
+                    "⚠️ This will delete all your data — preferences, history, watchlist.\n\n"
+                    "Are you sure?",
+                    [[{"text": "🗑 Yes, delete everything", "callback_data": "confirm_delete"},
+                      {"text": "Cancel", "callback_data": "status"}]])
+            elif text.startswith("/status"):
+                handle_status(chat_id)
+            elif text.startswith("/setup"):
+                send(chat_id, "Let's update your preferences:", kb_main())
+            elif text.startswith("/help"):
+                send(chat_id,
+                    "📖 <b>Remote Radar Commands</b>\n\n"
+                    "/start — Welcome & setup\n"
+                    "/setup — Change preferences\n"
+                    "/keywords — Add role keywords\n"
+                    "/find — Find jobs right now\n"
+                    "/watch Coinbase — Watch a company\n"
+                    "/unwatch Coinbase — Stop watching\n"
+                    "/invite — Get your invite link\n"
+                    "/status — View preferences\n"
+                    "/stop — Pause alerts\n"
+                    "/delete — Delete your account\n"
+                    "/help — This message\n\n"
+                    "💡 Keyword examples:\n"
+                    "<code>ambassador, kol manager, discord mod</code>")
+
+        elif "callback_query" in update:
+            cb = update["callback_query"]
+            chat_id = cb["from"]["id"]
+            username = cb["from"].get("username","")
+            msg_id = cb["message"]["message_id"]
+            data = cb.get("data","")
+            cb_id = cb["id"]
+
+            if not get_user(chat_id):
+                set_user(chat_id, {"username": username, "active": False, "setup_complete": False})
+
+            if data == "setup_start":
+                answer(cb_id)
+                step1(chat_id, msg_id)
+            elif data == "find_jobs":
+                answer(cb_id, "Searching...")
+                user = get_user(chat_id)
                 send_jobs_from_cache(chat_id, user)
-                return
+            elif data == "invite":
+                answer(cb_id)
+                handle_invite(chat_id)
+            elif data == "add_keywords":
+                answer(cb_id)
+                update_user(chat_id, {"awaiting_keywords": True})
+                send(chat_id,
+                    "✏️ <b>Add Keywords</b>\n\nType your keywords and send:\n\n"
+                    "• <code>moderator, community manager</code>\n"
+                    "• <code>ambassador, kol manager, discord mod</code>")
+            elif data == "status":
+                answer(cb_id)
+                handle_status(chat_id)
+            elif data == "stop":
+                answer(cb_id)
+                handle_stop(chat_id)
+            elif data == "confirm_delete":
+                answer(cb_id)
+                handle_delete(chat_id)
+            elif data.startswith("cat_"):
+                step2(chat_id, msg_id, data.replace("cat_",""), cb_id)
+            elif data.startswith("sen_"):
+                step3(chat_id, msg_id, data.replace("sen_",""), cb_id)
+            elif data.startswith("loc_"):
+                step4(chat_id, msg_id, data.replace("loc_",""), cb_id)
+            elif data.startswith("ctype_"):
+                finish_setup(chat_id, msg_id, data.replace("ctype_",""), cb_id)
 
-        if text.startswith("/start"):
-            parts = text.split(" ", 1)
-            ref = parts[1].strip() if len(parts) > 1 else None
-            handle_start(chat_id, username, ref)
-        elif text.startswith("/keywords"):
-            handle_keywords(chat_id, text)
-        elif text.startswith("/find"):
-            handle_find(chat_id)
-        elif text.startswith("/watch"):
-            handle_watch(chat_id, text)
-        elif text.startswith("/invite") or text.startswith("/refer"):
-            handle_invite(chat_id)
-        elif text.startswith("/stop"):
-            handle_stop(chat_id)
-        elif text.startswith("/status"):
-            handle_status(chat_id)
-        elif text.startswith("/setup"):
-            send(chat_id, "Let's update your preferences:", kb_main())
-        elif text.startswith("/help"):
-            send(chat_id,
-                "📖 <b>Remote Radar Commands</b>\n\n"
-                "/start — Welcome & setup\n"
-                "/setup — Change preferences\n"
-                "/keywords — Add role keywords\n"
-                "/find — Find jobs right now\n"
-                "/watch Coinbase — Watch a company\n"
-                "/invite — Get your invite link\n"
-                "/status — View preferences\n"
-                "/stop — Pause alerts\n"
-                "/help — This message")
-
-    elif "callback_query" in update:
-        cb = update["callback_query"]
-        chat_id = cb["from"]["id"]
-        username = cb["from"].get("username","")
-        msg_id = cb["message"]["message_id"]
-        data = cb.get("data","")
-        cb_id = cb["id"]
-
-        if not get_user(chat_id):
-            set_user(chat_id, {"username": username, "active": False, "setup_complete": False})
-
-        if data == "setup_start":
-            answer(cb_id)
-            step1(chat_id, msg_id)
-        elif data == "find_jobs":
-            answer(cb_id, "Searching...")
-            user = get_user(chat_id)
-            send_jobs_from_cache(chat_id, user)
-        elif data == "invite":
-            answer(cb_id)
-            handle_invite(chat_id)
-        elif data == "add_keywords":
-            answer(cb_id)
-            update_user(chat_id, {"awaiting_keywords": True})
-            send(chat_id,
-                "✏️ <b>Add Keywords</b>\n\nType your keywords and send:\n\n"
-                "• <code>moderator, community manager</code>\n"
-                "• <code>ambassador, kol manager, discord mod</code>")
-        elif data == "status":
-            answer(cb_id)
-            handle_status(chat_id)
-        elif data == "stop":
-            answer(cb_id)
-            handle_stop(chat_id)
-        elif data.startswith("cat_"):
-            step2(chat_id, msg_id, data.replace("cat_",""), cb_id)
-        elif data.startswith("sen_"):
-            step3(chat_id, msg_id, data.replace("sen_",""), cb_id)
-        elif data.startswith("loc_"):
-            step4(chat_id, msg_id, data.replace("loc_",""), cb_id)
-        elif data.startswith("ctype_"):
-            finish_setup(chat_id, msg_id, data.replace("ctype_",""), cb_id)
+    except Exception as e:
+        log_error("process_update", e)
 
 
 class handler(BaseHTTPRequestHandler):
@@ -581,7 +727,7 @@ class handler(BaseHTTPRequestHandler):
         try:
             process_update(json.loads(body))
         except Exception as e:
-            print(f"Webhook error: {e}")
+            log_error("webhook_post", e)
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"OK")
