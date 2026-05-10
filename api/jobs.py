@@ -101,13 +101,19 @@ def is_title_relevant(title, user_keywords, user_category):
         return False
     if any(e in t for e in EXCLUDE_TITLES):
         return False
+
+    # If user set specific keywords, ONLY match those — strict mode
     if user_keywords:
         kws = [k.strip().lower() for k in user_keywords.split(",") if k.strip()]
-        if kws and any(k in t for k in kws):
-            return True
+        if kws:
+            return any(k in t for k in kws)
+
+    # No keywords set — fall back to category matching
     if user_category and user_category != "all":
         cat_kws = CATEGORY_KEYWORDS.get(user_category, [])
         return any(k in t for k in cat_kws)
+
+    # "all" with no keywords — match any known role
     all_kws = [k for kws in CATEGORY_KEYWORDS.values() for k in kws]
     return any(k in t for k in all_kws)
 
