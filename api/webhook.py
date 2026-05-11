@@ -19,9 +19,11 @@ Fixes applied:
   #FB Feedback loop: likes/dislikes influence feed
   #21 FSM bug fix: handle_start no longer resets awaiting_role
   #22 step1_role now uses send() so prompt always arrives
-  #23 FIX: all awaiting_role=True writes now use PATCH (update_user)
-       so the flag is actually saved — was silently failing with sb_post
-       when Supabase has no UNIQUE constraint on chat_id
+  #23 FIX: sb_patch now detects 0-row updates (silent RLS block) and
+       falls back to sb_post upsert. Requires UNIQUE constraint on
+       users.chat_id — run:
+         ALTER TABLE users ADD CONSTRAINT users_chat_id_unique UNIQUE (chat_id);
+       Also ensure SUPABASE_KEY is the service_role key, not anon.
 """
 import os, json, time, requests, re
 from datetime import datetime, timezone, timedelta
@@ -99,13 +101,33 @@ def sb_post(path, body, prefer="resolution=merge-duplicates"):
         logger.error(f"sb_post {path}: {e}")
 
 def sb_patch(path, body):
+    """
+    PATCH with return=representation so we can detect silent 0-row updates.
+    If 0 rows were updated (RLS blocking or row missing), logs a warning
+    and returns False so callers can fall back to upsert.
+    """
     try:
-        r = requests.patch(f"{SUPABASE_URL}/rest/v1/{path}",
-                           headers=_hdr(), json=body, timeout=10)
+        r = requests.patch(
+            f"{SUPABASE_URL}/rest/v1/{path}",
+            headers=_hdr({"Prefer": "return=representation"}),
+            json=body,
+            timeout=10,
+        )
         if r.status_code not in (200, 204):
             logger.sb_error("patch", path, r.status_code, r.text)
+            return False
+        # With return=representation, 200 returns updated rows as JSON array
+        if r.status_code == 200:
+            updated = r.json() if r.text.strip() else []
+            if not updated:
+                logger.warn(f"sb_patch {path}: 0 rows updated — "
+                            f"RLS may be blocking UPDATE or row missing. "
+                            f"Check: SUPABASE_KEY is service_role, not anon.")
+                return False
+        return True
     except Exception as e:
         logger.error(f"sb_patch {path}: {e}")
+        return False
 
 def sb_delete(path):
     try:
@@ -139,7 +161,18 @@ def set_user(chat_id, data):
     sb_post("users", data)
 
 def update_user(chat_id, data):
-    sb_patch(f"users?chat_id=eq.{chat_id}", data)
+    """
+    Try PATCH first. If it updates 0 rows (silent RLS failure), fall back
+    to POST upsert. Upsert requires UNIQUE constraint on users.chat_id —
+    run: ALTER TABLE users ADD CONSTRAINT users_chat_id_unique UNIQUE (chat_id);
+    """
+    ok = sb_patch(f"users?chat_id=eq.{chat_id}", data)
+    if not ok:
+        # Fallback: upsert. Requires UNIQUE constraint on chat_id.
+        upsert_body = dict(data)
+        upsert_body["chat_id"] = chat_id
+        logger.warn(f"update_user {chat_id}: PATCH failed, falling back to upsert")
+        sb_post("users", upsert_body, prefer="resolution=merge-duplicates")
 
 def was_sent(chat_id, job_id):
     r = sb_get(f"sent_jobs?chat_id=eq.{chat_id}&job_id=eq.{job_id}&select=id&limit=1")
@@ -496,10 +529,8 @@ def get_current_step(user):
 
 def _reset_to_step1(chat_id):
     """
-    FIX #23: Always use update_user (PATCH) to set awaiting_role=True.
-    sb_post (upsert) silently fails when Supabase has no UNIQUE constraint
-    on chat_id — it inserts a second row and get_user still returns the
-    original row with awaiting_role=False.
+    Set awaiting_role=True via update_user which tries PATCH first,
+    then falls back to upsert if PATCH updates 0 rows (RLS or missing row).
     """
     update_user(chat_id, {
         "awaiting_role":      True,
@@ -508,6 +539,11 @@ def _reset_to_step1(chat_id):
         "awaiting_ctype":     False,
         "awaiting_keywords":  False,
     })
+    # Verify the write actually landed
+    verify = get_user(chat_id)
+    if not verify.get("awaiting_role"):
+        logger.error(f"_reset_to_step1 {chat_id}: awaiting_role STILL False after write — "
+                     f"check SUPABASE_KEY (needs service_role) and UNIQUE constraint on chat_id")
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
 
@@ -531,7 +567,6 @@ def handle_start(chat_id, username, ref_code=None):
                  [[{"text": "❌ Cancel", "callback_data": "status"}]])
             return
         elif step in ("awaiting_seniority", "awaiting_location", "awaiting_ctype"):
-            # FIX #23: use update_user (PATCH) not sb_post (upsert)
             _reset_to_step1(chat_id)
             send(chat_id,
                  "👋 Let's pick up where you left off.\n\n"
@@ -716,10 +751,6 @@ def handle_search(chat_id, text):
 # ── Onboarding steps ──────────────────────────────────────────────────────────
 
 def step1_role(chat_id, msg_id):
-    # FIX #23: use update_user (PATCH) not sb_post (upsert)
-    # sb_post without a UNIQUE constraint on chat_id inserts a second row;
-    # get_user then returns the OLD row (awaiting_role still False) and
-    # the role text falls through to the "Not sure what you mean" fallback.
     _reset_to_step1(chat_id)
     try:
         edit(chat_id, msg_id, "⚙️ Setting up your alerts...")
@@ -793,8 +824,6 @@ def process_update(update):
             text     = msg.get("text", "") or ""
 
             if text and not text.startswith("/"):
-                # FIX #23: always re-fetch user from DB here — never use
-                # a cached/stale copy — so we see the latest awaiting_* flags.
                 user = get_user(chat_id)
                 logger.info(f"Text from {chat_id}: '{text[:40]}' | "
                             f"awaiting_role={user.get('awaiting_role')} "
@@ -866,7 +895,6 @@ def process_update(update):
                                        "setup_complete": False})
                 step = get_current_step(user) if user else None
                 if step or not (user or {}).get("setup_complete"):
-                    # FIX #23: use update_user (PATCH) not sb_post (upsert)
                     _reset_to_step1(chat_id)
                     send(chat_id,
                          "⚙️ <b>Step 1 of 4 — Your Role</b>\n\nType your role and send 👇",
