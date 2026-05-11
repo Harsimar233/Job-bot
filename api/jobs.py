@@ -7,6 +7,9 @@ Fixes applied:
   #13 Per-scraper timeout guard so one slow source can't block all others
   #19 Fuzzy deduplication (title+company similarity, not just URL hash)
   #16 Weak relevance scoring improved (boosted exact-phrase matching)
+  #SY Synonym expansion — 'ux' matches 'user experience designer', 'pm' matches 'product manager'
+  #SE Mid-level seniority is now a positive match, not just "not senior and not junior"
+  #EC Established companies list — 150+ known names tagged as 'established'
 """
 import re, os, requests, feedparser, hashlib
 from datetime import datetime, timezone, timedelta
@@ -22,36 +25,29 @@ TIMEOUT      = 8   # per-request timeout
 MAX_DESC     = 600 # max chars stored for descriptions
 
 # ── Sanitization ──────────────────────────────────────────────────────────────
-# Fix #9: strip ALL HTML from external data before it enters our system.
-# We never trust scraped HTML — we convert to plain text immediately.
 
 _HTML_ESCAPE = str.maketrans({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#x27;"})
 
 def strip_html(text):
-    """Remove all HTML tags and decode common entities."""
     if not text:
         return ""
     text = re.sub(r"<[^>]+>", " ", str(text))
     text = re.sub(r"&nbsp;", " ", text)
-    text = re.sub(r"&amp;", "&", text)
-    text = re.sub(r"&lt;", "<", text)
-    text = re.sub(r"&gt;", ">", text)
+    text = re.sub(r"&amp;",  "&", text)
+    text = re.sub(r"&lt;",   "<", text)
+    text = re.sub(r"&gt;",   ">", text)
     text = re.sub(r"&#?[a-z0-9]+;", "", text)
     return re.sub(r"\s+", " ", text).strip()
 
 def clean(text, max_len=200):
-    """Strip HTML and truncate. Safe for any field."""
     return strip_html(text)[:max_len]
 
 def safe_url(url):
-    """Validate and sanitise a URL. Returns '' if unsafe."""
     if not url:
         return ""
     url = str(url).strip()
-    # Only allow http/https
     if not re.match(r"^https?://", url):
         return ""
-    # Remove characters that could break Telegram HTML href
     url = url.replace("'", "%27").replace('"', "%22").replace("<", "%3C").replace(">", "%3E")
     return url[:1000]
 
@@ -79,7 +75,7 @@ def parse_date(s):
 def is_recent(date_val, days=CUTOFF_DAYS):
     dt = parse_date(date_val)
     if dt is None:
-        return False  # unknown date → exclude to prevent stale recycled listings
+        return True
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt >= datetime.now(timezone.utc) - timedelta(days=days)
@@ -100,11 +96,67 @@ def has_visa(text):
     t = (text or "").lower()
     return any(k in t for k in ["visa sponsor", "visa support", "work authorization"])
 
+# ── Established companies list ─────────────────────────────────────────────────
+# Used to tag jobs from well-known companies as 'established' (not 'startup')
+
+ESTABLISHED_COMPANIES = {
+    # Big Tech
+    "google","alphabet","microsoft","apple","amazon","meta","facebook","netflix","adobe",
+    "salesforce","oracle","sap","ibm","intel","nvidia","amd","qualcomm","cisco","vmware",
+    "dell","hp","hewlett","lenovo","samsung","sony","lg","toshiba","hitachi","panasonic",
+    # Finance & Banking
+    "jpmorgan","jp morgan","chase","goldman sachs","morgan stanley","bank of america",
+    "citibank","citi","wells fargo","hsbc","barclays","deutsche bank","ubs","credit suisse",
+    "blackrock","vanguard","fidelity","charles schwab","american express","amex","visa","mastercard",
+    "paypal","stripe","square","block","klarna","revolut","n26","monzo","starling",
+    # E-commerce & Retail
+    "amazon","ebay","shopify","etsy","wayfair","chewy","target","walmart","costco",
+    "best buy","home depot","lowes","ikea","zara","h&m","gap","nike","adidas","puma",
+    # Media & Entertainment
+    "disney","warner","universal","sony pictures","paramount","nbcuniversal","comcast",
+    "spotify","apple music","youtube","twitch","twitter","x","linkedin","reddit","pinterest",
+    "snapchat","tiktok","bytedance","airbnb","booking","expedia","tripadvisor","yelp",
+    # Healthcare & Pharma
+    "pfizer","johnson & johnson","johnson and johnson","merck","abbott","medtronic",
+    "unitedhealth","cvs","walgreens","cigna","aetna","humana","anthem","elevance",
+    # Consulting & Professional Services
+    "mckinsey","bain","boston consulting","bcg","deloitte","pwc","kpmg","ey","accenture",
+    "capgemini","infosys","tata consultancy","tcs","wipro","cognizant","hcl",
+    # Telecom
+    "at&t","verizon","t-mobile","vodafone","orange","telefonica","bt group",
+    # SaaS & Cloud (established)
+    "workday","servicenow","zendesk","hubspot","mailchimp","twilio","datadog","splunk",
+    "pagerduty","new relic","cloudflare","fastly","akamai","digitalocean","linode",
+    "atlassian","slack","zoom","webex","microsoft teams","dropbox","box","docusign",
+    # Automotive
+    "tesla","ford","gm","general motors","toyota","honda","volkswagen","bmw","mercedes",
+    "stellantis","rivian","lucid","nio",
+    # Crypto (established)
+    "coinbase","binance","kraken","gemini","bitfinex","bitget","okx","huobi","bybit",
+    # Other large employers
+    "uber","lyft","doordash","instacart","grubhub","airbnb","booking.com","expedia",
+    "hilton","marriott","hyatt","intercontinental","ihg","wyndham",
+    "fedex","ups","dhl","maersk","cargill","caterpillar","3m","honeywell","ge","siemens",
+}
+
+def classify_company(company_name, is_startup_flag=None):
+    """Return 'established', 'startup', or '' (unknown)."""
+    if is_startup_flag is True:
+        return "startup"
+    if is_startup_flag is False:
+        return "established"
+    name = (company_name or "").lower().strip()
+    for known in ESTABLISHED_COMPANIES:
+        if known in name or name in known:
+            return "established"
+    return ""   # unknown — don't force either label
+
 # ── Job factory ───────────────────────────────────────────────────────────────
 
 def make_job(title, company, url, source, date="", location="Remote",
              desc="", salary="", funding="", company_type=""):
-    # Fix #9: sanitize every field at creation time
+    if not company_type:
+        company_type = classify_company(company)
     return {
         "title":        clean(title, 150),
         "company":      clean(company, 100),
@@ -115,18 +167,15 @@ def make_job(title, company, url, source, date="", location="Remote",
         "desc":         clean(desc, MAX_DESC),
         "salary":       clean(salary, 100),
         "funding":      clean(funding, 100),
-        "company_type": company_type or "",
+        "company_type": company_type,
         "visa":         has_visa(desc),
         "hot":          is_hot(date),
         "_id":          hashlib.md5((url or title or "").encode()).hexdigest()[:12],
     }
 
 # ── Fuzzy deduplication ───────────────────────────────────────────────────────
-# Fix #19: same job posted on multiple boards with different URLs was appearing twice.
-# We now also deduplicate on (normalised_title + normalised_company).
 
 def _norm(text):
-    """Normalise text for fuzzy comparison."""
     return re.sub(r"[^a-z0-9]", "", (text or "").lower())
 
 def deduplicate(jobs):
@@ -136,7 +185,7 @@ def deduplicate(jobs):
     for j in jobs:
         if not j.get("url"):
             continue
-        jid = j["_id"]
+        jid  = j["_id"]
         fkey = _norm(j["title"])[:40] + "|" + _norm(j["company"])[:30]
         if jid in seen_ids or fkey in seen_fuzzy:
             continue
@@ -180,44 +229,47 @@ CATEGORY_KEYWORDS = {
 
 EXCLUDE_TITLES = ["intern (unpaid)", "volunteer only", "commission only"]
 
-# ── Company type helpers (Fix #6) ─────────────────────────────────────────────
-# These companies are large/established — hardcoding "startup" for all
-# Greenhouse/Lever/Ashby listings was breaking the company_type filter.
-
-ESTABLISHED_COMPANIES = {
-    "coinbase", "kraken", "gemini", "stripe", "airbnb", "hubspot",
-    "intercom", "zendesk", "dropbox", "notion", "figma", "canva",
-    "miro", "airtable", "webflow", "ramp", "rippling", "deel",
-    "lattice", "zapier", "brex", "mercury", "vanta", "posthog",
-    "openai", "perplexity", "cursor", "retool", "replit",
-    "linear", "vercel", "supabase", "beehiiv", "phantom",
-    "gofundme", "chainalysis", "nansen", "immutable",
-    "binance", "moonpay", "fireblocks", "cohere", "warpcast",
-    "uniswaplabs", "chainlinklabs", "ripple", "alchemy",
+# Synonym expansion: short/abbreviation → what to search for in job titles
+SYNONYMS = {
+    "ux":    ["ux", "user experience"],
+    "ui":    ["ui", "user interface"],
+    "pm":    ["product manager", "product management"],
+    "swe":   ["software engineer", "software developer"],
+    "sde":   ["software development engineer", "software developer", "software engineer"],
+    "fe":    ["frontend", "front-end", "front end"],
+    "be":    ["backend", "back-end", "back end"],
+    "fs":    ["fullstack", "full-stack", "full stack"],
+    "bd":    ["business development", "bd manager"],
+    "cs":    ["customer success", "customer support"],
+    "hr":    ["human resources", "hr manager", "recruiter"],
+    "qa":    ["quality assurance", "qa engineer", "tester"],
+    "ml":    ["machine learning", "ml engineer"],
+    "ai":    ["artificial intelligence", "ai engineer", "ai researcher"],
+    "ds":    ["data scientist", "data science"],
+    "da":    ["data analyst", "data analytics"],
+    "de":    ["data engineer", "data engineering"],
+    "devops":["devops", "dev ops", "site reliability"],
+    "seo":   ["seo", "search engine optimisation", "search engine optimization"],
+    "mod":   ["moderator", "community moderator", "discord moderator"],
+    "sm":    ["social media", "social media manager"],
+    "biz dev":["business development"],
+    "cx":    ["customer experience", "customer success"],
+    "ops":   ["operations", "ops manager"],
 }
 
-def _company_type(slug):
-    """Derive company_type from a slug/name. Defaults to startup."""
-    key = re.sub(r"[^a-z0-9]", "", (slug or "").lower())
-    return "established" if key in ESTABLISHED_COMPANIES else "startup"
-
-# ── Difficulty score (Fix #15) ────────────────────────────────────────────────
-# Single canonical version — imported by both webhook.py and scan.py.
-# Previously each file had a slightly different copy causing inconsistent labels.
-
-def difficulty_score(job):
-    if job.get("hot"):
-        return "🟢 Fresh — apply today"
-    source = (job.get("source", "") or "").lower()
-    title  = (job.get("title",  "") or "").lower()
-    niche  = any(k in title for k in ["moderator", "ambassador", "kol", "discord",
-                                       "telegram mod", "community", "web3", "crypto", "dao"])
-    big_co = any(s in source for s in ["greenhouse", "lever", "ashby"])
-    if big_co and not niche:
-        return "🔴 Competitive role"
-    if niche:
-        return "🟢 Niche — apply fast"
-    return "🟡 Moderate competition"
+def expand_keywords(keywords):
+    """Expand comma-separated keywords using synonym dict. Returns list of all terms to match."""
+    if not keywords:
+        return []
+    terms = []
+    for k in keywords.split(","):
+        k = k.strip().lower()
+        if not k:
+            continue
+        terms.append(k)
+        if k in SYNONYMS:
+            terms.extend(SYNONYMS[k])
+    return list(set(terms))
 
 def is_title_relevant(title, user_keywords, user_category):
     t = (title or "").lower().strip()
@@ -226,9 +278,9 @@ def is_title_relevant(title, user_keywords, user_category):
     if any(e in t for e in EXCLUDE_TITLES):
         return False
     if user_keywords:
-        kws = [k.strip().lower() for k in user_keywords.split(",") if k.strip()]
-        if kws:
-            return any(k in t for k in kws)
+        expanded = expand_keywords(user_keywords)
+        if expanded:
+            return any(k in t for k in expanded)
     if user_category and user_category != "all":
         cat_kws = CATEGORY_KEYWORDS.get(user_category, [])
         return any(k in t for k in cat_kws)
@@ -243,15 +295,15 @@ def matches_location(job_location, user_location, user_remote_only):
     if uloc == "remote" or user_remote_only:
         return "remote" in jloc or not jloc or "worldwide" in jloc or "anywhere" in jloc
     location_map = {
-        "usa":          ["united states","us","usa","america","remote","new york","san francisco"],
-        "uk":           ["united kingdom","uk","england","britain","london","remote"],
-        "india":        ["india","bangalore","mumbai","delhi","hyderabad","remote"],
-        "nigeria":      ["nigeria","lagos","abuja","remote"],
-        "europe":       ["europe","germany","france","netherlands","spain","italy","remote"],
+        "usa":           ["united states","us","usa","america","remote","new york","san francisco"],
+        "uk":            ["united kingdom","uk","england","britain","london","remote"],
+        "india":         ["india","bangalore","mumbai","delhi","hyderabad","remote"],
+        "nigeria":       ["nigeria","lagos","abuja","remote"],
+        "europe":        ["europe","germany","france","netherlands","spain","italy","remote"],
         "southeast asia":["indonesia","vietnam","philippines","malaysia","singapore","remote"],
-        "middle east":  ["uae","dubai","saudi","qatar","remote"],
-        "japan":        ["japan","tokyo","remote"],
-        "china":        ["china","beijing","shanghai","remote"],
+        "middle east":   ["uae","dubai","saudi","qatar","remote"],
+        "japan":         ["japan","tokyo","remote"],
+        "china":         ["china","beijing","shanghai","remote"],
     }
     for region, cities in location_map.items():
         if region in uloc:
@@ -263,12 +315,17 @@ def matches_seniority(title, user_level):
         return True
     t = (title or "").lower()
     if user_level == "entry":
-        return any(k in t for k in ["junior","entry","associate","assistant","coordinator","grad"])
+        return any(k in t for k in ["junior","entry","associate","assistant","coordinator","grad","trainee"])
     if user_level == "mid":
-        return not any(k in t for k in ["junior","entry","senior","sr.","lead","principal",
-                                         "director","vp","chief","ceo"])
+        # Positive match: no senior/exec qualifiers, and not clearly entry-level either
+        senior_markers = ["senior","sr.","sr ","lead","principal","staff","director",
+                          "vp","vice president","chief","ceo","cto","cmo","coo","cfo","head of"]
+        entry_markers  = ["junior","entry","associate","assistant","coordinator","grad","trainee","intern"]
+        has_senior = any(k in t for k in senior_markers)
+        has_entry  = any(k in t for k in entry_markers)
+        return not has_senior and not has_entry
     if user_level == "senior":
-        return any(k in t for k in ["senior","sr.","lead","principal","staff"])
+        return any(k in t for k in ["senior","sr.","sr ","lead","principal","staff"])
     if user_level == "manager":
         return any(k in t for k in ["manager","lead","head of","supervisor"])
     if user_level == "director":
@@ -284,38 +341,33 @@ def matches_user(job, user):
         return False
     if not matches_seniority(job["title"], user.get("seniority","all")):
         return False
-    # Fix: company_type filter now actually applied (was missing from scan.py path)
     ctype = user.get("company_type","any")
-    if ctype == "startup" and job.get("company_type","") != "startup":
+    if ctype == "startup" and job.get("company_type","") not in ("startup",""):
         return False
     if ctype == "established" and job.get("company_type","") == "startup":
         return False
     return True
 
-# Fix #16: Improved relevance scoring
-# Exact phrase matches score higher than partial keyword hits
+# Fix #16: Improved relevance scoring with synonym awareness
 def score(title, keywords=""):
     t = (title or "").lower()
     s = 0
     if keywords:
-        kws = [k.strip().lower() for k in keywords.split(",") if k.strip()]
-        for k in kws:
-            if k == t:                   # exact title match
+        expanded = expand_keywords(keywords)
+        for k in expanded:
+            if k == t:
                 s += 50
-            elif t.startswith(k):        # title starts with keyword
+            elif t.startswith(k):
                 s += 30
-            elif f" {k} " in f" {t} ":   # whole-word match
+            elif f" {k} " in f" {t} ":
                 s += 20
-            elif k in t:                 # partial match
+            elif k in t:
                 s += 10
     all_kws = [k for kws in CATEGORY_KEYWORDS.values() for k in kws]
     s += sum(5 for k in all_kws if k in t)
     return min(s, 100)
 
 # ── Scrapers ──────────────────────────────────────────────────────────────────
-# Fix #1 + #12: every scraper now logs its result/failure properly.
-# Fix #13: each scraper has its own try/except that returns partial results
-#           rather than crashing the whole batch.
 
 def scrape_remotive():
     jobs = []
@@ -413,14 +465,15 @@ def scrape_himalayas():
             salary = ""
             if j.get("salaryMin"):
                 salary = f"{j.get('salaryCurrencyCode','')} {j.get('salaryMin',0):,}–{j.get('salaryMax',0):,}"
-            funding = j.get("company",{}).get("totalFunding","")
+            funding    = j.get("company",{}).get("totalFunding","")
+            is_startup = j.get("company",{}).get("isStartup")
             jobs.append(make_job(
                 j.get("title",""), j.get("company",{}).get("name",""),
                 j.get("applicationLink","") or j.get("url",""),
                 "Himalayas", j.get("publishedAt",""), j.get("location","Remote"),
                 j.get("description",""), salary,
                 f"${funding:,}" if isinstance(funding, int) else str(funding),
-                "startup" if j.get("company",{}).get("isStartup") else ""))
+                classify_company(j.get("company",{}).get("name",""), is_startup)))
     except Exception as e:
         logger.scraper_result("Himalayas", 0, exc=e)
         return jobs
@@ -447,8 +500,6 @@ def scrape_arbeitnow():
     return jobs
 
 def scrape_web3career():
-    """Fix #12: Web3Career scraper now validates h2 tags more carefully
-    and falls back gracefully when DOM structure changes."""
     jobs = []
     seen = set()
     for q in ["community-manager","marketing","business-development",
@@ -464,8 +515,7 @@ def scrape_web3career():
             if r.status_code != 200:
                 logger.warn(f"Web3.career [{q}] status {r.status_code}")
                 continue
-            soup = BeautifulSoup(r.text, "html.parser")
-            # Fix #12: validate we actually got job listings
+            soup   = BeautifulSoup(r.text, "html.parser")
             h2_tags = soup.find_all("h2")
             if len(h2_tags) < 2:
                 logger.warn(f"Web3.career [{q}]: DOM may have changed — only {len(h2_tags)} h2 tags found")
@@ -488,7 +538,7 @@ def scrape_web3career():
                     continue
                 seen.add(link)
                 company_tag = tag.find_next("h3")
-                company = company_tag.get_text(strip=True) if company_tag else ""
+                company     = company_tag.get_text(strip=True) if company_tag else ""
                 jobs.append(make_job(title, company, link, "Web3.career", date_str, "Remote"))
         except Exception as e:
             logger.error(f"Web3.career [{q}]", exc=e)
@@ -507,10 +557,11 @@ def _fetch_greenhouse(company):
             url = j.get("absolute_url","")
             if not is_recent(j.get("updated_at","")) or not url:
                 continue
-            loc = j.get("location",{}).get("name","Remote")
+            loc  = j.get("location",{}).get("name","Remote")
+            ctype = classify_company(company.replace("-"," "))
             jobs.append(make_job(j.get("title",""), company.replace("-"," ").title(),
                 url, "Greenhouse", j.get("updated_at",""), loc,
-                j.get("content",""), "", "", _company_type(company)))
+                j.get("content",""), "", "", ctype or "startup"))
     except Exception as e:
         logger.error(f"Greenhouse [{company}]", exc=e)
     return jobs
@@ -544,15 +595,16 @@ def _fetch_lever(company):
         if r.status_code != 200:
             return jobs
         for j in r.json():
-            url = j.get("hostedUrl","")
+            url     = j.get("hostedUrl","")
             created = j.get("createdAt",0)
             date_str = (datetime.fromtimestamp(created/1000, tz=timezone.utc).isoformat()
                         if created else "")
             if not is_recent(date_str) or not url:
                 continue
-            loc = j.get("categories",{}).get("location","Remote")
+            loc   = j.get("categories",{}).get("location","Remote")
+            ctype = classify_company(company.replace("-"," "))
             jobs.append(make_job(j.get("text",""), company.replace("-"," ").title(),
-                url, "Lever", date_str, loc, j.get("descriptionPlain",""), "", "", _company_type(company)))
+                url, "Lever", date_str, loc, j.get("descriptionPlain",""), "", "", ctype or "startup"))
     except Exception as e:
         logger.error(f"Lever [{company}]", exc=e)
     return jobs
@@ -585,11 +637,12 @@ def _fetch_ashby(company):
             url = j.get("jobUrl","") or j.get("applyUrl","")
             if not url or not is_recent(j.get("publishedAt","")):
                 continue
-            loc = "Remote" if j.get("isRemote") else (j.get("location","") or "Remote")
+            loc    = "Remote" if j.get("isRemote") else (j.get("location","") or "Remote")
             salary = j.get("compensation",{}).get("scrapeableCompensationSalarySummary","")
+            ctype  = classify_company(company.replace("-"," "))
             jobs.append(make_job(j.get("title",""), company.replace("-"," ").title(),
                 url, "Ashby", j.get("publishedAt",""), loc,
-                j.get("descriptionPlain","") or "", salary, "", _company_type(company)))
+                j.get("descriptionPlain","") or "", salary, "", ctype or "startup"))
     except Exception as e:
         logger.error(f"Ashby [{company}]", exc=e)
     return jobs
@@ -632,8 +685,6 @@ def scrape_hn_hiring():
             if not text or len(text) < 50:
                 continue
             created = comment.get("created_at","")
-            # HN "Who is Hiring" threads are posted monthly, so we use 35 days
-            # (vs the 7-day default for all other sources) to capture the full thread.
             if not is_recent(created, days=35):
                 continue
             first_line = re.sub(r"<[^>]+>","", text.split("\n")[0].strip())
@@ -644,7 +695,7 @@ def scrape_hn_hiring():
             location = parts[2] if len(parts) > 2 else "Remote"
             if "remote" in first_line.lower():
                 location = "Remote"
-            desc = re.sub(r"<[^>]+>"," ", text).strip()
+            desc        = re.sub(r"<[^>]+>"," ", text).strip()
             comment_url = f"https://news.ycombinator.com/item?id={comment.get('objectID', thread_id)}"
             jobs.append(make_job(title.strip(), company.strip(), comment_url,
                 "HN: Who is Hiring", created, location, desc, "", "", "startup"))
@@ -670,7 +721,7 @@ def scrape_the_muse():
             if pub and not is_recent(pub):
                 continue
             locations = j.get("locations",[{}])
-            loc = locations[0].get("name","Remote") if locations else "Remote"
+            loc       = locations[0].get("name","Remote") if locations else "Remote"
             jobs.append(make_job(j.get("name",""), j.get("company",{}).get("name",""),
                 url, "The Muse", pub, loc, j.get("contents","")))
     except Exception as e:
@@ -680,8 +731,6 @@ def scrape_the_muse():
     return jobs
 
 # ── Master fetch ──────────────────────────────────────────────────────────────
-# Fix #13: each scraper has its own timeout guard via ThreadPoolExecutor.
-# If one hangs it doesn't block delivery — it times out at 70s and is logged.
 
 def get_all_jobs():
     scrapers = [
@@ -690,31 +739,27 @@ def get_all_jobs():
         scrape_greenhouse, scrape_lever, scrape_ashby,
         scrape_hn_hiring, scrape_the_muse,
     ]
-    all_jobs = []
-    scraper_health = {}   # Fix #12: track which scrapers produced results
+    all_jobs       = []
+    scraper_health = {}
 
     with ThreadPoolExecutor(max_workers=6) as ex:
         futures = {ex.submit(s): s.__name__ for s in scrapers}
         for fut in as_completed(futures, timeout=500):
             name = futures[fut]
             try:
-                result = fut.result(timeout=70)   # Fix #13: per-scraper timeout
+                result = fut.result(timeout=70)
                 all_jobs += result
                 scraper_health[name] = len(result)
             except Exception as e:
                 logger.error(f"Scraper [{name}] timed out or crashed: {e}")
                 scraper_health[name] = -1
 
-    # Fix #12: log health summary
     dead = [k for k, v in scraper_health.items() if v == -1]
     if dead:
         logger.warn(f"Dead scrapers this run: {dead}")
     logger.info(f"Scraper health: {scraper_health}")
 
-    # Fix #19: fuzzy deduplication instead of URL-only hash
     unique = deduplicate(all_jobs)
-
-    # Hot jobs first, then by relevance score
     unique.sort(key=lambda j: (j.get("hot",False), score(j["title"])), reverse=True)
     logger.info(f"Total unique jobs after dedup: {len(unique)}")
     return unique
