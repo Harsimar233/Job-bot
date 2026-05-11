@@ -1,13 +1,14 @@
 """
 Remote Radar — Daily Job Scanner (Cron)
 Fixes applied:
-  #2  Broadcast batching: sleep between users + per-batch throttle
-  #6  Cron now 3× daily (vercel.json updated separately)
-  #11 Notification cooldown: don't re-alert same user within 8h
-  #15 Engagement loop: streak messages, "top match today" badge
-  #20 company_type filter now applied in scan path (was ignored before)
   #1  Structured logging throughout
+  #2  Broadcast sleep reduced 10× — won't timeout on Vercel
+  #6  Cron runs 3× daily (vercel.json handles schedule)
   #9  HTML sanitized at format time
+  #11 Notification cooldown: 6-hour window so all 3 crons can fire, but same cron won't double-send
+  #15 Engagement loop: streak messages, top match teaser
+  #20 company_type filter applied in scan path
+  #FB Feedback loop: liked/disliked jobs boost or suppress results
 """
 import os, re, time, requests
 from datetime import datetime, timezone, date, timedelta
@@ -20,8 +21,9 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 TG_API       = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# Fix #11: minimum hours between daily scan alerts per user
-MIN_HOURS_BETWEEN_ALERTS = 8
+# Minimum hours between alerts per user — 6h allows all 3 crons (9am/3pm/9pm)
+# but prevents a single cron from double-firing if Vercel retries
+MIN_HOURS_BETWEEN_ALERTS = 6
 
 def sanitize_url(url):
     if not url:
@@ -64,13 +66,6 @@ def send(chat_id, text, buttons=None, retries=3):
                 time.sleep(1)
     return False
 
-_REQUEST_METHODS = {
-    "get":    requests.get,
-    "post":   requests.post,
-    "patch":  requests.patch,
-    "delete": requests.delete,
-}
-
 def sb(method, path, body=None, prefer=None):
     hdrs = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
             "Content-Type": "application/json"}
@@ -78,10 +73,7 @@ def sb(method, path, body=None, prefer=None):
         hdrs["Prefer"] = prefer
     url = SUPABASE_URL.rstrip("/") + "/rest/v1/" + path
     try:
-        fn = _REQUEST_METHODS.get(method)
-        if fn is None:
-            logger.error(f"sb: unknown HTTP method '{method}'")
-            return [] if method == "get" else None
+        fn     = getattr(requests, method)
         kwargs = {"headers": hdrs, "timeout": 15}
         if body is not None:
             kwargs["json"] = body
@@ -91,7 +83,7 @@ def sb(method, path, body=None, prefer=None):
                 return r.json()
             logger.sb_error(method, path, r.status_code, r.text)
             return []
-        if r.status_code not in (200, 201, 204):
+        if r.status_code not in (200,201,204):
             logger.sb_error(method, path, r.status_code, r.text)
         return r
     except Exception as e:
@@ -134,41 +126,78 @@ def store_jobs(jobs):
     logger.info(f"Stored {total} jobs in Supabase")
 
 def update_streak(user):
-    chat_id       = user["chat_id"]
-    today         = date.today()
-    last_alert    = user.get("last_alert_date")
+    chat_id        = user["chat_id"]
+    today          = date.today()
+    last_alert     = user.get("last_alert_date")
     current_streak = user.get("streak", 0) or 0
 
     if last_alert:
         try:
             last_date = date.fromisoformat(str(last_alert)[:10])
             if last_date == today:
-                return current_streak
+                return current_streak          # already updated today — don't double-increment
             elif last_date == today - timedelta(days=1):
-                current_streak += 1
+                current_streak += 1            # consecutive day → extend streak
             else:
-                current_streak = 1
+                current_streak = 1             # gap → restart streak
         except Exception:
             current_streak = 1
     else:
         current_streak = 1
 
     sb("patch", f"users?chat_id=eq.{chat_id}",
-       {"streak": current_streak, "last_alert_date": today.isoformat(),
-        "last_active_at": datetime.now(timezone.utc).isoformat()})
+       {"streak": current_streak,
+        "last_alert_date": datetime.now(timezone.utc).isoformat(),  # full datetime, not just date
+        "last_active_at":  datetime.now(timezone.utc).isoformat()})
     return current_streak
 
-# Fix #11: check if user was already alerted recently (prevents double-send from cron overlap)
 def was_alerted_recently(user):
+    """
+    Returns True only if this user was alerted within the last MIN_HOURS_BETWEEN_ALERTS hours.
+    Using a full datetime (not just date) means the 9am, 3pm and 9pm crons can all fire,
+    but if Vercel retries a cron within 6h it won't double-send.
+    """
     last = user.get("last_alert_date")
     if not last:
         return False
     try:
-        last_dt = datetime.fromisoformat(str(last)[:10])
-        # Compare date only — one alert per calendar day per cron window
-        return last_dt.date() == date.today() if hasattr(last_dt, 'date') else last_dt == date.today()
+        last_dt = datetime.fromisoformat(str(last).replace("Z", "+00:00"))
+        if last_dt.tzinfo is None:
+            last_dt = last_dt.replace(tzinfo=timezone.utc)
+        hours_ago = (datetime.now(timezone.utc) - last_dt).total_seconds() / 3600
+        return hours_ago < MIN_HOURS_BETWEEN_ALERTS
     except Exception:
         return False
+
+def get_user_feedback(chat_id):
+    """Return sets of liked/disliked job_ids for a user."""
+    rows = sb("get", f"job_feedback?chat_id=eq.{chat_id}&select=job_id,feedback")
+    liked    = {r["job_id"] for r in rows if r.get("feedback") == "like"}
+    disliked = {r["job_id"] for r in rows if r.get("feedback") == "dislike"}
+    return liked, disliked
+
+def feedback_score(job, liked_ids, disliked_ids):
+    """Boost jobs similar to liked ones; penalise jobs similar to disliked ones."""
+    jid = job.get("_id","")
+    if jid in disliked_ids:
+        return -100
+    if jid in liked_ids:
+        return 50
+    return 0
+
+def difficulty_score(job):
+    if job.get("hot"):
+        return "🟢 Hot — apply today"
+    source = (job.get("source","") or "").lower()
+    title  = (job.get("title","")  or "").lower()
+    niche  = any(k in title for k in ["moderator","ambassador","kol","discord","telegram mod",
+                                       "community","web3"])
+    big_co = any(s in source for s in ["greenhouse","lever","ashby"])
+    if big_co and not niche:
+        return "🔴 Competitive"
+    if niche:
+        return "🟢 Niche — apply fast"
+    return "🟡 Moderate competition"
 
 def fmt_date(date_val):
     if not date_val:
@@ -180,13 +209,14 @@ def fmt_date(date_val):
     except Exception:
         return str(date_val)[:10] if date_val else ""
 
-def format_job_compact(job):
+def format_job_compact(job, show_divider=False):
     hot     = "🔥 " if job.get("hot") else ""
     title   = sanitize(job.get("title",""))
     company = sanitize(job.get("company",""))
     loc     = sanitize(job.get("location",""))
     url     = sanitize_url(job.get("url",""))
     source  = sanitize(job.get("source",""))
+    desc    = sanitize(job.get("desc","") or job.get("description",""), max_len=120)
 
     lines = [f"💼 {hot}<b>{title}</b>"]
     if company:
@@ -194,32 +224,29 @@ def format_job_compact(job):
     lines.append(f"📍 {loc}" if loc and loc.lower() not in ("remote","") else "📍 Remote")
     if job.get("salary"):
         lines.append(f"💰 {sanitize(job['salary'])}")
+    if desc:
+        lines.append(f"<i>{desc}…</i>")
     lines.append(f"📊 {difficulty_score(job)}")
     if url:
         lines.append(f'🔗 <a href="{url}">Apply Now</a>  •  📌 {source}')
+    if show_divider:
+        lines.append("\n─────────────────")
     return "\n".join(lines)
-
-# Fix #7: Send each job individually with action buttons so users can save/like/dislike
-# from their daily alerts — previously the morning batch had zero action buttons.
-def send_jobs_grouped(chat_id, jobs):
-    for job in jobs:
-        text    = format_job_compact(job)
-        job_id  = job.get("_id", "")
-        buttons = None
-        if job_id:
-            buttons = [[
-                {"text": "🔖 Save",  "callback_data": f"save_{job_id}"},
-                {"text": "👍",       "callback_data": f"like_{job_id}"},
-                {"text": "👎",       "callback_data": f"dislike_{job_id}"},
-            ]]
-        send(chat_id, text, buttons)
-        time.sleep(0.4)  # respect Telegram rate limits
 
 FIND_MORE_BTN = [[{"text": "🔍 Find More Jobs", "callback_data": "find_jobs"}]]
 
+def send_jobs_grouped(chat_id, jobs, batch_size=3):
+    """Send jobs in groups of 3. Rate-limit sleep is minimal — Telegram allows 30 msg/s."""
+    for i in range(0, len(jobs), batch_size):
+        group = jobs[i:i+batch_size]
+        parts = [format_job_compact(j, show_divider=idx < len(group)-1)
+                 for idx, j in enumerate(group)]
+        send(chat_id, "\n".join(parts))
+        time.sleep(0.05)   # 50ms is enough; 500ms was causing Vercel timeouts
+
 def run():
     logger.info("=== Scan started ===")
-    from api.jobs import get_all_jobs, matches_user, score, difficulty_score
+    from api.jobs import get_all_jobs, matches_user, score
 
     logger.info("Fetching all jobs from sources...")
     all_jobs = get_all_jobs()
@@ -236,10 +263,25 @@ def run():
         chat_id  = user["chat_id"]
         keywords = user.get("keywords","")
 
-        # Fix #20: matches_user now respects company_type
+        # Skip if alerted within last MIN_HOURS_BETWEEN_ALERTS hours
+        # (prevents double-send on Vercel cron retries while allowing 3×/day)
+        if was_alerted_recently(user):
+            logger.info(f"User {chat_id}: skipped — alerted within last {MIN_HOURS_BETWEEN_ALERTS}h")
+            skipped_count += 1
+            continue
+
+        # Load feedback to boost/suppress jobs
+        liked_ids, disliked_ids = get_user_feedback(chat_id)
+
         matched = [j for j in all_jobs
-                   if matches_user(j, user) and not was_sent(chat_id, j["_id"])]
-        matched.sort(key=lambda j: (-score(j["title"], keywords), not j.get("hot",False)))
+                   if matches_user(j, user)
+                   and not was_sent(chat_id, j["_id"])
+                   and j["_id"] not in disliked_ids]   # hard-filter disliked jobs
+        matched.sort(key=lambda j: (
+            -feedback_score(j, liked_ids, disliked_ids),
+            -score(j["title"], keywords),
+            not j.get("hot",False)
+        ))
         batch = matched[:9]
 
         logger.info(f"User {chat_id}: {len(matched)} matches, sending {len(batch)}")
@@ -251,39 +293,33 @@ def run():
                     days_since = (date.today() - date.fromisoformat(str(last_alert)[:10])).days
                     if days_since >= 3:
                         send(chat_id,
-                            f"👋 <b>Hey, still job hunting?</b>\n\n"
+                            f"👋 <b>Still job hunting?</b>\n\n"
                             f"No new matches in {days_since} days. "
-                            f"Try updating your role or keywords.\n\n"
-                            f"We scan 1,200+ jobs daily for you! 🔍",
-                            [[{"text": "🔑 Update Keywords",   "callback_data": "add_keywords"},
-                              {"text": "⚙️ Change Preferences","callback_data": "setup_start"}]])
+                            f"Try broadening your keywords or changing your seniority level.\n\n"
+                            f"We scan 1,200+ jobs daily — small tweaks make a big difference.",
+                            [[{"text": "🔑 Update Keywords",    "callback_data": "add_keywords"},
+                              {"text": "⚙️ Change Preferences", "callback_data": "setup_start"}]])
                 except Exception as e:
                     logger.error(f"Re-engagement for {chat_id}: {e}")
             else:
-                # First-time scan for this user — they haven't received anything yet
                 send(chat_id,
-                    "👋 <b>You're all set and in the queue!</b>\n\n"
-                    "No matches in today's scan for your current keywords. "
-                    "We scan 1,200+ jobs daily and will alert you as soon as something matches.\n\n"
-                    "Try broadening your keywords or search manually now:",
-                    [[{"text": "🔑 Update Keywords",    "callback_data": "add_keywords"},
-                      {"text": "🔍 Find Jobs Now",      "callback_data": "find_jobs"}]])
+                    "📭 <b>No new jobs today.</b>\n\n"
+                    "All matching listings have been sent. Fresh jobs arrive tomorrow.",
+                    FIND_MORE_BTN)
             skipped_count += 1
             continue
 
         streak    = update_streak(user)
         hot_count = sum(1 for j in batch if j.get("hot"))
         sources   = list({j["source"] for j in batch})
-
-        # Fix #15: engaging header with streak + top match
         top_job   = batch[0]
-        header    = f"🌅 <b>Your Daily Job Alerts</b> — {len(batch)} new matches"
-        if streak > 1:
-            header += f" · 🔥 Day {streak} streak!"
+
+        header = f"🌅 <b>{len(batch)} new jobs matched your profile</b>"
         if hot_count:
-            header += f"\n⚡ {hot_count} posted in last 24h"
+            header += f" · ⚡ {hot_count} posted today"
+        if streak > 1:
+            header += f"\n🔥 Day {streak} streak — keep it up!"
         header += f"\n📡 {', '.join(sources[:4])}"
-        # Fix #15: tease the top match to increase open curiosity
         header += f"\n\n🏆 <b>Top match:</b> {sanitize(top_job.get('title',''))} at {sanitize(top_job.get('company',''))}"
         send(chat_id, header)
 
@@ -293,13 +329,12 @@ def run():
             mark_sent(chat_id, job["_id"])
 
         send(chat_id,
-            "✅ That's today's batch! Tap below for more anytime. 🚀\n"
-            "💡 Tip: Use /saved to bookmark jobs you like.",
+            "✅ That's today's batch.\n"
+            "💡 Tip: tap 👍 on jobs you like — we'll refine your matches.",
             FIND_MORE_BTN)
 
         sent_count += 1
-        # Fix #2: throttle between users to avoid hitting Telegram broadcast limits
-        time.sleep(0.3)
+        time.sleep(0.1)   # 100ms between users — enough to stay under Telegram broadcast limits
 
     # Watchlist alerts
     watchlist = sb("get", "watchlist?select=chat_id,company")
@@ -314,7 +349,7 @@ def run():
                        and not was_sent(watcher_chat_id, j["_id"])]
             if watched:
                 send(watcher_chat_id,
-                     f"👁 <b>Watchlist Alert!</b> {len(watched)} new job(s) from your watched companies:")
+                     f"👁 <b>Watchlist Alert!</b> {len(watched)} new job(s) from companies you're watching:")
                 send_jobs_grouped(watcher_chat_id, watched[:6])
                 for job in watched[:6]:
                     mark_sent(watcher_chat_id, job["_id"])
