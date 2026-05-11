@@ -16,9 +16,12 @@ Fixes applied:
   #17 /unwatch command to remove watchlist entries
   #18 Pagination: /find returns 5 jobs + "Load more" button
   #SH /search command for one-off search without changing profile
-  #FB Feedback loop: 👍👎 actually influences what you see next
+  #FB Feedback loop: likes/dislikes influence feed
   #21 FSM bug fix: handle_start no longer resets awaiting_role
   #22 step1_role now uses send() so prompt always arrives
+  #23 FIX: all awaiting_role=True writes now use PATCH (update_user)
+       so the flag is actually saved — was silently failing with sb_post
+       when Supabase has no UNIQUE constraint on chat_id
 """
 import os, json, time, requests, re
 from datetime import datetime, timezone, timedelta
@@ -265,7 +268,6 @@ def fmt_date(date_val):
             return ""
 
 def format_job_card(job, show_actions=True):
-    """Full job card with action buttons — used for /find and /search flows."""
     hot     = "🔥 " if job.get("hot") else ""
     title   = sanitize(job.get("title", ""))
     company = sanitize(job.get("company", ""))
@@ -404,10 +406,6 @@ def job_matches_user(job, user):
         return False
 
 def send_jobs_from_cache(chat_id, user, page=0, keyword_override=None):
-    """
-    Fetch and send matching jobs from cache.
-    keyword_override: if set (from /search), use these keywords instead of profile keywords.
-    """
     if not check_rate_limit(chat_id):
         send(chat_id, f"⏳ Please wait {FIND_COOLDOWN}s between searches.")
         return
@@ -427,11 +425,9 @@ def send_jobs_from_cache(chat_id, user, page=0, keyword_override=None):
     from api.jobs import score
     keywords = keyword_override or user.get("keywords", "")
 
-    # Apply feedback: suppress disliked jobs, boost liked ones
     liked_ids, disliked_ids = get_user_feedback(chat_id)
 
     if keyword_override:
-        # /search mode: filter by the override keyword only, ignore profile filters
         matched = [j for j in cached
                    if keyword_override.lower() in (j.get("title","") or "").lower()
                    and j.get("job_id","") not in disliked_ids]
@@ -498,6 +494,21 @@ def get_current_step(user):
             return step
     return None
 
+def _reset_to_step1(chat_id):
+    """
+    FIX #23: Always use update_user (PATCH) to set awaiting_role=True.
+    sb_post (upsert) silently fails when Supabase has no UNIQUE constraint
+    on chat_id — it inserts a second row and get_user still returns the
+    original row with awaiting_role=False.
+    """
+    update_user(chat_id, {
+        "awaiting_role":      True,
+        "awaiting_seniority": False,
+        "awaiting_location":  False,
+        "awaiting_ctype":     False,
+        "awaiting_keywords":  False,
+    })
+
 # ── Handlers ──────────────────────────────────────────────────────────────────
 
 def handle_start(chat_id, username, ref_code=None):
@@ -520,9 +531,8 @@ def handle_start(chat_id, username, ref_code=None):
                  [[{"text": "❌ Cancel", "callback_data": "status"}]])
             return
         elif step in ("awaiting_seniority", "awaiting_location", "awaiting_ctype"):
-            sb_post("users", {"chat_id": chat_id, "awaiting_role": True,
-                               "awaiting_seniority": False, "awaiting_location": False,
-                               "awaiting_ctype": False, "awaiting_keywords": False})
+            # FIX #23: use update_user (PATCH) not sb_post (upsert)
+            _reset_to_step1(chat_id)
             send(chat_id,
                  "👋 Let's pick up where you left off.\n\n"
                  "<b>Step 1 of 4 — Your Role</b>\n\nType your role and send 👇",
@@ -690,7 +700,6 @@ def handle_keywords(chat_id, text):
     send_jobs_from_cache(chat_id, user)
 
 def handle_search(chat_id, text):
-    """One-off search without changing the user's saved profile."""
     query = sanitize(text.replace("/search", "").strip(), max_len=150)
     if not query:
         update_user(chat_id, {"awaiting_search": True})
@@ -707,14 +716,11 @@ def handle_search(chat_id, text):
 # ── Onboarding steps ──────────────────────────────────────────────────────────
 
 def step1_role(chat_id, msg_id):
-    sb_post("users", {
-        "chat_id":            chat_id,
-        "awaiting_role":      True,
-        "awaiting_seniority": False,
-        "awaiting_location":  False,
-        "awaiting_ctype":     False,
-        "awaiting_keywords":  False,
-    })
+    # FIX #23: use update_user (PATCH) not sb_post (upsert)
+    # sb_post without a UNIQUE constraint on chat_id inserts a second row;
+    # get_user then returns the OLD row (awaiting_role still False) and
+    # the role text falls through to the "Not sure what you mean" fallback.
+    _reset_to_step1(chat_id)
     try:
         edit(chat_id, msg_id, "⚙️ Setting up your alerts...")
     except Exception:
@@ -732,7 +738,7 @@ def step1_role(chat_id, msg_id):
          [[{"text": "❌ Cancel", "callback_data": "status"}]])
 
 def step2_seniority(chat_id, role):
-    update_user(chat_id, {"awaiting_role": False})
+    update_user(chat_id, {"awaiting_role": False, "awaiting_seniority": True})
     send(chat_id,
          f"✅ Role: <b>{sanitize(role)}</b>\n\n"
          f"⚙️ <b>Step 2 of 4 — Level</b>\n\nWhat seniority are you targeting?",
@@ -740,7 +746,8 @@ def step2_seniority(chat_id, role):
 
 def step3_location(chat_id, msg_id, seniority, cb_id):
     answer(cb_id, f"✅ {SEN_LABELS.get(seniority, seniority)}")
-    update_user(chat_id, {"seniority": seniority})
+    update_user(chat_id, {"seniority": seniority, "awaiting_seniority": False,
+                           "awaiting_location": True})
     edit(chat_id, msg_id,
          f"✅ Level: {SEN_LABELS.get(seniority, seniority)}\n\n"
          f"⚙️ <b>Step 3 of 4 — Location</b>\n\nWhere are you looking to work?",
@@ -750,7 +757,8 @@ def step4_company_type(chat_id, msg_id, loc_key, cb_id):
     loc_name, remote_only = LOC_MAP.get(loc_key, ("Worldwide", False))
     answer(cb_id, f"✅ {LOC_LABELS.get(loc_key, loc_key)}")
     update_user(chat_id, {"location": loc_name, "location_key": loc_key,
-                           "remote_only": remote_only})
+                           "remote_only": remote_only, "awaiting_location": False,
+                           "awaiting_ctype": True})
     edit(chat_id, msg_id,
          f"✅ Location: {LOC_LABELS.get(loc_key, loc_key)}\n\n"
          f"⚙️ <b>Step 4 of 4 — Company Type</b>\n\nWhat kind of company do you prefer?",
@@ -785,6 +793,8 @@ def process_update(update):
             text     = msg.get("text", "") or ""
 
             if text and not text.startswith("/"):
+                # FIX #23: always re-fetch user from DB here — never use
+                # a cached/stale copy — so we see the latest awaiting_* flags.
                 user = get_user(chat_id)
                 logger.info(f"Text from {chat_id}: '{text[:40]}' | "
                             f"awaiting_role={user.get('awaiting_role')} "
@@ -796,8 +806,7 @@ def process_update(update):
                     if not role:
                         send(chat_id, "Please type a role name.")
                         return
-                    sb_post("users", {
-                        "chat_id":       chat_id,
+                    update_user(chat_id, {
                         "keywords":      role,
                         "category":      "all",
                         "awaiting_role": False,
@@ -807,8 +816,7 @@ def process_update(update):
 
                 if user.get("awaiting_keywords"):
                     kw = sanitize(text.strip(), max_len=300)
-                    sb_post("users", {
-                        "chat_id":           chat_id,
+                    update_user(chat_id, {
                         "keywords":          kw,
                         "awaiting_keywords": False,
                     })
@@ -852,23 +860,18 @@ def process_update(update):
             elif text.startswith("/status"):
                 handle_status(chat_id)
             elif text.startswith("/setup"):
-                # Launch setup immediately — don't just show a menu
                 user = get_user(chat_id)
                 if not user:
                     set_user(chat_id, {"username": username or "", "active": False,
                                        "setup_complete": False})
-                    user = get_user(chat_id)
-                # Find the next incomplete step and jump to it
-                step = get_current_step(user)
-                if step or not user.get("setup_complete"):
-                    sb_post("users", {"chat_id": chat_id, "awaiting_role": True,
-                                       "awaiting_seniority": False, "awaiting_location": False,
-                                       "awaiting_ctype": False})
+                step = get_current_step(user) if user else None
+                if step or not (user or {}).get("setup_complete"):
+                    # FIX #23: use update_user (PATCH) not sb_post (upsert)
+                    _reset_to_step1(chat_id)
                     send(chat_id,
                          "⚙️ <b>Step 1 of 4 — Your Role</b>\n\nType your role and send 👇",
                          [[{"text": "❌ Cancel", "callback_data": "status"}]])
                 else:
-                    # Already set up — show a minimal edit menu
                     send(chat_id, "What would you like to change?",
                          [[{"text": "✏️ Change Role / Keywords", "callback_data": "add_keywords"}],
                           [{"text": "🔄 Redo Full Setup",         "callback_data": "setup_start"}]])
