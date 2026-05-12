@@ -231,30 +231,97 @@ EXCLUDE_TITLES = ["intern (unpaid)", "volunteer only", "commission only"]
 
 # Synonym expansion: short/abbreviation → what to search for in job titles
 SYNONYMS = {
-    "ux":    ["ux", "user experience"],
-    "ui":    ["ui", "user interface"],
-    "pm":    ["product manager", "product management"],
-    "swe":   ["software engineer", "software developer"],
-    "sde":   ["software development engineer", "software developer", "software engineer"],
-    "fe":    ["frontend", "front-end", "front end"],
-    "be":    ["backend", "back-end", "back end"],
-    "fs":    ["fullstack", "full-stack", "full stack"],
-    "bd":    ["business development", "bd manager"],
-    "cs":    ["customer success", "customer support"],
-    "hr":    ["human resources", "hr manager", "recruiter"],
-    "qa":    ["quality assurance", "qa engineer", "tester"],
-    "ml":    ["machine learning", "ml engineer"],
-    "ai":    ["artificial intelligence", "ai engineer", "ai researcher"],
-    "ds":    ["data scientist", "data science"],
-    "da":    ["data analyst", "data analytics"],
-    "de":    ["data engineer", "data engineering"],
-    "devops":["devops", "dev ops", "site reliability"],
-    "seo":   ["seo", "search engine optimisation", "search engine optimization"],
-    "mod":   ["moderator", "community moderator", "discord moderator"],
-    "sm":    ["social media", "social media manager"],
-    "biz dev":["business development"],
-    "cx":    ["customer experience", "customer success"],
-    "ops":   ["operations", "ops manager"],
+    # Community & moderation
+    "cm":        ["community manager", "community lead", "community growth"],
+    "mod":       ["moderator", "community moderator", "discord moderator", "telegram moderator"],
+    "community": ["community manager", "community lead", "community moderator", "community growth",
+                  "discord moderator", "telegram moderator", "ambassador", "community mod"],
+    "discord":   ["discord moderator", "discord manager", "discord mod", "community manager"],
+    "ambassador": ["ambassador", "brand ambassador", "community ambassador", "ecosystem ambassador"],
+
+    # Marketing & growth
+    "growth":    ["growth manager", "growth marketing", "growth hacker", "growth lead"],
+    "smm":       ["social media manager", "social media marketing"],
+    "sm":        ["social media", "social media manager"],
+    "seo":       ["seo", "search engine optimisation", "search engine optimization"],
+    "kol":       ["kol manager", "influencer marketing", "kol", "key opinion leader"],
+    "content":   ["content writer", "content manager", "content creator", "content marketing",
+                  "copywriter", "content strategist"],
+    "copy":      ["copywriter", "content writer", "copy editor"],
+    "pr":        ["public relations", "pr manager", "communications manager"],
+
+    # Product & design
+    "pm":        ["product manager", "product management", "product lead", "product owner"],
+    "po":        ["product owner", "product manager"],
+    "ux":        ["ux", "user experience", "ux designer", "ux researcher"],
+    "ui":        ["ui", "user interface", "ui designer"],
+    "ux/ui":     ["ux designer", "ui designer", "product designer", "user experience"],
+    "designer":  ["designer", "ux designer", "ui designer", "product designer", "graphic designer",
+                  "visual designer", "brand designer"],
+
+    # Engineering
+    "swe":       ["software engineer", "software developer"],
+    "sde":       ["software engineer", "software developer", "software development engineer"],
+    "dev":       ["developer", "software engineer", "software developer", "engineer"],
+    "fe":        ["frontend", "front-end", "front end", "frontend developer", "frontend engineer"],
+    "be":        ["backend", "back-end", "back end", "backend developer", "backend engineer"],
+    "fs":        ["fullstack", "full-stack", "full stack", "fullstack developer"],
+    "fullstack": ["fullstack", "full-stack", "full stack developer", "frontend", "backend"],
+    "mobile":    ["mobile developer", "ios developer", "android developer", "react native"],
+    "ios":       ["ios developer", "ios engineer", "swift developer"],
+    "android":   ["android developer", "android engineer", "kotlin developer"],
+    "devops":    ["devops", "dev ops", "site reliability", "sre", "platform engineer"],
+    "sre":       ["site reliability", "sre", "devops", "platform engineer"],
+    "infra":     ["infrastructure", "devops", "platform engineer", "sre"],
+    "web3 dev":  ["blockchain developer", "smart contract", "solidity", "web3 engineer"],
+    "solidity":  ["solidity developer", "smart contract developer", "blockchain developer"],
+
+    # Data & AI
+    "ml":        ["machine learning", "ml engineer", "machine learning engineer"],
+    "ai":        ["artificial intelligence", "ai engineer", "ai researcher", "machine learning"],
+    "ds":        ["data scientist", "data science"],
+    "da":        ["data analyst", "data analytics", "analyst"],
+    "de":        ["data engineer", "data engineering"],
+    "analyst":   ["analyst", "data analyst", "business analyst", "financial analyst"],
+
+    # Sales & business
+    "bd":        ["business development", "bd manager", "business developer"],
+    "biz dev":   ["business development", "bd manager"],
+    "sales":     ["sales manager", "account executive", "sales lead", "sales director"],
+    "ae":        ["account executive", "sales"],
+    "am":        ["account manager", "account management"],
+    "partnerships": ["partnership manager", "partnerships lead", "bd manager"],
+
+    # Support & CX
+    "cs":        ["customer success", "customer support", "customer service"],
+    "cx":        ["customer experience", "customer success", "customer support"],
+    "support":   ["customer support", "support specialist", "support agent", "help desk"],
+
+    # Operations & finance
+    "ops":       ["operations", "ops manager", "operations manager"],
+    "coo":       ["chief operating officer", "coo", "head of operations"],
+    "finance":   ["finance manager", "financial analyst", "accountant", "fp&a"],
+    "cfo":       ["chief financial officer", "cfo", "head of finance"],
+    "accounting": ["accountant", "finance manager", "bookkeeper"],
+
+    # HR & people
+    "hr":        ["human resources", "hr manager", "recruiter", "people ops", "talent acquisition"],
+    "recruiter": ["recruiter", "talent acquisition", "hr manager", "people ops"],
+    "ta":        ["talent acquisition", "recruiter", "hr"],
+
+    # Executive
+    "ceo":       ["chief executive officer", "ceo", "founder", "co-founder"],
+    "cto":       ["chief technology officer", "cto", "vp engineering", "head of engineering"],
+    "cmo":       ["chief marketing officer", "cmo", "vp marketing", "head of marketing"],
+    "vp":        ["vice president", "vp", "director"],
+    "exec":      ["executive", "director", "vp", "head of", "chief"],
+
+    # Web3 specific
+    "web3":      ["web3", "crypto", "blockchain", "defi", "nft", "dao"],
+    "crypto":    ["crypto", "web3", "blockchain", "defi"],
+    "defi":      ["defi", "decentralized finance", "web3", "blockchain"],
+    "nft":       ["nft", "web3", "digital assets"],
+    "dao":       ["dao", "web3", "community manager", "governance"],
 }
 
 def expand_keywords(keywords):
