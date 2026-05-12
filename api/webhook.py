@@ -866,6 +866,11 @@ def process_update(update):
                 send(chat_id, "Not sure what you mean — use the buttons or try /help.", kb_main())
                 return
 
+            # Strip @BotUsername suffix Telegram appends in some clients
+            # e.g. /start@RemoteJobsAlertBot -> /start
+            if text.startswith("/"):
+                text = text.split("@")[0]
+
             if text.startswith("/start"):
                 parts    = text.split(" ", 1)
                 ref_code = parts[1].strip() if len(parts) > 1 else None
