@@ -36,7 +36,7 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 TG_API       = f"https://api.telegram.org/bot{BOT_TOKEN}"
 BOT_USERNAME = os.environ.get("BOT_USERNAME", "RemoteDailyJobBot")
-FIND_COOLDOWN = 10   # seconds between /find calls
+FIND_COOLDOWN = 60   # seconds between /find calls
 
 WELCOME = """👋 <b>Welcome to Remote Radar!</b>
 
@@ -189,8 +189,10 @@ def inc_referrals(chat_id):
     user = get_user(chat_id)
     update_user(chat_id, {"referrals": (user.get("referrals") or 0) + 1})
 
-def check_rate_limit(chat_id):
-    user = get_user(chat_id)
+def check_rate_limit(chat_id, user=None):
+    """Pass user dict to avoid an extra DB round-trip."""
+    if user is None:
+        user = get_user(chat_id)
     last = user.get("last_find_at")
     if not last:
         return True, 0
@@ -198,7 +200,7 @@ def check_rate_limit(chat_id):
         last_dt = datetime.fromisoformat(str(last).replace("Z", "+00:00"))
         if last_dt.tzinfo is None:
             last_dt = last_dt.replace(tzinfo=timezone.utc)
-        elapsed = (datetime.now(timezone.utc) - last_dt).total_seconds()
+        elapsed  = (datetime.now(timezone.utc) - last_dt).total_seconds()
         remaining = max(0, int(FIND_COOLDOWN - elapsed))
         return elapsed >= FIND_COOLDOWN, remaining
     except Exception:
@@ -440,12 +442,14 @@ def job_matches_user(job, user):
         return False
 
 def send_jobs_from_cache(chat_id, user, page=0, keyword_override=None):
-    allowed, remaining = check_rate_limit(chat_id)
+    # Check rate limit using already-fetched user — no extra DB call
+    allowed, remaining = check_rate_limit(chat_id, user)
     if not allowed:
         send(chat_id, f"⏳ Please wait {remaining}s before searching again.")
         return
 
-    send(chat_id, "🔍 Searching for matching jobs...")
+    # Send instantly so user sees a response while DB work happens below
+    send(chat_id, "🔍 Searching...")
     update_user(chat_id, {
         "last_find_at":   datetime.now(timezone.utc).isoformat(),
         "last_active_at": datetime.now(timezone.utc).isoformat(),
@@ -462,6 +466,10 @@ def send_jobs_from_cache(chat_id, user, page=0, keyword_override=None):
 
     liked_ids, disliked_ids = get_user_feedback(chat_id)
 
+    # Bulk fetch all sent job IDs in ONE query instead of one per job
+    sent_rows = sb_get(f"sent_jobs?chat_id=eq.{chat_id}&select=job_id")
+    sent_ids  = {r["job_id"] for r in sent_rows} if sent_rows else set()
+
     if keyword_override:
         matched = [j for j in cached
                    if keyword_override.lower() in (j.get("title","") or "").lower()
@@ -469,7 +477,7 @@ def send_jobs_from_cache(chat_id, user, page=0, keyword_override=None):
     else:
         matched = [j for j in cached
                    if job_matches_user(j, user)
-                   and not was_sent(chat_id, j["job_id"])
+                   and j.get("job_id","") not in sent_ids
                    and j.get("job_id","") not in disliked_ids]
 
     matched.sort(key=lambda j: (
@@ -726,7 +734,7 @@ def handle_keywords(chat_id, text):
     if not keywords:
         update_user(chat_id, {"awaiting_keywords": True})
         send(chat_id,
-             "✏️ <b>Update keywords</b>\n\nType your new keywords and send:\n\n"
+             "✏️ <b>Update keywords</b>\n\nType your new keywords:\n\n"
              "<code>community manager, discord</code>\n"
              "<code>python engineer, backend</code>")
         return
