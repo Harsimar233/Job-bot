@@ -719,7 +719,16 @@ def handle_unwatch(chat_id, text):
     sb_delete(f"watchlist?chat_id=eq.{chat_id}&company=eq.{company}")
     send(chat_id, f"✅ Stopped watching <b>{company}</b>.")
 
-update_user(chat_id, {
+def handle_keywords(chat_id, text):
+    keywords = sanitize(text.replace("/keywords", "").strip().lstrip(","), max_len=300)
+    if not keywords:
+        update_user(chat_id, {"awaiting_keywords": True})
+        send(chat_id,
+             "✏️ <b>Update keywords</b>\n\nType your new keywords and send:\n\n"
+             "<code>community manager, discord</code>\n"
+             "<code>python engineer, backend</code>")
+        return
+    update_user(chat_id, {
         "keywords":          keywords,
         "awaiting_keywords": False,
         "last_find_at":      None,
@@ -791,7 +800,7 @@ def step4_company_type(chat_id, msg_id, loc_key, cb_id):
 
 def finish_setup(chat_id, msg_id, ctype, cb_id):
     answer(cb_id, f"✅ {CTYPE_LABELS.get(ctype, ctype)}")
-   update_user(chat_id, {"company_type": ctype, "active": True, "setup_complete": True,
+    update_user(chat_id, {"company_type": ctype, "active": True, "setup_complete": True,
                            "awaiting_ctype": False, "last_find_at": None})
     user   = get_user(chat_id)
     invite = f"t.me/{BOT_USERNAME}?start=ref_{chat_id}"
@@ -837,7 +846,7 @@ def process_update(update):
                     step2_seniority(chat_id, role)
                     return
 
-             if user.get("awaiting_keywords"):
+                if user.get("awaiting_keywords"):
                     kw = sanitize(text.strip(), max_len=300)
                     update_user(chat_id, {
                         "keywords":          kw,
