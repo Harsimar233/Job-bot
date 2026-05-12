@@ -36,7 +36,7 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 TG_API       = f"https://api.telegram.org/bot{BOT_TOKEN}"
 BOT_USERNAME = os.environ.get("BOT_USERNAME", "RemoteDailyJobBot")
-FIND_COOLDOWN = 60   # seconds between /find calls
+FIND_COOLDOWN = 10   # seconds between /find calls
 
 WELCOME = """👋 <b>Welcome to Remote Radar!</b>
 
@@ -193,15 +193,16 @@ def check_rate_limit(chat_id):
     user = get_user(chat_id)
     last = user.get("last_find_at")
     if not last:
-        return True
+        return True, 0
     try:
         last_dt = datetime.fromisoformat(str(last).replace("Z", "+00:00"))
         if last_dt.tzinfo is None:
             last_dt = last_dt.replace(tzinfo=timezone.utc)
         elapsed = (datetime.now(timezone.utc) - last_dt).total_seconds()
-        return elapsed >= FIND_COOLDOWN
+        remaining = max(0, int(FIND_COOLDOWN - elapsed))
+        return elapsed >= FIND_COOLDOWN, remaining
     except Exception:
-        return True
+        return True, 0
 
 def save_job(chat_id, job):
     sb_post("saved_jobs", {
@@ -439,8 +440,9 @@ def job_matches_user(job, user):
         return False
 
 def send_jobs_from_cache(chat_id, user, page=0, keyword_override=None):
-    if not check_rate_limit(chat_id):
-        send(chat_id, f"⏳ Please wait {FIND_COOLDOWN}s between searches.")
+    allowed, remaining = check_rate_limit(chat_id)
+    if not allowed:
+        send(chat_id, f"⏳ Please wait {remaining}s before searching again.")
         return
 
     send(chat_id, "🔍 Searching for matching jobs...")
@@ -866,8 +868,6 @@ def process_update(update):
                 send(chat_id, "Not sure what you mean — use the buttons or try /help.", kb_main())
                 return
 
-            # Strip @BotUsername suffix Telegram appends in some clients
-            # e.g. /start@RemoteJobsAlertBot -> /start
             if text.startswith("/"):
                 text = text.split("@")[0]
 
