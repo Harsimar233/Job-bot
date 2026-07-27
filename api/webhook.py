@@ -965,6 +965,8 @@ def format_job_card(job, show_actions=True, allow_autoapply=False):
 def kb_main():
     return [[{"text": "🔍 Find Jobs", "callback_data": "find_jobs"}],
             [{"text": "🌍 Abroad Job + Work Visa", "callback_data": "abroad_setup"}],
+            [{"text": "📊 Today's Progress", "callback_data": "ai_progress"},
+             {"text": "📥 Applications", "callback_data": "applications"}],
             [{"text": "🤖 Auto Apply — Private Beta", "callback_data": "autoapply"}],
             [{"text": "⚙️ Set Up / Preferences", "callback_data": "setup_start"},
              {"text": "⏹ Pause",        "callback_data": "stop"}]]
@@ -1617,6 +1619,86 @@ def finish_setup(chat_id, msg_id, ctype, cb_id):
     if user.get("relocation_only") and not user.get("target_countries"):
         handle_abroad(chat_id)
 
+# ── Conversational AI assistant ───────────────────────────────────────────────
+
+def _looks_like_natural_job_search(text):
+    q = re.sub(r"\s+", " ", str(text or "").strip().casefold())
+    search_words = (
+        "find", "search", "dhund", "dhoond", "dikha", "show me", "jobs chahiye",
+        "job chahiye", "best jobs", "matching jobs",
+    )
+    tracking_words = (
+        "apply", "applied", "application", "pending", "queue", "draft",
+        "submitted", "progress", "status", "saved",
+    )
+    return (
+        ("job" in q or "vacanc" in q or "naukri" in q)
+        and any(word in q for word in search_words)
+        and not any(word in q for word in tracking_words)
+    )
+
+
+def handle_conversation(chat_id, text, username=""):
+    """Answer normal messages without forcing users to remember commands."""
+    user = get_user(chat_id)
+    if not user or not user.get("setup_complete"):
+        send(
+            chat_id,
+            "Pehle apna job profile set up kar lete hain—sirf role, level aur "
+            "location chahiye.",
+        )
+        step1_role(chat_id)
+        return
+
+    if _looks_like_natural_job_search(text):
+        q = str(text or "").casefold()
+        abroad_words = (
+            "visa", "abroad", "overseas", "dubai", "uae", "new zealand",
+            "canada", "europe", "germany", "australia", "relocation",
+        )
+        if any(word in q for word in abroad_words):
+            send(
+                chat_id,
+                "🌍 Abroad search samajh gaya. Target countries confirm kar do:",
+            )
+            handle_abroad(chat_id)
+        else:
+            send_jobs_from_cache(chat_id, user)
+        return
+
+    applications = sb_get(
+        f"applications?chat_id=eq.{chat_id}"
+        "&select=status,created_at,updated_at,approved_at,submitted_at,job_snapshot"
+        "&order=created_at.desc&limit=50"
+    )
+    saved_jobs = sb_get(
+        f"saved_jobs?chat_id=eq.{chat_id}"
+        "&select=job_title,company,source,created_at"
+        "&order=created_at.desc&limit=20"
+    )
+    sent_jobs = sb_get(
+        f"sent_jobs?chat_id=eq.{chat_id}"
+        "&select=job_id,sent_at&order=sent_at.desc&limit=100"
+    )
+    profile = get_candidate_profile(chat_id)
+
+    from api.job_assistant import answer_job_question
+    answer_text = answer_job_question(
+        text,
+        user=user,
+        profile=profile,
+        applications=applications,
+        saved_jobs=saved_jobs,
+        sent_jobs=sent_jobs,
+    )
+    track(chat_id, "assistant_question", {"length": len(str(text or ""))})
+    send(
+        chat_id,
+        sanitize(answer_text, 3900),
+        [[{"text": "🔍 Find Jobs", "callback_data": "find_jobs"},
+          {"text": "📥 Applications", "callback_data": "applications"}]],
+    )
+
 # ── Main update processor ─────────────────────────────────────────────────────
 
 def process_update(update):
@@ -1697,7 +1779,7 @@ def process_update(update):
                     send_jobs_from_cache(chat_id, user, keyword_override=query)
                     return
 
-                send(chat_id, "Not sure what you mean — use the buttons or try /help.", kb_main())
+                handle_conversation(chat_id, text, username)
                 return
 
             if text.startswith("/"):
@@ -1771,6 +1853,10 @@ def process_update(update):
                      "🤖 /autoapply — Auto Apply private beta\n"
                      "🔖 /saved — Saved jobs\n"
                      "⚙️ /status — Profile and settings\n\n"
+                     "💬 <b>Or just type normally</b>\n"
+                     "<code>Aaj maine kaunsi jobs apply ki?</code>\n"
+                     "<code>Pending applications batao</code>\n"
+                     "<code>Mere liye best jobs dikhao</code>\n\n"
                      "<b>More tools</b>\n"
                      "/search waiter · /keywords · /watch Company\n"
                      "/local · /stop · /delete",
@@ -1900,6 +1986,9 @@ def process_update(update):
                 else:
                     answer(cb_id, "Let's set up your profile")
                     step1_role(chat_id, msg_id)
+            elif data == "ai_progress":
+                answer(cb_id, "Checking today's progress...")
+                handle_conversation(chat_id, "aaj ka status", username)
             elif data == "abroad_setup":
                 answer(cb_id)
                 handle_abroad(chat_id)
