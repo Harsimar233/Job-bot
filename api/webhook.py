@@ -1,4 +1,3 @@
-dhud
 """
 Super Job Bot — Telegram Webhook
 Fixes applied:
