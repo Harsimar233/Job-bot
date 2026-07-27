@@ -263,6 +263,87 @@ def update_candidate_profile(chat_id, data):
     if not sb_patch(f"candidate_profiles?chat_id=eq.{chat_id}", payload):
         set_candidate_profile(chat_id, payload)
 
+def _resume_profile_data(profile):
+    data = profile.get("resume_profile") or {}
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except (TypeError, ValueError):
+            return {}
+    return data if isinstance(data, dict) else {}
+
+def _short_list(values, limit=6):
+    return ", ".join(sanitize(value, 60) for value in (values or [])[:limit])
+
+def send_resume_profile_preview(chat_id, profile):
+    data = _resume_profile_data(profile)
+    skills = _short_list(data.get("skills")) or "Not found"
+    experience = data.get("work_experience") or []
+    latest_role = "Not found"
+    if experience and isinstance(experience[0], dict):
+        role = sanitize(experience[0].get("title"), 80)
+        company = sanitize(experience[0].get("employer"), 80)
+        latest_role = " @ ".join(item for item in (role, company) if item) or "Not found"
+    elif experience:
+        latest_role = sanitize(experience[0], 160) or "Not found"
+    send(
+        chat_id,
+        "✨ <b>I read your resume</b>\n\n"
+        f"👤 Name: <b>{sanitize(profile.get('full_name')) or 'Not found'}</b>\n"
+        f"✉️ Email: {sanitize(profile.get('email')) or 'Not found'}\n"
+        f"📞 Phone: {sanitize(profile.get('phone')) or 'Not found'}\n"
+        f"📍 Current city: {sanitize(profile.get('current_city')) or 'Not found'}\n"
+        f"💼 Latest role: {latest_role}\n"
+        f"🛠 Skills: {skills}\n\n"
+        "Please confirm these details before the Apply Agent uses them.",
+        [
+            [{"text": "✅ Looks Right", "callback_data": "autoapply_profile_confirm"}],
+            [{"text": "✏️ Enter Details Manually", "callback_data": "autoapply_profile_edit"}],
+        ],
+    )
+
+def _next_missing_profile_step(profile):
+    name = str(profile.get("full_name") or "").strip()
+    if len(name) < 2:
+        return "awaiting_name"
+    email = str(profile.get("email") or "").strip()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        return "awaiting_email"
+    phone_digits = re.sub(r"\D", "", str(profile.get("phone") or ""))
+    if len(phone_digits) < 8 or len(phone_digits) > 15:
+        return "awaiting_phone"
+    if len(str(profile.get("current_city") or "").strip()) < 2:
+        return "awaiting_city"
+    return ""
+
+def confirm_resume_profile(chat_id):
+    profile = get_candidate_profile(chat_id)
+    missing_step = _next_missing_profile_step(profile)
+    if missing_step:
+        prompts = {
+            "awaiting_name": "I couldn't find your full legal name. Please type it:",
+            "awaiting_email": "I couldn't find your email. Please type it:",
+            "awaiting_phone": "I couldn't find your phone number. Include country code:",
+            "awaiting_city": "I couldn't confirm your current city and country. Please type it:",
+        }
+        update_candidate_profile(chat_id, {"setup_step": missing_step})
+        send(chat_id, prompts[missing_step])
+        return
+    update_candidate_profile(chat_id, {
+        "setup_step": "ready",
+        "auto_apply_mode": "review",
+    })
+    track(chat_id, "autoapply_setup_complete", {"resume_extracted": True})
+    send(
+        chat_id,
+        "✅ <b>Apply Agent is ready</b>\n\n"
+        "Your resume details are saved and Review Mode is ON. New matching "
+        "jobs will be added to /applications. Nothing is finally submitted "
+        "without you.",
+        [[{"text": "🔍 Find Jobs Now", "callback_data": "find_jobs"},
+          {"text": "📥 Review Queue", "callback_data": "applications"}]],
+    )
+
 def queue_applications(chat_id, jobs, username=""):
     """Queue matches only for users who explicitly enabled review mode."""
     if not is_autoapply_owner(chat_id, username):
@@ -316,11 +397,15 @@ def handle_autoapply(chat_id, username=""):
         return
     pending_prompts = {
         "awaiting_resume": "📄 Upload your resume as PDF, DOC or DOCX (max 10 MB).",
+        "processing_resume": "⏳ Your resume is being read. Please wait a moment.",
         "awaiting_name": "What is your full legal name?",
         "awaiting_email": "What email should job applications use?",
         "awaiting_phone": "What phone number should applications use? Include country code.",
         "awaiting_city": "What city and country do you currently live in?",
     }
+    if profile.get("setup_step") == "awaiting_confirmation":
+        send_resume_profile_preview(chat_id, profile)
+        return
     if profile.get("setup_step") in pending_prompts:
         send(
             chat_id,
@@ -336,8 +421,9 @@ def handle_autoapply(chat_id, username=""):
         "• Matching jobs are queued automatically\n"
         "• AI drafts never invent qualifications\n"
         "• <b>You approve before any final application step</b>\n\n"
-        "Your resume stays as a private Telegram file reference in the database. "
-        "This version does not send the resume to OpenAI.",
+        "With your consent, your resume is sent to OpenAI once to extract your "
+        "profile. The bot stores the extracted details and a private Telegram "
+        "file reference.",
         [[{"text": "🔐 I Agree — Set It Up", "callback_data": "autoapply_consent"}],
          [{"text": "❌ Not Now", "callback_data": "status"}]],
     )
@@ -347,6 +433,9 @@ def handle_resume_document(chat_id, document, username=""):
         autoapply_access_message(chat_id)
         return
     profile = get_candidate_profile(chat_id)
+    if profile.get("setup_step") == "processing_resume":
+        send(chat_id, "⏳ Your resume is already being read. Please wait a moment.")
+        return
     if profile.get("setup_step") != "awaiting_resume":
         send(chat_id, "Use /autoapply first, then upload your resume.")
         return
@@ -367,6 +456,29 @@ def handle_resume_document(chat_id, document, username=""):
     if size > 10 * 1024 * 1024:
         send(chat_id, "Resume is too large. Please keep it under 10 MB.")
         return
+    update_candidate_profile(chat_id, {"setup_step": "processing_resume"})
+    send(chat_id, "🧠 Reading your resume and filling your profile...")
+    from api.resume_parser import extract_resume_profile
+    extracted = extract_resume_profile(document)
+    if extracted:
+        update_candidate_profile(chat_id, {
+            "resume_file_id": document.get("file_id"),
+            "resume_file_unique_id": document.get("file_unique_id"),
+            "resume_file_name": name[:180],
+            "resume_mime_type": mime[:120],
+            "resume_size": size,
+            "resume_profile": extracted,
+            "resume_processed_at": datetime.now(timezone.utc).isoformat(),
+            "full_name": str(extracted.get("full_name") or "")[:120],
+            "email": str(extracted.get("email") or "")[:180],
+            "phone": str(extracted.get("phone") or "")[:40],
+            "current_city": str(extracted.get("current_city") or "")[:120],
+            "setup_step": "awaiting_confirmation",
+        })
+        send_resume_profile_preview(chat_id, get_candidate_profile(chat_id))
+        return
+
+    # Keep setup usable when OpenAI is unavailable or cannot read a document.
     already_complete = all(
         profile.get(field)
         for field in ("full_name", "email", "phone", "current_city")
@@ -382,11 +494,17 @@ def handle_resume_document(chat_id, document, username=""):
     if already_complete:
         send(
             chat_id,
-            "✅ Resume replaced. Your Apply Agent settings are unchanged.",
+            "✅ Resume replaced. Automatic reading was unavailable, so your "
+            "existing confirmed profile was kept.",
             [[{"text": "📥 Review Queue", "callback_data": "applications"}]],
         )
-    else:
-        send(chat_id, "✅ Resume saved privately.\n\nWhat is your <b>full legal name</b>?")
+        return
+    send(
+        chat_id,
+        "✅ Resume saved, but automatic reading was unavailable. "
+        "We'll finish the four essential fields manually.\n\n"
+        "What is your <b>full legal name</b>?",
+    )
 
 def handle_apply_profile_text(chat_id, text, profile, username=""):
     step = profile.get("setup_step")
@@ -398,6 +516,12 @@ def handle_apply_profile_text(chat_id, text, profile, username=""):
         return True
     if step == "awaiting_resume":
         send(chat_id, "Please upload your resume as a PDF, DOC or DOCX file.")
+        return True
+    if step == "processing_resume":
+        send(chat_id, "Your resume is still being read. Please wait a moment.")
+        return True
+    if step == "awaiting_confirmation":
+        send_resume_profile_preview(chat_id, profile)
         return True
     if step == "awaiting_name":
         if len(value) < 2 or len(value) > 120:
@@ -1587,7 +1711,8 @@ def process_update(update):
                 ))
                 or data in {
                     "autoapply_consent", "autoapply_resume", "autoapply_on",
-                    "autoapply_off", "applications",
+                    "autoapply_off", "autoapply_profile_confirm",
+                    "autoapply_profile_edit", "applications",
                 }
             )
             if private_apply_action and not is_autoapply_owner(chat_id, username):
@@ -1706,17 +1831,26 @@ def process_update(update):
                 set_candidate_profile(chat_id, {
                     "setup_step": "awaiting_resume",
                     "auto_apply_mode": "off",
-                    "consent_version": "review-first-v1",
+                    "consent_version": "resume-ai-extraction-v2",
                     "consented_at": datetime.now(timezone.utc).isoformat(),
                 })
                 send(
                     chat_id,
-                    "📄 Upload your resume now as PDF, DOC or DOCX (max 10 MB).",
+                    "📄 Upload your resume now as PDF, DOC or DOCX (max 10 MB).\n\n"
+                    "It will be sent to OpenAI once to extract your profile, "
+                    "then you can confirm or edit the result.",
                 )
             elif data == "autoapply_resume":
                 answer(cb_id)
                 update_candidate_profile(chat_id, {"setup_step": "awaiting_resume"})
                 send(chat_id, "📄 Upload the replacement PDF, DOC or DOCX resume.")
+            elif data == "autoapply_profile_confirm":
+                answer(cb_id, "Details confirmed")
+                confirm_resume_profile(chat_id)
+            elif data == "autoapply_profile_edit":
+                answer(cb_id, "Let's edit your details")
+                update_candidate_profile(chat_id, {"setup_step": "awaiting_name"})
+                send(chat_id, "What is your <b>full legal name</b>?")
             elif data == "autoapply_on":
                 answer(cb_id, "Review mode enabled")
                 profile = get_candidate_profile(chat_id)
