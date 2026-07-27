@@ -1,30 +1,51 @@
-<html>
+<!doctype html>
+<html lang="en">
 <head>
-  <title>Remote Radar — Daily Remote Job Alerts on Telegram</title>
+  <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Super Job Bot — Every Job, Every Region</title>
+  <meta name="description" content="Local, hybrid and remote job alerts—from waiter to director—delivered on Telegram.">
   <style>
-    body { font-family: -apple-system, sans-serif; background: #0a0a0a; color: #fff; text-align: center; padding: 60px 20px; margin: 0; }
-    h1 { font-size: 2.5rem; margin-bottom: 10px; }
-    p { color: #aaa; font-size: 1.1rem; max-width: 520px; margin: 0 auto 30px; line-height: 1.6; }
-    .features { display: flex; flex-wrap: wrap; justify-content: center; gap: 16px; margin: 30px auto; max-width: 620px; }
-    .feature { background: #1a1a1a; border-radius: 12px; padding: 16px 20px; font-size: 0.95rem; }
-    a.cta { display: inline-block; background: #0088cc; color: #fff; padding: 14px 32px; border-radius: 8px; text-decoration: none; font-size: 1.1rem; font-weight: 600; }
-    a.cta:hover { background: #0077b5; }
-    .note { color: #666; font-size: 0.85rem; margin-top: 20px; }
+    :root { color-scheme: dark; --bg:#070b14; --panel:#111827; --muted:#9ca3af; --brand:#39d98a; }
+    * { box-sizing:border-box; }
+    body { margin:0; font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:radial-gradient(circle at 50% 0,#173052 0,var(--bg) 45%); color:#fff; }
+    main { width:min(920px,calc(100% - 36px)); margin:auto; padding:76px 0 56px; text-align:center; }
+    .eyebrow { color:var(--brand); font-weight:800; letter-spacing:.12em; text-transform:uppercase; font-size:.78rem; }
+    h1 { font-size:clamp(2.7rem,8vw,5.7rem); letter-spacing:-.065em; line-height:.94; margin:18px auto 24px; max-width:860px; }
+    .sub { color:#c4cad4; font-size:clamp(1.05rem,2.6vw,1.35rem); line-height:1.6; max-width:720px; margin:0 auto 34px; }
+    .actions { display:flex; justify-content:center; gap:12px; flex-wrap:wrap; }
+    .cta { display:inline-block; background:var(--brand); color:#03140c; padding:16px 28px; border-radius:999px; text-decoration:none; font-weight:850; box-shadow:0 12px 35px #39d98a33; }
+    .cta.secondary { color:#fff; background:#ffffff0d; border:1px solid #ffffff24; box-shadow:none; }
+    .cta:focus-visible { outline:3px solid #fff; outline-offset:4px; }
+    .grid { display:grid; grid-template-columns:repeat(2,1fr); gap:14px; margin:54px 0 32px; text-align:left; }
+    .card { background:#111827cc; border:1px solid #ffffff14; border-radius:18px; padding:22px; min-height:150px; }
+    .card span { font-size:1.7rem; }
+    .card h2 { font-size:1.05rem; margin:14px 0 8px; }
+    .card p { color:var(--muted); line-height:1.5; margin:0; font-size:.94rem; }
+    .roles { color:#aeb8c6; line-height:1.8; margin-top:34px; }
+    footer { color:#687385; margin-top:60px; font-size:.85rem; }
+    @media (max-width:700px) { .grid { grid-template-columns:1fr; } main { padding-top:56px; } .card { min-height:auto; } }
   </style>
 </head>
 <body>
-  <h1>🎯 Remote Radar</h1>
-  <p>Personalised remote job alerts on Telegram, delivered 3× daily — free forever. Covers tech, marketing, community, sales, design, support, and more.</p>
-  <div class="features">
-    <div class="feature">🌍 12 global job sources</div>
-    <div class="feature">🎯 Fully personalised</div>
-    <div class="feature">⚡ 3× daily alerts</div>
-    <div class="feature">🔥 Hot jobs flagged &lt;24h</div>
-    <div class="feature">🚀 Startup funding data</div>
-    <div class="feature">💰 100% free</div>
-  </div>
-  <a class="cta" href="https://t.me/RemoteJobsAlertBot">Get Free Job Alerts →</a>
-  <p class="note">Focused on remote-friendly roles in tech, web3, marketing, operations & beyond. Best for knowledge-worker roles.</p>
+  <main>
+    <div class="eyebrow">AI-powered global job discovery</div>
+    <h1>Every job.<br>Every region.</h1>
+    <p class="sub">Fresh local, hybrid and remote opportunities delivered on Telegram—from restaurant shifts and skilled trades to tech and leadership roles.</p>
+    <div class="actions">
+      <a class="cta" href="https://t.me/RemoteJobsAlertBot">Find jobs on Telegram →</a>
+      <a class="cta secondary" href="https://t.me/Harsimarhs">Request Auto Apply</a>
+    </div>
+
+    <section class="grid" aria-label="Features">
+      <article class="card"><span>🌍</span><h2>Search beyond one job board</h2><p>Public APIs, employer career pages, ATS feeds and AI-assisted web discovery.</p></article>
+      <article class="card"><span>📍</span><h2>Local + hybrid + remote</h2><p>Choose any city, region or country instead of being limited to remote tech work.</p></article>
+      <article class="card"><span>🛂</span><h2>Abroad + work visa mode</h2><p>Target countries and filter for credible sponsorship, work-permit support or overseas applicants.</p></article>
+      <article class="card"><span>🤖</span><h2>Auto Apply private beta</h2><p>Currently available only to @Harsimarhs. Other users can DM to request access. Every final application step stays user-approved.</p></article>
+    </section>
+
+    <p class="roles">Waiter · Chef · Driver · Cashier · Nurse · Teacher · Electrician · Sales · Support · Designer · Engineer · Manager · Director</p>
+    <footer>Original source links. No fake listings. You stay in control of every application.</footer>
+  </main>
 </body>
 </html>
