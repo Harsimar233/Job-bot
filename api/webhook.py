@@ -1022,11 +1022,24 @@ def send_jobs_from_cache(chat_id, user, page=0, keyword_override=None):
             and j.get("job_id","") not in disliked_ids
             and (not user.get("relocation_only") or job_matches_user(j, search_user))
         ]
+        showing_previous = False
     else:
         matched = [j for j in cached
                    if job_matches_user(j, user)
                    and j.get("job_id","") not in sent_ids
                    and j.get("job_id","") not in disliked_ids]
+        showing_previous = False
+
+        # "No new matches" used to look like the bot had found zero jobs on the
+        # internet. If every matching cached job was already shown, repeat the
+        # best recent matches instead of presenting a misleading empty result.
+        if not matched:
+            matched = [
+                j for j in cached
+                if job_matches_user(j, user)
+                and j.get("job_id","") not in disliked_ids
+            ]
+            showing_previous = bool(matched)
 
     matched.sort(key=lambda j: (
         -(50 if j.get("job_id","") in liked_ids else 0),
@@ -1038,7 +1051,7 @@ def send_jobs_from_cache(chat_id, user, page=0, keyword_override=None):
     per_page = 5
     # Profile searches mark each delivered job as sent. On the next page those
     # jobs are already excluded, so the next batch starts at zero.
-    start    = page * per_page if keyword_override else 0
+    start    = page * per_page if (keyword_override or showing_previous) else 0
     batch    = matched[start:start + per_page]
     has_more = not keyword_override and len(matched) > start + per_page
 
@@ -1067,7 +1080,13 @@ def send_jobs_from_cache(chat_id, user, page=0, keyword_override=None):
 
     hot_count = sum(1 for j in batch if j.get("hot"))
     sources   = list({j["source"] for j in batch})
-    header    = f"🔍 <b>{len(batch)} jobs for you</b>"
+    if showing_previous:
+        header = (
+            "🔄 <b>No brand-new matches since your last check.</b>\n"
+            f"Here are {len(batch)} best recent matches again"
+        )
+    else:
+        header = f"🔍 <b>{len(batch)} jobs for you</b>"
     if hot_count:
         header += f" · ⚡ {hot_count} posted today"
     header += f"\n📡 {', '.join(sources[:4])}"
