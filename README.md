@@ -1,127 +1,186 @@
-# 🤖 Remote Radar — Job Alert Bot
+# Super Job Bot
 
-Automatically finds remote jobs from 12 global sources.
-Sends personalised daily alerts to users on Telegram — 3× per day.
+A Telegram-first job discovery engine for local, hybrid and remote work—from
+restaurant and retail jobs to engineering, healthcare and director-level roles.
 
----
+See [AUDIT.md](./AUDIT.md) for the complete product, security and UX review.
 
-## Stack
+## What changed
 
-| Layer | Tool | Cost |
-|-------|------|------|
-| Hosting | Vercel (serverless) | Free |
-| Database | Supabase | Free |
-| Bot | Telegram Bot API | Free |
+- Existing 12-source scraper engine remains available.
+- OpenAI Responses API web search is an optional discovery source.
+- AI searches are demand-driven: similar user role/location preferences are
+  clustered so the app does not make one paid request per user.
+- Hospitality, retail, logistics, healthcare, education, trades, services and
+  government roles are included in the job taxonomy.
+- Users can enter any city, region or country during onboarding.
+- Dedicated **Abroad + Work Visa** mode with comma-separated target countries.
+- Visa mode rejects jobs requiring existing local work rights and only matches
+  explicit sponsorship/work-permit support or overseas-candidate acceptance.
+- Jobs now store work mode, employment type, category, experience, discovery
+  method and evidence.
+- Missing Supabase schema is included.
+- Cron endpoint supports bearer-token protection.
+- `/find` pagination and keyword refresh bugs are fixed.
+- Owner-only, review-first **Apply Agent** stores one resume reference and
+  candidate profile, auto-queues matches, drafts truthful cover letters, and
+  asks for approval before opening the original employer form.
 
----
+## Discovery architecture
 
-## Setup (15 minutes)
-
-### Step 1 — Create your Telegram bot
-
-1. Open Telegram → search **@BotFather**
-2. Send `/newbot` → choose a name → choose a username ending in `bot`
-3. Copy the token it gives you (looks like `7123456789:AAFxxx...`)
-
-### Step 2 — Get your Chat ID (for testing)
-
-1. Search **@userinfobot** → press Start
-2. It shows your ID (e.g. `123456789`)
-
-### Step 3 — Set up Supabase
-
-1. Go to [supabase.com](https://supabase.com) → create a new project
-2. Go to **SQL Editor** → paste the contents of `supabase_schema.sql` → click Run
-3. Go to **Settings > API** → copy:
-   - **Project URL** (looks like `https://xxxx.supabase.co`)
-   - **anon/public key**
-
-### Step 4 — Fork & deploy to Vercel
-
-1. Fork this repo on GitHub
-2. Go to [vercel.com](https://vercel.com) → Add New Project → pick your fork
-3. Under **Environment Variables**, add these:
-
-| Name | Value |
-|------|-------|
-| `JOB_BOT_TOKEN` | Your BotFather token |
-| `SUPABASE_URL` | Your Supabase project URL |
-| `SUPABASE_KEY` | Your Supabase anon key |
-| `BOT_USERNAME` | Your bot's username (without @) |
-| `LOG_LEVEL` | `INFO` (use `DEBUG` while testing) |
-| `SCRAPER_KEY` | Optional: ScraperAPI key for Web3.career |
-
-4. Click **Deploy**
-
-### Step 5 — Register the webhook
-
-After deploy, open this URL in your browser (replace values):
-
-```
-https://api.telegram.org/bot<YOUR_TOKEN>/setWebhook?url=https://<YOUR_VERCEL_DOMAIN>/api/webhook
+```text
+Telegram users
+    |
+    +-- preferences: role, level, location, remote/local
+    |
+Scheduled scan
+    |
+    +-- public APIs, RSS and ATS feeds (deterministic)
+    +-- OpenAI web search scout (optional, demand-driven)
+    |
+Normalize -> validate URL/date -> deduplicate -> Supabase
+    |
+Match and rank -> Telegram alerts
+    |
+Opt-in Apply Agent -> queue -> draft -> user approval -> employer form
 ```
 
-### Step 6 — Test
+OpenAI is not treated as the database. It discovers and extracts recent
+postings; the bot still validates required fields, keeps the original apply URL,
+deduplicates results and stores normalized records.
 
-1. In Vercel → **Functions** tab → find `api/scan` → click **Test**
-2. Open your bot on Telegram and send `/start`
-3. You should receive a welcome message within seconds
+## Apply Agent
 
----
+The private beta is restricted to `@Harsimarhs` by default. Other users see a
+button to DM the owner instead of application controls. For the strongest lock,
+set `AUTO_APPLY_ALLOWED_CHAT_ID` to the owner's numeric Telegram chat ID; when
+that variable is set, it overrides username matching.
 
-## When does it run?
+The owner runs `/autoapply`, accepts the privacy notice, then uploads a
+PDF/DOC/DOCX resume and enters the contact details applications should use.
+When review mode is on:
 
-Automatically 3 times a day (UTC):
-- **9:00 AM**
-- **3:00 PM**
-- **9:00 PM**
+1. New personalized matches are added to `applications`.
+2. `/applications` shows the pending queue.
+3. **Prepare Application** generates a job-specific draft. Contact details and
+   the Telegram resume file ID are not sent to OpenAI.
+4. The candidate approves the draft and opens the original employer form.
 
-Trigger manually any time from the Vercel Functions tab.
+This is intentionally review-first. The app does not claim a submission
+succeeded when it only opened a URL, does not invent experience or work
+authorization, and does not bypass CAPTCHA. `api/apply_agent.py` identifies
+Greenhouse, Lever, Ashby, Workday and generic forms so audited site-specific
+submission adapters can be added later without changing the queue or consent
+model.
 
----
+Resume files are not copied into Supabase; only Telegram's private `file_id` and
+basic metadata are stored. Database tables use RLS and are accessed only with
+the server-side Supabase service-role key.
 
-## Bot commands
+For relocation searches, the discovery prompt states that the candidate is
+currently in India. A local validation gate then rejects results unless the
+structured result confirms employer visa/work-permit support or explicit
+acceptance of overseas applicants. Generic phrases such as "must have work
+authorization" are not treated as sponsorship.
 
-| Command | What it does |
-|---------|-------------|
-| `/start` | Welcome + onboarding |
-| `/find` | Find jobs right now |
-| `/keywords web3, community` | Update your keywords |
-| `/saved` | View bookmarked jobs |
-| `/watch Coinbase` | Get alerts when Coinbase posts |
-| `/status` | View your preferences |
-| `/invite` | Get your referral link |
-| `/stop` | Pause alerts |
-| `/delete` | Delete all your data |
-| `/help` | Show all commands |
+## Setup
 
----
+1. Create a Telegram bot with `@BotFather`.
+2. Create a Supabase project.
+3. Run [`supabase_schema.sql`](./supabase_schema.sql) in the Supabase SQL Editor.
+4. Deploy the repository to Vercel.
+5. Add the environment variables shown in [`.env.example`](./.env.example).
+6. Generate a random `TELEGRAM_WEBHOOK_SECRET`, add it to the deployment, and
+   register the Telegram webhook with the same value:
 
-## Troubleshooting
-
-- **No messages**: Check `JOB_BOT_TOKEN` and `SUPABASE_KEY` in Vercel env vars
-- **No jobs matched**: Broaden your keywords or change seniority to "All Levels"
-- **Vercel errors**: Check Function Logs in your Vercel dashboard — errors are now properly logged
-- **Webhook not responding**: Re-run the `setWebhook` URL above
-
----
-
-## Architecture
-
+```text
+https://api.telegram.org/bot<JOB_BOT_TOKEN>/setWebhook?url=https://<DOMAIN>/api/webhook&secret_token=<TELEGRAM_WEBHOOK_SECRET>
 ```
-Telegram User
-     │
-     ▼
-api/webhook.py  ← handles all messages & button taps
-     │
-     ▼
-Supabase        ← stores users, jobs, sent history, analytics
 
-[Cron 3×/day]
-     │
-     ▼
-api/scan.py     ← fetches jobs, matches users, sends alerts
-     │
-     ▼
-api/jobs.py     ← scrapes 12 job sources in parallel
+The webhook rejects requests whose
+`X-Telegram-Bot-Api-Secret-Token` header does not match.
+
+### Important Supabase key rule
+
+`SUPABASE_KEY` must be the server-side `service_role` key—not the public anon
+key. Store it only in Vercel/GitHub secrets. Never expose it in frontend code.
+
+### OpenAI web discovery
+
+Set `OPENAI_API_KEY` to enable it. Without this key, all non-AI job sources keep
+working normally.
+
+Cost and coverage controls:
+
+- `OPENAI_MAX_SEARCHES`: maximum clustered searches per scan; default `6`.
+- `OPENAI_RESULTS_PER_SEARCH`: requested jobs per search; default `12`.
+- `OPENAI_MODEL`: model used for search and structured extraction.
+- `OPENAI_TIMEOUT`: request timeout in seconds.
+
+Only listings with a valid direct URL, company, title and parseable posting date
+within 30 days are accepted. The prompt prefers jobs from the last 7 days.
+
+## Required environment variables
+
+| Variable | Purpose |
+|---|---|
+| `JOB_BOT_TOKEN` | Telegram BotFather token |
+| `BOT_USERNAME` | Bot username without `@` |
+| `SUPABASE_URL` | Supabase project URL |
+| `SUPABASE_KEY` | Supabase `service_role` key |
+| `CRON_SECRET` | Protects `/api/scan` |
+| `TELEGRAM_WEBHOOK_SECRET` | Verifies Telegram webhook requests |
+| `AUTO_APPLY_OWNER_USERNAME` | Private beta owner; default `Harsimarhs` |
+| `AUTO_APPLY_ALLOWED_CHAT_ID` | Recommended numeric owner ID; overrides username |
+
+Optional: `OPENAI_API_KEY`, `OPENAI_MODEL`, `OPENAI_MAX_SEARCHES`,
+`OPENAI_RESULTS_PER_SEARCH`, `OPENAI_TIMEOUT`, `SCRAPER_KEY`, `LOG_LEVEL`.
+
+## Scheduling
+
+Vercel runs scans at 09:00, 15:00 and 21:00 UTC. The GitHub workflow is manual
+only, avoiding a duplicate 09:00 broadcast.
+
+For a manual protected call:
+
+```bash
+curl -H "Authorization: Bearer $CRON_SECRET" \
+  "https://<DOMAIN>/api/scan"
 ```
+
+## Job source policy
+
+Prefer official APIs, RSS feeds, public employer ATS endpoints and licensed job
+data providers. Do not scrape sources whose terms or robots policy prohibit it.
+Keep source attribution and always link users to the original listing.
+
+Good next source adapters include Adzuna, USAJOBS and country-specific public
+employment portals. API credentials can be added independently without changing
+the matching layer.
+
+## Commands
+
+- `/start` — onboarding
+- `/find` — personalized jobs
+- `/search waiter` — one-off search
+- `/abroad UAE, Japan, Singapore, New Zealand` — turn on visa-first matching
+- `/local` — turn off relocation mode
+- `/autoapply` — owner-only Apply Agent; others get a DM link
+- `/applications` — owner-only application review queue
+- `/keywords` — update target roles
+- `/saved` — bookmarks
+- `/watch Company` — company watchlist
+- `/status` — preferences
+- `/stop` — pause alerts
+- `/delete` — delete account data
+
+## Before production
+
+- Expand adapter and end-to-end webhook test coverage.
+- Add a database-backed scan lock for horizontally concurrent invocations.
+- Move long scans to a queue/worker if the source count grows substantially.
+- Add source health, cost and job-expiry dashboards.
+- Add audited ATS adapters and a durable browser worker before enabling any
+  real cross-site submission. Keep final submission opt-in and user-approved.
+- Verify every overseas offer and recruiting agent before sharing documents or
+  money; the bot is a discovery tool, not an immigration adviser.
