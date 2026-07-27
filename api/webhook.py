@@ -1,5 +1,5 @@
 """
-Remote Radar — Telegram Webhook
+Super Job Bot — Telegram Webhook
 Fixes applied:
   #1  Structured logging — no more silent failures
   #3  UX: jobs sent as individual cards with action buttons
@@ -25,7 +25,7 @@ Fixes applied:
          ALTER TABLE users ADD CONSTRAINT users_chat_id_unique UNIQUE (chat_id);
        Also ensure SUPABASE_KEY is the service_role key, not anon.
 """
-import os, json, time, requests, re
+import os, json, time, requests, re, hmac
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
 from http.server import BaseHTTPRequestHandler
@@ -35,19 +35,21 @@ BOT_TOKEN    = os.environ.get("JOB_BOT_TOKEN", "")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 TG_API       = f"https://api.telegram.org/bot{BOT_TOKEN}"
-BOT_USERNAME = os.environ.get("BOT_USERNAME", "RemoteDailyJobBot")
+BOT_USERNAME = os.environ.get("BOT_USERNAME", "RemoteJobsAlertBot")
+TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
 FIND_COOLDOWN = 60   # seconds between /find calls
+MAX_WEBHOOK_BYTES = 1_000_000
 
-WELCOME = """👋 <b>Welcome to Remote Radar!</b>
+WELCOME = """👋 <b>Welcome to Super Job Bot!</b>
 
-Get fresh remote job alerts on Telegram — free, forever, worldwide.
+Get fresh local, hybrid and remote job alerts on Telegram.
 
-🌍 12 global sources, scanned daily
-🎯 Fully personalised to your role
+🌍 Job boards + company pages + AI web discovery
+🎯 Waiter to director — every kind of role
 ⚡ Hot jobs flagged within 24h
-💰 Salary & funding info included
+📍 Search any city, region or country
 
-Takes 60 seconds to set up 👇
+Takes about 30 seconds to set up 👇
 
 <i>Built by <a href="https://t.me/Harsimarhs">@Harsimarhs</a> — questions always welcome</i>"""
 
@@ -144,7 +146,7 @@ def track(chat_id, event, meta=None):
         sb_post("analytics", {
             "chat_id": chat_id,
             "event":   event,
-            "meta":    json.dumps(meta or {}),
+            "meta":    meta or {},
             "ts":      datetime.now(timezone.utc).isoformat(),
         }, prefer="return=minimal")
     except Exception:
@@ -226,6 +228,416 @@ def get_user_feedback(chat_id):
     disliked = {r["job_id"] for r in rows if r.get("feedback") == "dislike"}
     return liked, disliked
 
+# ── Apply Agent helpers ───────────────────────────────────────────────────────
+
+def get_candidate_profile(chat_id):
+    rows = sb_get(f"candidate_profiles?chat_id=eq.{chat_id}&select=*&limit=1")
+    return rows[0] if rows else {}
+
+def is_autoapply_owner(chat_id, username=""):
+    from api.apply_agent import auto_apply_allowed
+    if not username:
+        username = get_user(chat_id).get("username", "")
+    return auto_apply_allowed(username=username, chat_id=chat_id)
+
+def autoapply_access_message(chat_id):
+    from api.apply_agent import owner_username
+    owner = sanitize(owner_username(), 64)
+    send(
+        chat_id,
+        "🔒 <b>Auto Apply is currently a private beta.</b>\n\n"
+        f"Only <b>@{owner}</b> can use it right now. If you want access or "
+        "want us to apply on your behalf, send a DM.",
+        [[{"text": f"💬 DM @{owner}", "url": f"https://t.me/{owner}"}]],
+    )
+
+def set_candidate_profile(chat_id, data):
+    payload = dict(data)
+    payload["chat_id"] = chat_id
+    payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+    sb_post("candidate_profiles", payload, prefer="resolution=merge-duplicates")
+
+def update_candidate_profile(chat_id, data):
+    payload = dict(data)
+    payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+    if not sb_patch(f"candidate_profiles?chat_id=eq.{chat_id}", payload):
+        set_candidate_profile(chat_id, payload)
+
+def queue_applications(chat_id, jobs, username=""):
+    """Queue matches only for users who explicitly enabled review mode."""
+    if not is_autoapply_owner(chat_id, username):
+        return 0
+    profile = get_candidate_profile(chat_id)
+    if profile.get("auto_apply_mode") != "review":
+        return 0
+    from api.apply_agent import adapter_for, job_snapshot
+    rows = []
+    for job in jobs:
+        job_id = str(job.get("job_id") or job.get("_id") or "")
+        if not job_id:
+            continue
+        rows.append({
+            "chat_id": chat_id,
+            "job_id": job_id,
+            "status": "queued",
+            "adapter": adapter_for(job.get("url")),
+            "apply_method": "review_then_open",
+            "job_snapshot": job_snapshot(job),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        })
+    if rows:
+        sb_post("applications", rows, prefer="resolution=ignore-duplicates")
+    return len(rows)
+
+def handle_autoapply(chat_id, username=""):
+    if not is_autoapply_owner(chat_id, username):
+        autoapply_access_message(chat_id)
+        return
+    profile = get_candidate_profile(chat_id)
+    if profile.get("setup_step") == "ready":
+        enabled = profile.get("auto_apply_mode") == "review"
+        status = "🟢 Review mode ON" if enabled else "⚪ Off"
+        send(
+            chat_id,
+            "🤖 <b>Apply Agent</b>\n\n"
+            f"Status: <b>{status}</b>\n"
+            f"Resume: {sanitize(profile.get('resume_file_name') or 'Not uploaded')}\n"
+            f"Candidate: {sanitize(profile.get('full_name'))}\n\n"
+            "When ON, matching jobs are auto-queued and the agent prepares a "
+            "truthful application draft. You approve before opening/submitting "
+            "any employer form.",
+            [
+                [{"text": "✅ Turn Review Mode On", "callback_data": "autoapply_on"},
+                 {"text": "⏹ Turn Off", "callback_data": "autoapply_off"}],
+                [{"text": "📥 Review Queue", "callback_data": "applications"},
+                 {"text": "📄 Replace Resume", "callback_data": "autoapply_resume"}],
+            ],
+        )
+        return
+    pending_prompts = {
+        "awaiting_resume": "📄 Upload your resume as PDF, DOC or DOCX (max 10 MB).",
+        "awaiting_name": "What is your full legal name?",
+        "awaiting_email": "What email should job applications use?",
+        "awaiting_phone": "What phone number should applications use? Include country code.",
+        "awaiting_city": "What city and country do you currently live in?",
+    }
+    if profile.get("setup_step") in pending_prompts:
+        send(
+            chat_id,
+            "🤖 <b>Continue Apply Agent setup</b>\n\n"
+            + pending_prompts[profile["setup_step"]],
+        )
+        return
+    send(
+        chat_id,
+        "🤖 <b>Set up Apply Agent</b>\n\n"
+        "• Upload your resume once\n"
+        "• Add name, email, phone and current city\n"
+        "• Matching jobs are queued automatically\n"
+        "• AI drafts never invent qualifications\n"
+        "• <b>You approve before any final application step</b>\n\n"
+        "Your resume stays as a private Telegram file reference in the database. "
+        "This version does not send the resume to OpenAI.",
+        [[{"text": "🔐 I Agree — Set It Up", "callback_data": "autoapply_consent"}],
+         [{"text": "❌ Not Now", "callback_data": "status"}]],
+    )
+
+def handle_resume_document(chat_id, document, username=""):
+    if not is_autoapply_owner(chat_id, username):
+        autoapply_access_message(chat_id)
+        return
+    profile = get_candidate_profile(chat_id)
+    if profile.get("setup_step") != "awaiting_resume":
+        send(chat_id, "Use /autoapply first, then upload your resume.")
+        return
+    name = str(document.get("file_name") or "resume")
+    mime = str(document.get("mime_type") or "").lower()
+    size = int(document.get("file_size") or 0)
+    allowed = (
+        mime in (
+            "application/pdf",
+            "application/msword",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+        or name.lower().endswith((".pdf", ".doc", ".docx"))
+    )
+    if not allowed:
+        send(chat_id, "Please upload a PDF, DOC or DOCX resume.")
+        return
+    if size > 10 * 1024 * 1024:
+        send(chat_id, "Resume is too large. Please keep it under 10 MB.")
+        return
+    already_complete = all(
+        profile.get(field)
+        for field in ("full_name", "email", "phone", "current_city")
+    )
+    update_candidate_profile(chat_id, {
+        "resume_file_id": document.get("file_id"),
+        "resume_file_unique_id": document.get("file_unique_id"),
+        "resume_file_name": name[:180],
+        "resume_mime_type": mime[:120],
+        "resume_size": size,
+        "setup_step": "ready" if already_complete else "awaiting_name",
+    })
+    if already_complete:
+        send(
+            chat_id,
+            "✅ Resume replaced. Your Apply Agent settings are unchanged.",
+            [[{"text": "📥 Review Queue", "callback_data": "applications"}]],
+        )
+    else:
+        send(chat_id, "✅ Resume saved privately.\n\nWhat is your <b>full legal name</b>?")
+
+def handle_apply_profile_text(chat_id, text, profile, username=""):
+    step = profile.get("setup_step")
+    value = text.strip()
+    if step and step not in ("not_started", "ready") and not is_autoapply_owner(
+        chat_id, username
+    ):
+        autoapply_access_message(chat_id)
+        return True
+    if step == "awaiting_resume":
+        send(chat_id, "Please upload your resume as a PDF, DOC or DOCX file.")
+        return True
+    if step == "awaiting_name":
+        if len(value) < 2 or len(value) > 120:
+            send(chat_id, "Please enter your full name (2–120 characters).")
+            return True
+        update_candidate_profile(chat_id, {
+            "full_name": value,
+            "setup_step": "awaiting_email",
+        })
+        send(chat_id, "What email should job applications use?")
+        return True
+    if step == "awaiting_email":
+        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", value):
+            send(chat_id, "That email does not look valid. Please try again.")
+            return True
+        update_candidate_profile(chat_id, {
+            "email": value[:180],
+            "setup_step": "awaiting_phone",
+        })
+        send(chat_id, "What phone number should applications use? Include country code.")
+        return True
+    if step == "awaiting_phone":
+        digits = re.sub(r"\D", "", value)
+        if len(digits) < 8 or len(digits) > 15:
+            send(chat_id, "Please enter a valid phone number with country code.")
+            return True
+        update_candidate_profile(chat_id, {
+            "phone": value[:40],
+            "setup_step": "awaiting_city",
+        })
+        send(chat_id, "What city and country do you currently live in?")
+        return True
+    if step == "awaiting_city":
+        if len(value) < 2 or len(value) > 120:
+            send(chat_id, "Please enter a city and country.")
+            return True
+        update_candidate_profile(chat_id, {
+            "current_city": value,
+            "setup_step": "ready",
+            "auto_apply_mode": "review",
+        })
+        track(chat_id, "autoapply_setup_complete")
+        send(
+            chat_id,
+            "✅ <b>Apply Agent is ready</b>\n\n"
+            "New matching jobs will be added to your review queue. Use "
+            "/applications anytime. Nothing is finally submitted without you.",
+            [[{"text": "🔍 Find Jobs Now", "callback_data": "find_jobs"},
+              {"text": "📥 Review Queue", "callback_data": "applications"}]],
+        )
+        return True
+    return False
+
+def _application_job(application):
+    snapshot = application.get("job_snapshot") or {}
+    if snapshot:
+        return snapshot
+    rows = sb_get(
+        f"jobs?job_id=eq.{application.get('job_id','')}&select=*&limit=1"
+    )
+    return rows[0] if rows else {}
+
+def prepare_application(chat_id, job_id, username=""):
+    if not is_autoapply_owner(chat_id, username):
+        autoapply_access_message(chat_id)
+        return
+    from api.apply_agent import (
+        adapter_for, build_application_draft, job_snapshot, profile_ready,
+    )
+    profile = get_candidate_profile(chat_id)
+    if not profile_ready(profile):
+        send(chat_id, "Set up your resume and profile first with /autoapply.")
+        handle_autoapply(chat_id, username)
+        return
+    rows = sb_get(f"jobs?job_id=eq.{job_id}&select=*&limit=1")
+    if not rows:
+        queued = sb_get(
+            f"applications?chat_id=eq.{chat_id}&job_id=eq.{job_id}&select=*&limit=1"
+        )
+        job = _application_job(queued[0]) if queued else {}
+    else:
+        job = rows[0]
+    if not job:
+        send(chat_id, "This job is no longer available in the cache.")
+        return
+    send(chat_id, "🤖 Preparing a truthful application draft...")
+    draft = build_application_draft(job, profile)
+    now = datetime.now(timezone.utc).isoformat()
+    sb_post("applications", {
+        "chat_id": chat_id,
+        "job_id": job_id,
+        "status": "awaiting_approval",
+        "adapter": adapter_for(job.get("url")),
+        "apply_method": "review_then_open",
+        "cover_letter": draft.get("cover_letter", ""),
+        "why_fit": draft.get("why_fit", ""),
+        "questions_to_confirm": draft.get("questions_to_confirm", []),
+        "job_snapshot": job_snapshot(job),
+        "updated_at": now,
+    }, prefer="resolution=merge-duplicates")
+    applications = sb_get(
+        f"applications?chat_id=eq.{chat_id}&job_id=eq.{job_id}&select=*&limit=1"
+    )
+    if not applications:
+        send(chat_id, "Could not save the draft. Please try again.")
+        return
+    application = applications[0]
+    questions = application.get("questions_to_confirm") or []
+    question_text = "\n".join(f"• {sanitize(q, 180)}" for q in questions[:3])
+    cover = sanitize(application.get("cover_letter"), 1000)
+    job = _application_job(application)
+    send(
+        chat_id,
+        "🤖 <b>Application ready for review</b>\n\n"
+        f"💼 <b>{sanitize(job.get('title'))}</b>\n"
+        f"🏢 {sanitize(job.get('company'))}\n\n"
+        f"<b>Draft cover letter</b>\n<i>{cover}</i>\n\n"
+        + (f"<b>Please confirm on the employer form</b>\n{question_text}\n\n"
+           if question_text else "")
+        + "Approval records your consent and gives you the original employer "
+          "form. It does not falsely mark the application as submitted.",
+        [[{"text": "✅ Approve & Continue", "callback_data": f"applyapprove_{application['id']}"}],
+         [{"text": "⏭ Skip This Job", "callback_data": f"applyskip_{application['id']}"}]],
+    )
+    track(chat_id, "application_drafted", {"job_id": job_id})
+
+def handle_applications(chat_id, username=""):
+    if not is_autoapply_owner(chat_id, username):
+        autoapply_access_message(chat_id)
+        return
+    rows = sb_get(
+        f"applications?chat_id=eq.{chat_id}"
+        "&status=in.(queued,awaiting_approval,manual_required)"
+        "&select=*&order=created_at.desc&limit=8"
+    )
+    if not rows:
+        send(
+            chat_id,
+            "📥 <b>Your application queue is empty.</b>\n\n"
+            "Turn on /autoapply and use /find. New matching jobs will appear here.",
+        )
+        return
+    send(chat_id, f"📥 <b>{len(rows)} applications to review</b>")
+    for application in rows:
+        job = _application_job(application)
+        status = application.get("status", "queued").replace("_", " ").title()
+        text = (
+            f"💼 <b>{sanitize(job.get('title') or 'Job')}</b>\n"
+            f"🏢 {sanitize(job.get('company'))}\n"
+            f"📍 {sanitize(job.get('location'))}\n"
+            f"🤖 {status}"
+        )
+        if application.get("status") == "manual_required":
+            url = sanitize_url(job.get("url"))
+            buttons = []
+            if url:
+                buttons.append([{"text": "🌐 Open Employer Form", "url": url}])
+            buttons.append([{
+                "text": "✅ Mark as Submitted",
+                "callback_data": f"applysubmitted_{application['id']}",
+            }])
+        elif application.get("status") == "awaiting_approval":
+            buttons = [
+                [{"text": "✅ Approve & Continue",
+                  "callback_data": f"applyapprove_{application['id']}"}],
+                [{"text": "⏭ Skip", "callback_data": f"applyskip_{application['id']}"}],
+            ]
+        else:
+            buttons = [[{"text": "🤖 Prepare Draft",
+                         "callback_data": f"applyprep_{application['job_id']}"}]]
+        send(chat_id, text, buttons)
+
+def approve_application(chat_id, application_id, username=""):
+    if not is_autoapply_owner(chat_id, username):
+        autoapply_access_message(chat_id)
+        return
+    rows = sb_get(
+        f"applications?id=eq.{application_id}&chat_id=eq.{chat_id}&select=*&limit=1"
+    )
+    if not rows:
+        send(chat_id, "Application not found.")
+        return
+    application = rows[0]
+    job = _application_job(application)
+    url = sanitize_url(job.get("url"))
+    update = {
+        "status": "manual_required",
+        "approved_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    sb_patch(f"applications?id=eq.{application_id}&chat_id=eq.{chat_id}", update)
+    send(
+        chat_id,
+        "✅ <b>Approved</b>\n\n"
+        "Open the original employer form below. Upload your saved resume, copy "
+        "the draft if needed, and complete employer-specific questions or "
+        "CAPTCHA yourself.\n\n"
+        f"<b>Cover letter</b>\n<i>{sanitize(application.get('cover_letter'), 1800)}</i>",
+        (
+            [[{"text": "🌐 Open Employer Form", "url": url}],
+             [{"text": "✅ Mark as Submitted",
+               "callback_data": f"applysubmitted_{application_id}"}]]
+            if url
+            else [[{"text": "✅ Mark as Submitted",
+                    "callback_data": f"applysubmitted_{application_id}"}]]
+        ),
+    )
+    track(chat_id, "application_approved", {"job_id": application.get("job_id")})
+
+def skip_application(chat_id, application_id, username=""):
+    if not is_autoapply_owner(chat_id, username):
+        autoapply_access_message(chat_id)
+        return
+    sb_patch(
+        f"applications?id=eq.{application_id}&chat_id=eq.{chat_id}",
+        {
+            "status": "skipped",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    track(chat_id, "application_skipped", {"application_id": application_id})
+
+def mark_application_submitted(chat_id, application_id, username=""):
+    if not is_autoapply_owner(chat_id, username):
+        autoapply_access_message(chat_id)
+        return
+    rows = sb_get(
+        f"applications?id=eq.{application_id}&chat_id=eq.{chat_id}&select=job_id&limit=1"
+    )
+    if not rows:
+        send(chat_id, "Application not found.")
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    sb_patch(
+        f"applications?id=eq.{application_id}&chat_id=eq.{chat_id}",
+        {"status": "submitted", "submitted_at": now, "updated_at": now},
+    )
+    track(chat_id, "application_submitted", {"job_id": rows[0].get("job_id")})
+    send(chat_id, "🎉 Marked as submitted. Good luck!")
+
 # ── Telegram helpers ──────────────────────────────────────────────────────────
 
 def send(chat_id, text, keyboard=None, retries=3):
@@ -303,7 +715,7 @@ def fmt_date(date_val):
         except Exception:
             return ""
 
-def format_job_card(job, show_actions=True):
+def format_job_card(job, show_actions=True, allow_autoapply=False):
     hot     = "🔥 " if job.get("hot") else ""
     title   = sanitize(job.get("title", ""))
     company = sanitize(job.get("company", ""))
@@ -321,8 +733,16 @@ def format_job_card(job, show_actions=True):
         lines.append(f"💰 {sanitize(job['salary'])}")
     if job.get("funding"):
         lines.append(f"💸 Funded: {sanitize(job['funding'])}")
-    if job.get("visa"):
-        lines.append("✈️ Visa sponsorship available")
+    if job.get("visa_status") == "confirmed" or job.get("visa"):
+        lines.append("🛂 <b>Employer visa/work-permit support confirmed</b>")
+    elif job.get("overseas_candidates"):
+        lines.append("🌍 Overseas applicants accepted")
+    mode = (job.get("work_mode") or "").lower()
+    employment = (job.get("employment_type") or "").replace("_", " ").title()
+    if mode and mode != "unknown":
+        lines.append(f"🧭 {sanitize(mode.title())}")
+    if employment and employment.lower() != "unknown":
+        lines.append(f"🕒 {sanitize(employment)}")
     if desc:
         lines.append(f"<i>{desc}…</i>")
     lines.append(f"📊 {difficulty_score(job)}")
@@ -341,14 +761,22 @@ def format_job_card(job, show_actions=True):
             [{"text": "🔖 Save",        "callback_data": f"save_{job_id}"},
              {"text": "📤 Share",       "callback_data": f"share_{job_id}"}],
         ]
+        if allow_autoapply:
+            buttons.insert(
+                0,
+                [{"text": "🤖 Prepare Application",
+                  "callback_data": f"applyprep_{job_id}"}],
+            )
     return text, buttons
 
 # ── Keyboards ─────────────────────────────────────────────────────────────────
 
 def kb_main():
-    return [[{"text": "⚙️ Set Up Alerts", "callback_data": "setup_start"}],
-            [{"text": "📋 My Preferences", "callback_data": "status"},
-             {"text": "⏹ Pause",           "callback_data": "stop"}]]
+    return [[{"text": "🔍 Find Jobs", "callback_data": "find_jobs"}],
+            [{"text": "🌍 Abroad Job + Work Visa", "callback_data": "abroad_setup"}],
+            [{"text": "🤖 Auto Apply — Private Beta", "callback_data": "autoapply"}],
+            [{"text": "⚙️ Set Up / Preferences", "callback_data": "setup_start"},
+             {"text": "⏹ Pause",        "callback_data": "stop"}]]
 
 def kb_seniority():
     return [
@@ -373,19 +801,20 @@ def kb_location():
         [{"text": "🌏 SE Asia",         "callback_data": "loc_sea"},
          {"text": "🕌 Middle East",     "callback_data": "loc_me"}],
         [{"text": "🇪🇺 Europe",        "callback_data": "loc_europe"}],
+        [{"text": "📍 Any other city / region", "callback_data": "loc_custom"}],
         [{"text": "🌐 Worldwide",        "callback_data": "loc_worldwide"}],
     ]
 
-def kb_company_type():
-    return [
-        [{"text": "🚀 Startups & Scale-ups",  "callback_data": "ctype_startup"}],
-        [{"text": "🏢 Established Companies", "callback_data": "ctype_established"}],
-        [{"text": "🌍 Both / Any",            "callback_data": "ctype_any"}],
-    ]
-
-def kb_after_jobs():
+def kb_after_jobs(chat_id, username=""):
+    apply_row = (
+        [{"text": "🤖 Application Queue", "callback_data": "applications"}]
+        if is_autoapply_owner(chat_id, username)
+        else [{"text": "🤖 Request Auto Apply", "callback_data": "autoapply"}]
+    )
     return [
         [{"text": "🔍 Find More", "callback_data": "find_jobs"}],
+        apply_row,
+        [{"text": "🌍 Abroad + Visa Mode", "callback_data": "abroad_setup"}],
         [{"text": "🔖 Saved",     "callback_data": "show_saved"},
          {"text": "📋 Profile",   "callback_data": "status"}],
     ]
@@ -400,6 +829,7 @@ LOC_LABELS = {
     "india":     "🇮🇳 India",       "nigeria": "🇳🇬 Nigeria", "japan": "🇯🇵 Japan",
     "china":     "🇨🇳 China",       "sea": "🌏 SE Asia",       "me": "🕌 Middle East",
     "europe":    "🇪🇺 Europe",      "worldwide": "🌐 Worldwide",
+    "custom":    "📍 Custom location",
 }
 CTYPE_LABELS = {
     "startup": "🚀 Startups", "established": "🏢 Established", "any": "🌍 Any",
@@ -422,38 +852,25 @@ LOC_MAP = {
 
 def job_matches_user(job, user):
     try:
-        from api.jobs import is_title_relevant, matches_location, matches_seniority
-        title = sanitize(job.get("title", ""))
-        if not is_title_relevant(title, user.get("keywords", ""), user.get("category", "all")):
-            return False
-        if not matches_location(job.get("location", "Remote"), user.get("location", "Remote"),
-                                user.get("remote_only", True)):
-            return False
-        if not matches_seniority(title, user.get("seniority", "all")):
-            return False
-        ctype = user.get("company_type", "any")
-        if ctype == "startup" and job.get("company_type", "") not in ("startup",""):
-            return False
-        if ctype == "established" and job.get("company_type", "") == "startup":
-            return False
-        return True
+        from api.jobs import matches_user
+        return matches_user(job, user)
     except Exception as e:
         logger.error(f"job_matches_user: {e}")
         return False
 
 def send_jobs_from_cache(chat_id, user, page=0, keyword_override=None):
-    # Check rate limit using already-fetched user — no extra DB call
-    allowed, remaining = check_rate_limit(chat_id, user)
-    if not allowed:
-        send(chat_id, f"⏳ Please wait {remaining}s before searching again.")
-        return
+    # Pagination is part of an existing search and must not hit the /find cooldown.
+    if page == 0:
+        allowed, remaining = check_rate_limit(chat_id, user)
+        if not allowed:
+            send(chat_id, f"⏳ Please wait {remaining}s before searching again.")
+            return
 
-    # Send instantly so user sees a response while DB work happens below
-    send(chat_id, "🔍 Searching...")
-    update_user(chat_id, {
-        "last_find_at":   datetime.now(timezone.utc).isoformat(),
-        "last_active_at": datetime.now(timezone.utc).isoformat(),
-    })
+        send(chat_id, "🔍 Searching...")
+        update_user(chat_id, {
+            "last_find_at":   datetime.now(timezone.utc).isoformat(),
+            "last_active_at": datetime.now(timezone.utc).isoformat(),
+        })
     track(chat_id, "find_jobs", {"page": page})
 
     cached = get_cached_jobs()
@@ -461,19 +878,26 @@ def send_jobs_from_cache(chat_id, user, page=0, keyword_override=None):
         send(chat_id, "No jobs cached yet — the daily scan runs at 9am UTC.", kb_main())
         return
 
-    from api.jobs import score
+    from api.jobs import feedback_affinity, score
     keywords = keyword_override or user.get("keywords", "")
 
     liked_ids, disliked_ids = get_user_feedback(chat_id)
+    liked_jobs = [j for j in cached if j.get("job_id", "") in liked_ids]
 
     # Bulk fetch all sent job IDs in ONE query instead of one per job
     sent_rows = sb_get(f"sent_jobs?chat_id=eq.{chat_id}&select=job_id")
     sent_ids  = {r["job_id"] for r in sent_rows} if sent_rows else set()
 
     if keyword_override:
-        matched = [j for j in cached
-                   if keyword_override.lower() in (j.get("title","") or "").lower()
-                   and j.get("job_id","") not in disliked_ids]
+        search_user = dict(user)
+        search_user["keywords"] = keyword_override
+        search_user["category"] = "all"
+        matched = [
+            j for j in cached
+            if keyword_override.lower() in (j.get("title","") or "").lower()
+            and j.get("job_id","") not in disliked_ids
+            and (not user.get("relocation_only") or job_matches_user(j, search_user))
+        ]
     else:
         matched = [j for j in cached
                    if job_matches_user(j, user)
@@ -482,24 +906,36 @@ def send_jobs_from_cache(chat_id, user, page=0, keyword_override=None):
 
     matched.sort(key=lambda j: (
         -(50 if j.get("job_id","") in liked_ids else 0),
+        -feedback_affinity(j, liked_jobs),
         -score(j.get("title",""), keywords),
         not j.get("hot", False)
     ))
 
     per_page = 5
-    start    = page * per_page
+    # Profile searches mark each delivered job as sent. On the next page those
+    # jobs are already excluded, so the next batch starts at zero.
+    start    = page * per_page if keyword_override else 0
     batch    = matched[start:start + per_page]
-    has_more = len(matched) > start + per_page
+    has_more = not keyword_override and len(matched) > start + per_page
 
     if not batch:
-        tips = (
-            "📭 <b>No new matches found.</b>\n\n"
-            "A few things to try:\n"
-            "• Broaden your keywords (e.g. <code>marketing</code> instead of <code>web3 marketing manager</code>)\n"
-            "• Switch seniority to <b>All Levels</b>\n"
-            "• Set location to <b>Worldwide</b>\n\n"
-            "Fresh jobs arrive every few hours."
-        )
+        if user.get("relocation_only"):
+            tips = (
+                "📭 <b>No verified visa-supported matches in the cache yet.</b>\n\n"
+                "The bot intentionally hides jobs that require existing local work rights. "
+                "The next scheduled scan will search your target countries again.\n\n"
+                "Try broader role keywords such as "
+                "<code>waiter, kitchen helper, housekeeping, warehouse, store assistant</code>."
+            )
+        else:
+            tips = (
+                "📭 <b>No new matches found.</b>\n\n"
+                "A few things to try:\n"
+                "• Broaden your keywords (e.g. <code>marketing</code> instead of <code>web3 marketing manager</code>)\n"
+                "• Switch seniority to <b>All Levels</b>\n"
+                "• Set location to <b>Worldwide</b>\n\n"
+                "Fresh jobs arrive every few hours."
+            )
         send(chat_id, tips,
              [[{"text": "🔑 Update Keywords",    "callback_data": "add_keywords"},
                {"text": "⚙️ Change Preferences", "callback_data": "setup_start"}]])
@@ -513,23 +949,41 @@ def send_jobs_from_cache(chat_id, user, page=0, keyword_override=None):
     header += f"\n📡 {', '.join(sources[:4])}"
     send(chat_id, header)
 
+    allow_autoapply = is_autoapply_owner(chat_id, user.get("username", ""))
     for job in batch:
-        text, buttons = format_job_card(job, show_actions=True)
+        text, buttons = format_job_card(
+            job, show_actions=True, allow_autoapply=allow_autoapply
+        )
         send(chat_id, text, buttons)
         if not keyword_override:
             mark_sent(chat_id, job["job_id"])
         time.sleep(0.1)
 
-    footer_kb = kb_after_jobs()
+    queued_count = (
+        queue_applications(chat_id, batch, user.get("username", ""))
+        if not keyword_override else 0
+    )
+    footer_kb = kb_after_jobs(chat_id, user.get("username", ""))
     if has_more:
         footer_kb = [[{"text": f"➡️ Load {min(5, len(matched) - start - per_page)} more",
                        "callback_data": f"find_page_{page+1}"}]] + footer_kb
 
-    send(chat_id, "✅ Tap 👍 on good matches — it trains your feed.", footer_kb)
+    queue_note = (
+        f"\n🤖 {queued_count} added to your application review queue."
+        if queued_count else ""
+    )
+    send(
+        chat_id,
+        f"✅ Tap 👍 on good matches — it trains your feed.{queue_note}",
+        footer_kb,
+    )
 
 # ── Onboarding FSM ────────────────────────────────────────────────────────────
 
-SETUP_STEPS = ["awaiting_role", "awaiting_seniority", "awaiting_location", "awaiting_ctype"]
+SETUP_STEPS = [
+    "awaiting_role", "awaiting_seniority", "awaiting_location",
+    "awaiting_custom_location", "awaiting_ctype",
+]
 
 def get_current_step(user):
     for step in SETUP_STEPS:
@@ -546,8 +1000,10 @@ def _reset_to_step1(chat_id):
         "awaiting_role":      True,
         "awaiting_seniority": False,
         "awaiting_location":  False,
+        "awaiting_custom_location": False,
         "awaiting_ctype":     False,
         "awaiting_keywords":  False,
+        "awaiting_abroad_countries": False,
     })
     # Verify the write actually landed
     verify = get_user(chat_id)
@@ -566,7 +1022,7 @@ def handle_start(chat_id, username, ref_code=None):
         step = get_current_step(existing)
         if step == "awaiting_role":
             send(chat_id,
-                 "⚙️ <b>Step 1 of 4 — Your Role</b>\n\n"
+                 "⚙️ <b>Step 1 of 3 — Your Role</b>\n\n"
                  "What job role are you looking for?\n\n"
                  "<b>Examples:</b>\n"
                  "• <code>Community Manager</code>\n"
@@ -576,11 +1032,14 @@ def handle_start(chat_id, username, ref_code=None):
                  "Type your role and send 👇",
                  [[{"text": "❌ Cancel", "callback_data": "status"}]])
             return
-        elif step in ("awaiting_seniority", "awaiting_location", "awaiting_ctype"):
+        elif step in (
+            "awaiting_seniority", "awaiting_location",
+            "awaiting_custom_location", "awaiting_ctype",
+        ):
             _reset_to_step1(chat_id)
             send(chat_id,
                  "👋 Let's pick up where you left off.\n\n"
-                 "<b>Step 1 of 4 — Your Role</b>\n\nType your role and send 👇",
+                 "<b>Step 1 of 3 — Your Role</b>\n\nType your role and send 👇",
                  [[{"text": "❌ Cancel", "callback_data": "status"}]])
             return
     else:
@@ -595,10 +1054,14 @@ def handle_start(chat_id, username, ref_code=None):
             "location_key":       "worldwide",
             "remote_only":        False,
             "company_type":       "any",
+            "relocation_only":     False,
+            "target_countries":    "",
             "awaiting_keywords":  False,
+            "awaiting_abroad_countries": False,
             "awaiting_role":      False,
             "awaiting_seniority": False,
             "awaiting_location":  False,
+            "awaiting_custom_location": False,
             "awaiting_ctype":     False,
             "streak":             0,
             "referrals":          0,
@@ -625,6 +1088,82 @@ def handle_start(chat_id, username, ref_code=None):
     track(chat_id, "start", {"is_new": is_new})
     send(chat_id, WELCOME, kb_main())
 
+
+def handle_abroad(chat_id, text=""):
+    user = get_user(chat_id)
+    if not user:
+        set_user(chat_id, {
+            "active": False,
+            "setup_complete": False,
+            "relocation_only": True,
+            "target_countries": "",
+        })
+        user = get_user(chat_id)
+    countries = sanitize(
+        re.sub(
+            r"[^A-Za-zÀ-ÿ ,.&()/-]",
+            "",
+            text.replace("/abroad", "", 1).strip().lstrip(","),
+        ),
+        max_len=200,
+    )
+    if not user or not user.get("setup_complete"):
+        update_user(chat_id, {
+            "relocation_only": True,
+            "target_countries": countries,
+            "awaiting_abroad_countries": False,
+        })
+        send(
+            chat_id,
+            "🌍 <b>Abroad + Work Visa mode selected.</b>\n\n"
+            "First tell me the role you can do. You can enter multiple roles, "
+            "for example:\n<code>dishwasher, waiter, store assistant, warehouse</code>",
+        )
+        step1_role(chat_id, 0)
+        return
+    if not countries:
+        update_user(chat_id, {"awaiting_abroad_countries": True})
+        send(
+            chat_id,
+            "🌍 <b>Which countries should I target?</b>\n\n"
+            "Type comma-separated countries, for example:\n"
+            "<code>UAE, Japan, Singapore, New Zealand</code>\n\n"
+            "Or type <code>Worldwide</code>.",
+            [[{"text": "❌ Turn off abroad mode", "callback_data": "abroad_off"}]],
+        )
+        return
+    update_user(chat_id, {
+        "relocation_only": True,
+        "target_countries": countries,
+        "remote_only": False,
+        "awaiting_abroad_countries": False,
+        "last_find_at": None,
+        "active": True,
+    })
+    track(chat_id, "abroad_mode_enabled", {"countries": countries})
+    send(
+        chat_id,
+        f"✅ <b>Abroad + Work Visa mode is ON</b>\n\n"
+        f"🎯 Countries: {countries}\n"
+        "🛂 Only jobs with credible employer visa/work-permit support or "
+        "explicit overseas-candidate acceptance will match.\n\n"
+        "Fresh visa-first discovery runs with the scheduled scan.",
+        [[{"text": "🔍 Check Matching Jobs", "callback_data": "find_jobs"},
+          {"text": "📋 View Profile", "callback_data": "status"}]],
+    )
+
+
+def handle_abroad_off(chat_id):
+    update_user(chat_id, {
+        "relocation_only": False,
+        "target_countries": "",
+        "awaiting_abroad_countries": False,
+        "last_find_at": None,
+    })
+    track(chat_id, "abroad_mode_disabled")
+    send(chat_id, "✅ Abroad mode is off. Regular local/remote matching restored.", kb_main())
+
+
 def handle_status(chat_id):
     user = get_user(chat_id)
     if not user or not user.get("setup_complete"):
@@ -632,24 +1171,36 @@ def handle_status(chat_id):
         return
     kws       = user.get("keywords", "") or "—"
     status    = "✅ Active" if user.get("active") else "⏸ Paused"
-    referrals = user.get("referrals", 0) or 0
-    streak    = user.get("streak", 0) or 0
-    invite    = f"t.me/{BOT_USERNAME}?start=ref_{chat_id}"
-    send(chat_id,
-         f"📋 <b>Your Profile</b>\n\n"
-         f"🎯 Keywords: {sanitize(kws)}\n"
-         f"🎓 Level: {SEN_LABELS.get(user.get('seniority', 'all'), 'All Levels')}\n"
-         f"📍 Location: {LOC_LABELS.get(user.get('location_key', 'worldwide'), 'Worldwide')}\n"
-         f"🏢 Company: {CTYPE_LABELS.get(user.get('company_type', 'any'), 'Any')}\n"
-         f"📡 Alerts: {status}"
-         + (f"\n🔥 {streak}-day streak!" if streak > 1 else "") +
-         f"\n\n👥 Referrals: <b>{referrals}</b>\n"
-         f"🔗 <code>{invite}</code>",
-         [[{"text": "✏️ Edit Preferences", "callback_data": "setup_start"},
-           {"text": "⏹ Pause",             "callback_data": "stop"}],
-          [{"text": "🔍 Find Jobs Now",     "callback_data": "find_jobs"},
-           {"text": "🔖 Saved",             "callback_data": "show_saved"}],
-          [{"text": "👥 Invite Friends",    "callback_data": "invite"}]])
+    location_label = (
+        sanitize(user.get("location", "Worldwide"))
+        if user.get("location_key") == "custom"
+        else LOC_LABELS.get(user.get("location_key", "worldwide"), "Worldwide")
+    )
+    abroad_line = (
+        f"\n🌍 Abroad + Visa: ✅ {sanitize(user.get('target_countries') or 'Worldwide')}"
+        if user.get("relocation_only")
+        else "\n🌍 Abroad + Visa: Off"
+    )
+    apply_button = (
+        {"text": "🤖 Application Queue", "callback_data": "applications"}
+        if is_autoapply_owner(chat_id, user.get("username", ""))
+        else {"text": "🤖 Request Auto Apply", "callback_data": "autoapply"}
+    )
+    send(
+        chat_id,
+        f"📋 <b>Your Job Profile</b>\n\n"
+        f"🎯 {sanitize(kws)}\n"
+        f"🎓 {SEN_LABELS.get(user.get('seniority', 'all'), 'All Levels')}\n"
+        f"📍 {location_label}\n"
+        f"🏢 {CTYPE_LABELS.get(user.get('company_type', 'any'), 'Any')}\n"
+        f"📡 Alerts: {status}{abroad_line}",
+        [[{"text": "🔍 Find Jobs", "callback_data": "find_jobs"},
+          {"text": "🔖 Saved", "callback_data": "show_saved"}],
+         [{"text": "✏️ Edit Preferences", "callback_data": "setup_start"},
+          {"text": "🌍 Visa Settings", "callback_data": "abroad_setup"}],
+         [apply_button],
+         [{"text": "⏹ Pause Alerts", "callback_data": "stop"}]],
+    )
 
 def handle_saved(chat_id):
     saved = sb_get(f"saved_jobs?chat_id=eq.{chat_id}&select=*&order=created_at.desc&limit=10")
@@ -684,13 +1235,29 @@ def handle_invite(chat_id):
          f"👥 <b>Invite Friends</b>\n\n"
          f"Your link: <code>{invite}</code>\n\n"
          f"People invited: <b>{referrals}</b>\n\n"
-         f"<i>Send this to anyone job hunting — free daily remote alerts, set up in 60 seconds.</i>")
+         f"<i>Send this to anyone job hunting — fresh local and remote alerts, set up in 60 seconds.</i>")
 
 def handle_stop(chat_id):
     update_user(chat_id, {"active": False})
     track(chat_id, "paused")
     send(chat_id, "⏸ Alerts paused.",
-         [[{"text": "▶️ Resume Alerts", "callback_data": "setup_start"}]])
+         [[{"text": "▶️ Resume Alerts", "callback_data": "resume_alerts"}]])
+
+def handle_resume_alerts(chat_id):
+    user = get_user(chat_id)
+    if not user.get("setup_complete"):
+        step1_role(chat_id)
+        return
+    update_user(chat_id, {
+        "active": True,
+        "last_active_at": datetime.now(timezone.utc).isoformat(),
+    })
+    track(chat_id, "resumed")
+    send(
+        chat_id,
+        "▶️ Alerts resumed. Fresh matches will arrive on the next scan.",
+        [[{"text": "🔍 Find Jobs Now", "callback_data": "find_jobs"}]],
+    )
 
 def handle_delete(chat_id):
     try:
@@ -763,14 +1330,12 @@ def handle_search(chat_id, text):
 
 # ── Onboarding steps ──────────────────────────────────────────────────────────
 
-def step1_role(chat_id, msg_id):
+def step1_role(chat_id, msg_id=None):
     _reset_to_step1(chat_id)
-    try:
+    if msg_id is not None:
         edit(chat_id, msg_id, "⚙️ Setting up your alerts...")
-    except Exception:
-        pass
     send(chat_id,
-         "⚙️ <b>Step 1 of 4 — Your Role</b>\n\n"
+         "⚙️ <b>Step 1 of 3 — Your Role</b>\n\n"
          "What job are you looking for?\n\n"
          "<b>Examples:</b>\n"
          "• <code>Community Manager</code>\n"
@@ -785,7 +1350,7 @@ def step2_seniority(chat_id, role):
     update_user(chat_id, {"awaiting_role": False, "awaiting_seniority": True})
     send(chat_id,
          f"✅ Role: <b>{sanitize(role)}</b>\n\n"
-         f"⚙️ <b>Step 2 of 4 — Level</b>\n\nWhat seniority are you targeting?",
+         f"⚙️ <b>Step 2 of 3 — Level</b>\n\nWhat seniority are you targeting?",
          kb_seniority())
 
 def step3_location(chat_id, msg_id, seniority, cb_id):
@@ -794,37 +1359,53 @@ def step3_location(chat_id, msg_id, seniority, cb_id):
                            "awaiting_location": True})
     edit(chat_id, msg_id,
          f"✅ Level: {SEN_LABELS.get(seniority, seniority)}\n\n"
-         f"⚙️ <b>Step 3 of 4 — Location</b>\n\nWhere are you looking to work?",
+         f"⚙️ <b>Step 3 of 3 — Location</b>\n\nWhere are you looking to work?",
          kb_location())
 
 def step4_company_type(chat_id, msg_id, loc_key, cb_id):
+    if loc_key == "custom":
+        answer(cb_id, "✅ Type your location")
+        update_user(chat_id, {
+            "awaiting_location": False,
+            "awaiting_custom_location": True,
+        })
+        edit(
+            chat_id,
+            msg_id,
+            "📍 <b>Type any city, region or country</b>\n\n"
+            "Examples: <code>Amritsar</code>, <code>Dubai</code>, "
+            "<code>Ontario, Canada</code>",
+        )
+        return
     loc_name, remote_only = LOC_MAP.get(loc_key, ("Worldwide", False))
     answer(cb_id, f"✅ {LOC_LABELS.get(loc_key, loc_key)}")
     update_user(chat_id, {"location": loc_name, "location_key": loc_key,
                            "remote_only": remote_only, "awaiting_location": False,
-                           "awaiting_ctype": True})
-    edit(chat_id, msg_id,
-         f"✅ Location: {LOC_LABELS.get(loc_key, loc_key)}\n\n"
-         f"⚙️ <b>Step 4 of 4 — Company Type</b>\n\nWhat kind of company do you prefer?",
-         kb_company_type())
+                           "awaiting_ctype": False})
+    finish_setup(chat_id, msg_id, "any", None)
 
 def finish_setup(chat_id, msg_id, ctype, cb_id):
-    answer(cb_id, f"✅ {CTYPE_LABELS.get(ctype, ctype)}")
+    if cb_id:
+        answer(cb_id, f"✅ {CTYPE_LABELS.get(ctype, ctype)}")
     update_user(chat_id, {"company_type": ctype, "active": True, "setup_complete": True,
                            "awaiting_ctype": False, "last_find_at": None})
-    user   = get_user(chat_id)
-    invite = f"t.me/{BOT_USERNAME}?start=ref_{chat_id}"
+    user = get_user(chat_id)
+    location_label = (
+        sanitize(user.get("location", "Worldwide"))
+        if user.get("location_key") == "custom"
+        else LOC_LABELS.get(user.get("location_key", "worldwide"), "Worldwide")
+    )
     track(chat_id, "setup_complete")
     send(chat_id,
          f"🎉 <b>You're all set!</b>\n\n"
          f"🎯 {sanitize(user.get('keywords', ''))}\n"
          f"🎓 {SEN_LABELS.get(user.get('seniority', 'all'), 'All Levels')}\n"
-         f"📍 {LOC_LABELS.get(user.get('location_key', 'worldwide'), 'Worldwide')}\n"
-         f"🏢 {CTYPE_LABELS.get(ctype, 'Any')}\n\n"
-         f"Alerts go out 3× daily. Find jobs right now 👇\n\n"
-         f"👥 Share: <code>{invite}</code>",
-         [[{"text": "🔍 Find Jobs Now",  "callback_data": "find_jobs"},
-           {"text": "👥 Invite",         "callback_data": "invite"}]])
+         f"📍 {location_label}\n"
+         "\n"
+         "Alerts go out 3× daily. Find jobs right now 👇",
+         [[{"text": "🔍 Find Jobs Now", "callback_data": "find_jobs"}]])
+    if user.get("relocation_only") and not user.get("target_countries"):
+        handle_abroad(chat_id)
 
 # ── Main update processor ─────────────────────────────────────────────────────
 
@@ -836,12 +1417,30 @@ def process_update(update):
             username = msg.get("from", {}).get("username", "")
             text     = msg.get("text", "") or ""
 
+            if msg.get("document"):
+                if not get_user(chat_id):
+                    set_user(chat_id, {
+                        "username": username,
+                        "active": False,
+                        "setup_complete": False,
+                    })
+                handle_resume_document(chat_id, msg["document"], username)
+                return
+
             if text and not text.startswith("/"):
                 user = get_user(chat_id)
+                profile = get_candidate_profile(chat_id)
+                if handle_apply_profile_text(chat_id, text, profile, username):
+                    return
                 logger.info(f"Text from {chat_id}: '{text[:40]}' | "
                             f"awaiting_role={user.get('awaiting_role')} "
                             f"awaiting_keywords={user.get('awaiting_keywords')} "
-                            f"awaiting_search={user.get('awaiting_search')}")
+                            f"awaiting_search={user.get('awaiting_search')} "
+                            f"awaiting_abroad={user.get('awaiting_abroad_countries')}")
+
+                if user.get("awaiting_abroad_countries"):
+                    handle_abroad(chat_id, text)
+                    return
 
                 if user.get("awaiting_role"):
                     role = sanitize(text.strip(), max_len=150)
@@ -864,7 +1463,22 @@ def process_update(update):
                         "last_find_at":      None,
                     })
                     send(chat_id, f"✅ Keywords updated: <b>{kw}</b>")
-                    send_jobs_from_cache(chat_id, user)
+                    send_jobs_from_cache(chat_id, get_user(chat_id))
+                    return
+
+                if user.get("awaiting_custom_location"):
+                    location = sanitize(text.strip(), max_len=120)
+                    if len(location) < 2:
+                        send(chat_id, "Please type a city, region or country.")
+                        return
+                    update_user(chat_id, {
+                        "location": location,
+                        "location_key": "custom",
+                        "remote_only": False,
+                        "awaiting_custom_location": False,
+                        "awaiting_ctype": False,
+                    })
+                    finish_setup(chat_id, None, "any", None)
                     return
 
                 if user.get("awaiting_search"):
@@ -887,12 +1501,26 @@ def process_update(update):
                 handle_keywords(chat_id, text)
             elif text.startswith("/search"):
                 handle_search(chat_id, text)
+            elif text.startswith("/abroad"):
+                handle_abroad(chat_id, text)
+            elif text.startswith("/local"):
+                handle_abroad_off(chat_id)
+            elif text.startswith("/autoapply"):
+                if not get_user(chat_id):
+                    set_user(chat_id, {
+                        "username": username,
+                        "active": False,
+                        "setup_complete": False,
+                    })
+                handle_autoapply(chat_id, username)
+            elif text.startswith("/applications"):
+                handle_applications(chat_id, username)
             elif text.startswith("/find"):
                 user = get_user(chat_id)
                 if user.get("setup_complete"):
                     send_jobs_from_cache(chat_id, user)
                 else:
-                    send(chat_id, "Please set up your preferences first.", kb_main())
+                    step1_role(chat_id)
             elif text.startswith("/saved"):
                 handle_saved(chat_id)
             elif text.startswith("/unwatch"):
@@ -914,7 +1542,7 @@ def process_update(update):
                 if step or not (user or {}).get("setup_complete"):
                     _reset_to_step1(chat_id)
                     send(chat_id,
-                         "⚙️ <b>Step 1 of 4 — Your Role</b>\n\nType your role and send 👇",
+                         "⚙️ <b>Step 1 of 3 — Your Role</b>\n\nType your role and send 👇",
                          [[{"text": "❌ Cancel", "callback_data": "status"}]])
                 else:
                     send(chat_id, "What would you like to change?",
@@ -927,18 +1555,16 @@ def process_update(update):
                        {"text": "❌ Cancel",        "callback_data": "status"}]])
             elif text.startswith("/help"):
                 send(chat_id,
-                     "📖 <b>Commands</b>\n\n"
-                     "/find — Find jobs now\n"
-                     "/search <i>keyword</i> — Quick search without changing profile\n"
-                     "/keywords — Update keywords\n"
-                     "/saved — Saved jobs\n"
-                     "/watch <i>Company</i> — Get notified when a company posts\n"
-                     "/unwatch — Manage watchlist\n"
-                     "/status — View your profile\n"
-                     "/setup — Update preferences\n"
-                     "/invite — Your referral link\n"
-                     "/stop — Pause alerts\n"
-                     "/delete — Delete account")
+                     "📖 <b>Quick Help</b>\n\n"
+                     "🔍 /find — Find personalized jobs\n"
+                     "🌍 /abroad UAE, New Zealand — Visa-first mode\n"
+                     "🤖 /autoapply — Auto Apply private beta\n"
+                     "🔖 /saved — Saved jobs\n"
+                     "⚙️ /status — Profile and settings\n\n"
+                     "<b>More tools</b>\n"
+                     "/search waiter · /keywords · /watch Company\n"
+                     "/local · /stop · /delete",
+                     kb_main())
 
         elif "callback_query" in update:
             cb       = update["callback_query"]
@@ -948,11 +1574,48 @@ def process_update(update):
             data     = cb.get("data", "")
             cb_id    = cb["id"]
 
-            if not get_user(chat_id):
+            current_user = get_user(chat_id)
+            if not current_user:
                 set_user(chat_id, {"username": username, "active": False,
                                    "setup_complete": False})
+            elif username and current_user.get("username") != username:
+                update_user(chat_id, {"username": username})
 
-            if data.startswith("like_"):
+            private_apply_action = (
+                data.startswith((
+                    "applyprep_", "applyapprove_", "applyskip_", "applysubmitted_",
+                ))
+                or data in {
+                    "autoapply_consent", "autoapply_resume", "autoapply_on",
+                    "autoapply_off", "applications",
+                }
+            )
+            if private_apply_action and not is_autoapply_owner(chat_id, username):
+                answer(cb_id, "Private beta — DM @Harsimarhs")
+                autoapply_access_message(chat_id)
+                return
+
+            if data.startswith("applyprep_"):
+                job_id = data.replace("applyprep_", "")
+                answer(cb_id, "Preparing application...")
+                prepare_application(chat_id, job_id, username)
+
+            elif data.startswith("applyapprove_"):
+                application_id = data.replace("applyapprove_", "")
+                answer(cb_id, "Approved")
+                approve_application(chat_id, application_id, username)
+
+            elif data.startswith("applyskip_"):
+                application_id = data.replace("applyskip_", "")
+                skip_application(chat_id, application_id, username)
+                answer(cb_id, "Skipped")
+
+            elif data.startswith("applysubmitted_"):
+                application_id = data.replace("applysubmitted_", "")
+                answer(cb_id, "Marked as submitted")
+                mark_application_submitted(chat_id, application_id, username)
+
+            elif data.startswith("like_"):
                 job_id = data.replace("like_", "")
                 save_feedback(chat_id, job_id, "like")
                 track(chat_id, "job_like", {"job_id": job_id})
@@ -986,7 +1649,7 @@ def process_update(update):
                 answer(cb_id, "🎉 Congratulations!")
                 send(chat_id,
                      "🎉 <b>Congratulations on landing the job!</b>\n\n"
-                     "Share Remote Radar with someone who's still searching 👇",
+                     "Share Super Job Bot with someone who's still searching 👇",
                      [[{"text": "👥 Share My Invite Link", "callback_data": "invite"}]])
 
             elif data.startswith("share_"):
@@ -1003,7 +1666,7 @@ def process_update(update):
                          f"📤 <b>Share this job:</b>\n\n"
                          f"💼 {title} @ {company}\n"
                          f"🔗 {url}\n\n"
-                         f"Get daily remote alerts free: {invite}")
+                         f"Get fresh local and remote job alerts: {invite}")
 
             elif data.startswith("find_page_"):
                 try:
@@ -1019,12 +1682,56 @@ def process_update(update):
                 step1_role(chat_id, msg_id)
 
             elif data == "find_jobs":
-                answer(cb_id, "Searching...")
                 user = get_user(chat_id)
-                send_jobs_from_cache(chat_id, user)
+                if user.get("setup_complete"):
+                    answer(cb_id, "Searching...")
+                    send_jobs_from_cache(chat_id, user)
+                else:
+                    answer(cb_id, "Let's set up your profile")
+                    step1_role(chat_id, msg_id)
+            elif data == "abroad_setup":
+                answer(cb_id)
+                handle_abroad(chat_id)
+            elif data == "abroad_off":
+                answer(cb_id)
+                handle_abroad_off(chat_id)
             elif data == "show_saved":
                 answer(cb_id)
                 handle_saved(chat_id)
+            elif data == "autoapply":
+                answer(cb_id)
+                handle_autoapply(chat_id, username)
+            elif data == "autoapply_consent":
+                answer(cb_id)
+                set_candidate_profile(chat_id, {
+                    "setup_step": "awaiting_resume",
+                    "auto_apply_mode": "off",
+                    "consent_version": "review-first-v1",
+                    "consented_at": datetime.now(timezone.utc).isoformat(),
+                })
+                send(
+                    chat_id,
+                    "📄 Upload your resume now as PDF, DOC or DOCX (max 10 MB).",
+                )
+            elif data == "autoapply_resume":
+                answer(cb_id)
+                update_candidate_profile(chat_id, {"setup_step": "awaiting_resume"})
+                send(chat_id, "📄 Upload the replacement PDF, DOC or DOCX resume.")
+            elif data == "autoapply_on":
+                answer(cb_id, "Review mode enabled")
+                profile = get_candidate_profile(chat_id)
+                if profile.get("setup_step") == "ready":
+                    update_candidate_profile(chat_id, {"auto_apply_mode": "review"})
+                    send(chat_id, "🟢 Apply Agent review mode is ON.")
+                else:
+                    handle_autoapply(chat_id, username)
+            elif data == "autoapply_off":
+                answer(cb_id, "Apply Agent paused")
+                update_candidate_profile(chat_id, {"auto_apply_mode": "off"})
+                send(chat_id, "⏹ Apply Agent is off. Existing queue is kept.")
+            elif data == "applications":
+                answer(cb_id)
+                handle_applications(chat_id, username)
             elif data == "invite":
                 answer(cb_id)
                 handle_invite(chat_id)
@@ -1038,6 +1745,9 @@ def process_update(update):
             elif data == "stop":
                 answer(cb_id)
                 handle_stop(chat_id)
+            elif data == "resume_alerts":
+                answer(cb_id, "Alerts resumed")
+                handle_resume_alerts(chat_id)
             elif data == "confirm_delete":
                 answer(cb_id)
                 handle_delete(chat_id)
@@ -1054,7 +1764,24 @@ def process_update(update):
 
 class handler(BaseHTTPRequestHandler):
     def do_POST(self):
+        if not TELEGRAM_WEBHOOK_SECRET:
+            logger.error("TELEGRAM_WEBHOOK_SECRET is required")
+            self.send_response(503)
+            self.end_headers()
+            self.wfile.write(b"Webhook secret is not configured")
+            return
+        provided = self.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if not hmac.compare_digest(provided, TELEGRAM_WEBHOOK_SECRET):
+            self.send_response(403)
+            self.end_headers()
+            self.wfile.write(b"Forbidden")
+            return
         length = int(self.headers.get("Content-Length", 0))
+        if length <= 0 or length > MAX_WEBHOOK_BYTES:
+            self.send_response(413)
+            self.end_headers()
+            self.wfile.write(b"Invalid payload size")
+            return
         body   = self.rfile.read(length)
         try:
             update = json.loads(body)
@@ -1070,7 +1797,7 @@ class handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Remote Radar is running.")
+        self.wfile.write(b"Super Job Bot is running.")
 
     def log_message(self, *args):
         pass
