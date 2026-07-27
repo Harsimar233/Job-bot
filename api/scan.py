@@ -1,5 +1,5 @@
 """
-Remote Radar — Daily Job Scanner (Cron)
+Super Job Bot — Daily Job Scanner (Cron)
 Fixes applied:
   #1  Structured logging throughout
   #2  Broadcast sleep reduced 10× — won't timeout on Vercel
@@ -19,11 +19,12 @@ from api import logger
 BOT_TOKEN    = os.environ.get("JOB_BOT_TOKEN", "")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+CRON_SECRET  = os.environ.get("CRON_SECRET", "")
 TG_API       = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 # Minimum hours between alerts per user — 6h allows all 3 crons (9am/3pm/9pm)
 # but prevents a single cron from double-firing if Vercel retries
-MIN_HOURS_BETWEEN_ALERTS = 6
+MIN_HOURS_BETWEEN_ALERTS = 5.5
 
 def sanitize_url(url):
     if not url:
@@ -105,8 +106,19 @@ def store_jobs(jobs):
              "company": sanitize(j.get("company","")), "url": sanitize_url(j.get("url","")),
              "source": sanitize(j.get("source","")), "date_posted": str(j.get("date","")),
              "location": sanitize(j.get("location","Remote")), "salary": sanitize(j.get("salary","")),
+             "description": sanitize(j.get("desc",""), max_len=600),
              "funding": sanitize(j.get("funding","")), "company_type": j.get("company_type",""),
-             "visa": bool(j.get("visa",False)), "hot": bool(j.get("hot",False)),
+             "work_mode": sanitize(j.get("work_mode","unknown")),
+             "employment_type": sanitize(j.get("employment_type","unknown")),
+             "category": sanitize(j.get("category","")),
+             "experience": sanitize(j.get("experience","")),
+             "apply_method": sanitize(j.get("apply_method","url")),
+             "discovery_method": sanitize(j.get("discovery_method","scraper")),
+             "evidence": sanitize(j.get("evidence",""), max_len=300),
+             "visa_status": sanitize(j.get("visa_status","unknown")),
+             "visa": bool(j.get("visa",False)),
+             "overseas_candidates": bool(j.get("overseas_candidates",False)),
+             "hot": bool(j.get("hot",False)),
              "scraped_at": datetime.now(timezone.utc).isoformat()}
             for j in jobs]
     hdrs = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
@@ -224,6 +236,10 @@ def format_job_compact(job, show_divider=False):
     lines.append(f"📍 {loc}" if loc and loc.lower() not in ("remote","") else "📍 Remote")
     if job.get("salary"):
         lines.append(f"💰 {sanitize(job['salary'])}")
+    if job.get("visa_status") == "confirmed" or job.get("visa"):
+        lines.append("🛂 <b>Employer visa/work-permit support confirmed</b>")
+    elif job.get("overseas_candidates"):
+        lines.append("🌍 Overseas applicants accepted")
     if desc:
         lines.append(f"<i>{desc}…</i>")
     lines.append(f"📊 {difficulty_score(job)}")
@@ -234,6 +250,31 @@ def format_job_compact(job, show_divider=False):
     return "\n".join(lines)
 
 FIND_MORE_BTN = [[{"text": "🔍 Find More Jobs", "callback_data": "find_jobs"}]]
+APPLY_QUEUE_BTN = [
+    [{"text": "🤖 Review Application Queue", "callback_data": "applications"}],
+    [{"text": "🔍 Find More Jobs", "callback_data": "find_jobs"}],
+]
+
+def queue_applications(chat_id, jobs):
+    from api.apply_agent import adapter_for, job_snapshot
+    rows = []
+    now = datetime.now(timezone.utc).isoformat()
+    for job in jobs:
+        job_id = str(job.get("_id") or job.get("job_id") or "")
+        if not job_id:
+            continue
+        rows.append({
+            "chat_id": chat_id,
+            "job_id": job_id,
+            "status": "queued",
+            "adapter": adapter_for(job.get("url")),
+            "apply_method": "review_then_open",
+            "job_snapshot": job_snapshot(job),
+            "updated_at": now,
+        })
+    if rows:
+        sb("post", "applications", rows, prefer="resolution=ignore-duplicates")
+    return len(rows)
 
 def send_jobs_grouped(chat_id, jobs, batch_size=3):
     """Send jobs in groups of 3. Rate-limit sleep is minimal — Telegram allows 30 msg/s."""
@@ -246,15 +287,30 @@ def send_jobs_grouped(chat_id, jobs, batch_size=3):
 
 def run():
     logger.info("=== Scan started ===")
-    from api.jobs import get_all_jobs, matches_user, score
-
-    logger.info("Fetching all jobs from sources...")
-    all_jobs = get_all_jobs()
-    store_jobs(all_jobs)
+    from api.apply_agent import auto_apply_allowed
+    from api.jobs import feedback_affinity, get_all_jobs, matches_user, score
 
     logger.info("Fetching active users...")
     users = sb("get", "users?active=eq.true&setup_complete=eq.true")
     logger.info(f"Active users to process: {len(users)}")
+    review_profiles = sb(
+        "get",
+        "candidate_profiles?auto_apply_mode=eq.review&setup_step=eq.ready&select=chat_id",
+    )
+    users_by_chat = {user["chat_id"]: user for user in users}
+    review_chat_ids = {
+        row["chat_id"]
+        for row in review_profiles
+        if row["chat_id"] in users_by_chat
+        and auto_apply_allowed(
+            username=users_by_chat[row["chat_id"]].get("username", ""),
+            chat_id=row["chat_id"],
+        )
+    }
+
+    logger.info("Fetching all jobs from sources...")
+    all_jobs = get_all_jobs(users=users)
+    store_jobs(all_jobs)
 
     sent_count    = 0
     skipped_count = 0
@@ -272,6 +328,7 @@ def run():
 
         # Load feedback to boost/suppress jobs
         liked_ids, disliked_ids = get_user_feedback(chat_id)
+        liked_jobs = [j for j in all_jobs if j.get("_id") in liked_ids]
 
         matched = [j for j in all_jobs
                    if matches_user(j, user)
@@ -279,6 +336,7 @@ def run():
                    and j["_id"] not in disliked_ids]   # hard-filter disliked jobs
         matched.sort(key=lambda j: (
             -feedback_score(j, liked_ids, disliked_ids),
+            -feedback_affinity(j, liked_jobs),
             -score(j["title"], keywords),
             not j.get("hot",False)
         ))
@@ -328,10 +386,18 @@ def run():
         for job in batch:
             mark_sent(chat_id, job["_id"])
 
+        queued_count = (
+            queue_applications(chat_id, batch) if chat_id in review_chat_ids else 0
+        )
+        queue_note = (
+            f"\n🤖 {queued_count} jobs added to your application review queue."
+            if queued_count else ""
+        )
         send(chat_id,
             "✅ That's today's batch.\n"
-            "💡 Tip: tap 👍 on jobs you like — we'll refine your matches.",
-            FIND_MORE_BTN)
+            "💡 Tip: tap 👍 on jobs you like — we'll refine your matches."
+            + queue_note,
+            APPLY_QUEUE_BTN if queued_count else FIND_MORE_BTN)
 
         sent_count += 1
         time.sleep(0.1)   # 100ms between users — enough to stay under Telegram broadcast limits
@@ -359,13 +425,27 @@ def run():
 
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Scan running...")
+        if not CRON_SECRET:
+            logger.error("CRON_SECRET is required")
+            self.send_response(503)
+            self.end_headers()
+            self.wfile.write(b"Cron secret is not configured")
+            return
+        if self.headers.get("Authorization") != f"Bearer {CRON_SECRET}":
+            self.send_response(401)
+            self.end_headers()
+            self.wfile.write(b"Unauthorized")
+            return
         try:
             run()
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"Scan complete")
         except Exception as e:
             logger.error(f"Scan handler: {e}", exc=e)
+            self.send_response(500)
+            self.end_headers()
+            self.wfile.write(b"Scan failed")
 
     def log_message(self, *args):
         pass
