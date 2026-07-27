@@ -1,5 +1,5 @@
 """
-Remote Radar — Global Job Engine
+Super Job Bot — Global Job Engine
 Fixes applied:
   #1  Structured logging (no more silent failures)
   #9  HTML sanitization hardened — external data can't inject markup
@@ -13,7 +13,7 @@ Fixes applied:
 """
 import re, os, requests, feedparser, hashlib
 from datetime import datetime, timezone, timedelta
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout, as_completed
 from bs4 import BeautifulSoup
 from email.utils import parsedate_to_datetime
 from api import logger
@@ -92,9 +92,45 @@ def fmt_date(s):
     dt = parse_date(s)
     return dt.strftime("%-d %b %Y") if dt else ""
 
-def has_visa(text):
+def detect_visa_status(text):
+    t = re.sub(r"\s+", " ", re.sub(r"[-–—]", " ", (text or "").lower())).strip()
+    negative = [
+        "no visa sponsorship", "unable to sponsor", "cannot sponsor",
+        "do not sponsor", "does not sponsor", "will not sponsor",
+        "not eligible for sponsorship", "no sponsorship",
+        "without sponsorship", "must be authorized to work",
+        "must have work authorization", "sponsorship is not available",
+    ]
+    if any(term in t for term in negative):
+        return "not_offered"
+    positive = [
+        "visa sponsorship", "visa support", "sponsor your visa",
+        "sponsorship available",
+        "visa sponsorship available", "visa sponsorship provided",
+        "work visa provided", "work permit provided", "we sponsor visas",
+        "employer sponsored visa", "relocation and visa support",
+        "overseas applicants welcome", "international applicants welcome",
+    ]
+    return "confirmed" if any(term in t for term in positive) else "unknown"
+
+
+def accepts_overseas_candidates(text):
     t = (text or "").lower()
-    return any(k in t for k in ["visa sponsor", "visa support", "work authorization"])
+    negative = [
+        "local candidates only", "must currently reside", "existing work rights",
+        "must be authorized to work", "no overseas applicants",
+    ]
+    if any(term in t for term in negative):
+        return False
+    return any(term in t for term in [
+        "overseas applicants welcome", "international applicants welcome",
+        "applications from overseas", "candidates outside the country",
+        "recruiting from overseas",
+    ])
+
+
+def has_visa(text):
+    return detect_visa_status(text) == "confirmed"
 
 # ── Established companies list ─────────────────────────────────────────────────
 # Used to tag jobs from well-known companies as 'established' (not 'startup')
@@ -154,9 +190,15 @@ def classify_company(company_name, is_startup_flag=None):
 # ── Job factory ───────────────────────────────────────────────────────────────
 
 def make_job(title, company, url, source, date="", location="Remote",
-             desc="", salary="", funding="", company_type=""):
+             desc="", salary="", funding="", company_type="", work_mode="unknown",
+             employment_type="unknown", category="", experience="",
+             apply_method="url", discovery_method="scraper", evidence="",
+             visa_status="", overseas_candidates=False):
     if not company_type:
         company_type = classify_company(company)
+    if visa_status not in ("confirmed", "possible", "not_offered", "unknown"):
+        visa_status = ""
+    visa_status = visa_status or detect_visa_status(desc)
     return {
         "title":        clean(title, 150),
         "company":      clean(company, 100),
@@ -168,7 +210,18 @@ def make_job(title, company, url, source, date="", location="Remote",
         "salary":       clean(salary, 100),
         "funding":      clean(funding, 100),
         "company_type": company_type,
-        "visa":         has_visa(desc),
+        "work_mode":    clean(work_mode, 20).lower() or "unknown",
+        "employment_type": clean(employment_type, 30).lower() or "unknown",
+        "category":     clean(category, 60),
+        "experience":   clean(experience, 80),
+        "apply_method": clean(apply_method, 20).lower() or "url",
+        "discovery_method": clean(discovery_method, 40),
+        "evidence":     clean(evidence, 300),
+        "visa_status":  visa_status,
+        "visa":         visa_status == "confirmed",
+        "overseas_candidates": bool(
+            overseas_candidates or accepts_overseas_candidates(desc)
+        ),
         "hot":          is_hot(date),
         "_id":          hashlib.md5((url or title or "").encode()).hexdigest()[:12],
     }
@@ -225,6 +278,22 @@ CATEGORY_KEYWORDS = {
                     "cto","cmo","coo","cfo"],
     "web3":        ["web3","crypto","blockchain","defi","nft","dao","dex","protocol","token",
                     "wallet","exchange","ethereum","bitcoin","layer2","metaverse","gamefi","on-chain"],
+    "hospitality": ["waiter","waitress","server","bartender","barista","chef","cook","kitchen",
+                    "restaurant manager","hotel","housekeeping","front desk","concierge","banquet",
+                    "food service","dishwasher"],
+    "retail":      ["cashier","store associate","retail associate","shop assistant","merchandiser",
+                    "store manager","sales assistant","inventory associate","customer assistant"],
+    "logistics":   ["driver","delivery","courier","warehouse","picker","packer","forklift",
+                    "dispatcher","logistics","supply chain","fleet","loader"],
+    "healthcare":  ["nurse","doctor","physician","medical assistant","caregiver","pharmacist",
+                    "therapist","lab technician","healthcare","dental","radiologist","paramedic"],
+    "education":   ["teacher","tutor","lecturer","professor","teaching assistant","school",
+                    "education","trainer","instructor","counsellor"],
+    "trades":      ["electrician","plumber","carpenter","welder","mechanic","technician",
+                    "construction","mason","painter","hvac","machine operator","maintenance"],
+    "services":    ["security guard","cleaner","janitor","housekeeper","salon","beautician",
+                    "receptionist","office assistant","helper","field worker"],
+    "government":  ["government","civil service","public sector","municipal","federal","state job"],
 }
 
 EXCLUDE_TITLES = ["intern (unpaid)", "volunteer only", "commission only"]
@@ -377,6 +446,30 @@ def matches_location(job_location, user_location, user_remote_only):
             return any(c in jloc for c in cities)
     return uloc in jloc or "remote" in jloc
 
+
+def matches_target_countries(job_location, target_countries):
+    location = (job_location or "").lower()
+    targets = (target_countries or "").lower()
+    if not targets or "anywhere" in targets or "worldwide" in targets:
+        return True
+    aliases = {
+        "uae": ["uae", "united arab emirates", "dubai", "abu dhabi", "sharjah"],
+        "dubai": ["uae", "united arab emirates", "dubai"],
+        "new zealand": ["new zealand", "auckland", "wellington", "christchurch"],
+        "nz": ["new zealand", "auckland", "wellington", "christchurch"],
+        "singapore": ["singapore"],
+        "japan": ["japan", "tokyo", "osaka", "kyoto", "nagoya"],
+        "australia": ["australia", "sydney", "melbourne", "brisbane", "perth"],
+        "canada": ["canada", "toronto", "vancouver", "ontario", "alberta"],
+        "europe": ["europe", "germany", "netherlands", "ireland", "poland", "portugal"],
+    }
+    requested = [item.strip() for item in re.split(r"[,;/|]", targets) if item.strip()]
+    for target in requested:
+        terms = aliases.get(target, [target])
+        if any(term in location for term in terms):
+            return True
+    return False
+
 def matches_seniority(title, user_level):
     if not user_level or user_level == "all":
         return True
@@ -404,7 +497,17 @@ def matches_seniority(title, user_level):
 def matches_user(job, user):
     if not is_title_relevant(job["title"], user.get("keywords",""), user.get("category","all")):
         return False
-    if not matches_location(job["location"], user.get("location","Remote"), user.get("remote_only",True)):
+    if user.get("relocation_only"):
+        if not matches_target_countries(job.get("location", ""), user.get("target_countries", "")):
+            return False
+        if not (
+            job.get("visa_status") == "confirmed"
+            or job.get("overseas_candidates") is True
+        ):
+            return False
+    elif not matches_location(
+        job["location"], user.get("location","Remote"), user.get("remote_only",True)
+    ):
         return False
     if not matches_seniority(job["title"], user.get("seniority","all")):
         return False
@@ -433,6 +536,31 @@ def score(title, keywords=""):
     all_kws = [k for kws in CATEGORY_KEYWORDS.values() for k in kws]
     s += sum(5 for k in all_kws if k in t)
     return min(s, 100)
+
+
+def feedback_affinity(job, liked_jobs):
+    """Small explainable boost for jobs resembling previously liked listings."""
+    if not liked_jobs:
+        return 0
+    boost = 0
+    category = (job.get("category") or "").lower()
+    company = (job.get("company") or "").lower()
+    stop = {"and", "the", "for", "with", "remote", "senior", "junior"}
+    title_words = {
+        token for token in re.findall(r"[a-z0-9]+", (job.get("title") or "").lower())
+        if len(token) > 2 and token not in stop
+    }
+    for liked in liked_jobs:
+        if category and category == (liked.get("category") or "").lower():
+            boost = max(boost, 12)
+        if company and company == (liked.get("company") or "").lower():
+            boost = max(boost, 10)
+        liked_words = {
+            token for token in re.findall(r"[a-z0-9]+", (liked.get("title") or "").lower())
+            if len(token) > 2 and token not in stop
+        }
+        boost = max(boost, min(20, len(title_words & liked_words) * 5))
+    return boost
 
 # ── Scrapers ──────────────────────────────────────────────────────────────────
 
@@ -799,27 +927,49 @@ def scrape_the_muse():
 
 # ── Master fetch ──────────────────────────────────────────────────────────────
 
-def get_all_jobs():
+def get_all_jobs(users=None):
+    from api.source_adapters import scrape_adzuna, scrape_usajobs
+
     scrapers = [
         scrape_remotive, scrape_wwr, scrape_remoteok, scrape_jobicy,
         scrape_himalayas, scrape_arbeitnow, scrape_web3career,
         scrape_greenhouse, scrape_lever, scrape_ashby,
-        scrape_hn_hiring, scrape_the_muse,
+        scrape_hn_hiring, scrape_the_muse, scrape_adzuna, scrape_usajobs,
     ]
     all_jobs       = []
     scraper_health = {}
 
     with ThreadPoolExecutor(max_workers=6) as ex:
         futures = {ex.submit(s): s.__name__ for s in scrapers}
-        for fut in as_completed(futures, timeout=500):
-            name = futures[fut]
-            try:
-                result = fut.result(timeout=70)
-                all_jobs += result
-                scraper_health[name] = len(result)
-            except Exception as e:
-                logger.error(f"Scraper [{name}] timed out or crashed: {e}")
+        try:
+            for fut in as_completed(futures, timeout=150):
+                name = futures[fut]
+                try:
+                    result = fut.result()
+                    all_jobs += result
+                    scraper_health[name] = len(result)
+                except Exception as e:
+                    logger.error(f"Scraper [{name}] timed out or crashed: {e}")
+                    scraper_health[name] = -1
+        except FuturesTimeout:
+            unfinished = [futures[fut] for fut in futures if not fut.done()]
+            for fut in futures:
+                if not fut.done():
+                    fut.cancel()
+            for name in unfinished:
                 scraper_health[name] = -1
+            logger.error(f"Scraper pool exceeded 150s; cancelled: {unfinished}")
+
+    # Optional demand-driven web discovery. Similar user profiles are clustered
+    # so this never becomes one OpenAI request per Telegram user.
+    try:
+        from api.openai_discovery import discover_jobs
+        ai_jobs = discover_jobs(users or [])
+        all_jobs += ai_jobs
+        scraper_health["openai_web_search"] = len(ai_jobs)
+    except Exception as e:
+        logger.error(f"OpenAI discovery source crashed: {e}")
+        scraper_health["openai_web_search"] = -1
 
     dead = [k for k, v in scraper_health.items() if v == -1]
     if dead:
