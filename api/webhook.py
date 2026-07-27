@@ -1,3 +1,4 @@
+dhud
 """
 Super Job Bot — Telegram Webhook
 Fixes applied:
@@ -97,10 +98,13 @@ def sb_post(path, body, prefer="resolution=merge-duplicates"):
     try:
         r = requests.post(f"{SUPABASE_URL}/rest/v1/{path}",
                           headers=_hdr({"Prefer": prefer}), json=body, timeout=10)
-        if r.status_code not in (200, 201):
+        if r.status_code not in (200, 201, 204):
             logger.sb_error("post", path, r.status_code, r.text)
+            return False
+        return True
     except Exception as e:
         logger.error(f"sb_post {path}: {e}")
+        return False
 
 def sb_patch(path, body):
     """
@@ -366,9 +370,23 @@ def queue_applications(chat_id, jobs, username=""):
             "job_snapshot": job_snapshot(job),
             "updated_at": datetime.now(timezone.utc).isoformat(),
         })
-    if rows:
-        sb_post("applications", rows, prefer="resolution=ignore-duplicates")
-    return len(rows)
+    if not rows:
+        return 0
+    if not sb_post(
+        "applications?on_conflict=chat_id,job_id",
+        rows,
+        prefer="resolution=ignore-duplicates,return=minimal",
+    ):
+        logger.error(f"Could not queue applications for chat {chat_id}")
+        return 0
+
+    # Never claim that jobs were queued until Supabase confirms the rows exist.
+    queued_rows = sb_get(
+        f"applications?chat_id=eq.{chat_id}&select=job_id&limit=200"
+    )
+    queued_ids = {str(row.get("job_id") or "") for row in queued_rows}
+    requested_ids = {row["job_id"] for row in rows}
+    return len(requested_ids & queued_ids)
 
 def handle_autoapply(chat_id, username=""):
     if not is_autoapply_owner(chat_id, username):
@@ -610,7 +628,7 @@ def prepare_application(chat_id, job_id, username=""):
     send(chat_id, "🤖 Preparing a truthful application draft...")
     draft = build_application_draft(job, profile)
     now = datetime.now(timezone.utc).isoformat()
-    sb_post("applications", {
+    application_payload = {
         "chat_id": chat_id,
         "job_id": job_id,
         "status": "awaiting_approval",
@@ -621,12 +639,41 @@ def prepare_application(chat_id, job_id, username=""):
         "questions_to_confirm": draft.get("questions_to_confirm", []),
         "job_snapshot": job_snapshot(job),
         "updated_at": now,
-    }, prefer="resolution=merge-duplicates")
+    }
+    application_path = (
+        f"applications?chat_id=eq.{chat_id}&job_id=eq.{job_id}"
+    )
+    existing_application = sb_get(f"{application_path}&select=id&limit=1")
+    if existing_application:
+        saved = sb_patch(application_path, {
+            key: value for key, value in application_payload.items()
+            if key not in ("chat_id", "job_id")
+        })
+    else:
+        saved = sb_post(
+            "applications?on_conflict=chat_id,job_id",
+            application_payload,
+            prefer="resolution=merge-duplicates,return=minimal",
+        )
     applications = sb_get(
         f"applications?chat_id=eq.{chat_id}&job_id=eq.{job_id}&select=*&limit=1"
     )
-    if not applications:
-        send(chat_id, "Could not save the draft. Please try again.")
+    if (
+        not saved
+        or not applications
+        or applications[0].get("status") != "awaiting_approval"
+    ):
+        cover = sanitize(draft.get("cover_letter"), 1000)
+        url = sanitize_url(job.get("url"))
+        buttons = [[{"text": "🌐 Open Employer Form", "url": url}]] if url else None
+        send(
+            chat_id,
+            "⚠️ <b>Draft prepared, but Supabase could not save it.</b>\n\n"
+            f"<b>Copy this cover letter:</b>\n<i>{cover}</i>\n\n"
+            "You can still continue manually below. To permanently repair the "
+            "review queue, run the latest auto-apply SQL upgrade in Supabase.",
+            buttons,
+        )
         return
     application = applications[0]
     questions = application.get("questions_to_confirm") or []
@@ -652,16 +699,37 @@ def handle_applications(chat_id, username=""):
     if not is_autoapply_owner(chat_id, username):
         autoapply_access_message(chat_id)
         return
-    rows = sb_get(
+    queue_path = (
         f"applications?chat_id=eq.{chat_id}"
         "&status=in.(queued,awaiting_approval,manual_required)"
         "&select=*&order=created_at.desc&limit=8"
     )
+    rows = sb_get(queue_path)
+
+    # Self-heal old/failed queues. This also covers jobs found immediately
+    # before Review Mode was enabled.
+    if not rows:
+        profile = get_candidate_profile(chat_id)
+        if profile.get("auto_apply_mode") == "review":
+            user = get_user(chat_id)
+            _, disliked_ids = get_user_feedback(chat_id)
+            recovery_jobs = [
+                job for job in get_cached_jobs()
+                if job.get("job_id", "") not in disliked_ids
+                and job_matches_user(job, user)
+            ][:8]
+            if recovery_jobs:
+                queue_applications(chat_id, recovery_jobs, username)
+                rows = sb_get(queue_path)
+
     if not rows:
         send(
             chat_id,
             "📥 <b>Your application queue is empty.</b>\n\n"
-            "Turn on /autoapply and use /find. New matching jobs will appear here.",
+            "Review Mode is ON, but no matching cached jobs could be queued yet. "
+            "Use /find once, then open /applications again.\n\n"
+            "If jobs appear in /find but this remains empty, the Supabase "
+            "<code>applications</code> table needs the auto-apply SQL upgrade.",
         )
         return
     send(chat_id, f"📥 <b>{len(rows)} applications to review</b>")
