@@ -5,13 +5,22 @@
       "excludeFiles": "{tests/**,**/__pycache__/**,**/*.pyc}"
     },
     "api/webhook.py": {
-      "maxDuration": 60,
+      "maxDuration": 300,
       "excludeFiles": "{tests/**,**/__pycache__/**,**/*.pyc}"
     }
   },
   "crons": [
-    { "path": "/api/scan", "schedule": "0 9 * * *" },
-    { "path": "/api/scan", "schedule": "0 15 * * *" },
-    { "path": "/api/scan", "schedule": "0 21 * * *" }
+    {
+      "path": "/api/scan",
+      "schedule": "0 9 * * *"
+    },
+    {
+      "path": "/api/scan",
+      "schedule": "0 15 * * *"
+    },
+    {
+      "path": "/api/scan",
+      "schedule": "0 21 * * *"
+    }
   ]
 }
