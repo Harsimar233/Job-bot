@@ -8,8 +8,15 @@ from api.jobs import make_job
 
 
 TIMEOUT = 15
-ADZUNA_APP_ID = os.environ.get("ADZUNA_APP_ID", "")
-ADZUNA_APP_KEY = os.environ.get("ADZUNA_APP_KEY", "")
+ADZUNA_APP_ID = (
+    os.environ.get("ADZUNA_APP_ID")
+    or os.environ.get("ADZUNA_ID", "")
+)
+
+ADZUNA_APP_KEY = (
+    os.environ.get("ADZUNA_APP_KEY")
+    or os.environ.get("ADZUNA_KEY", "")
+)
 ADZUNA_COUNTRIES = [
     item.strip().lower()
     for item in os.environ.get("ADZUNA_COUNTRIES", "in,us,gb,ca,au").split(",")
