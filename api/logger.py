@@ -1,5 +1,5 @@
 """
-Remote Radar — Structured Logger
+Super Job Bot — Structured Logger
 Fix #1: Replaces silent except: pass with logged, trackable errors.
 All failures are printed with context so Vercel logs become useful.
 """
