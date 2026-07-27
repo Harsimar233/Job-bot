@@ -1,23 +1,34 @@
-name: Daily Job Scan
+name: Manual Job Scan
 
 on:
-  schedule:
-    - cron: '0 9 * * *'
   workflow_dispatch:
 
 jobs:
   scan:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-      - run: pip install requests feedparser beautifulsoup4 lxml
-      - run: python -m api.scan
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run job scan
+        run: python -m api.scan
         env:
-          JOB_BOT_TOKEN:  ${{ secrets.JOB_BOT_TOKEN }}
-          SUPABASE_URL:   ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY:   ${{ secrets.SUPABASE_KEY }}
-          SCRAPER_KEY:    ${{ secrets.SCRAPER_KEY }}
+          JOB_BOT_TOKEN: ${{ secrets.JOB_BOT_TOKEN }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          SCRAPER_KEY: ${{ secrets.SCRAPER_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ADZUNA_APP_ID: ${{ secrets.ADZUNA_APP_ID }}
+          ADZUNA_APP_KEY: ${{ secrets.ADZUNA_APP_KEY }}
+          USAJOBS_API_KEY: ${{ secrets.USAJOBS_API_KEY }}
+          USAJOBS_USER_AGENT: ${{ secrets.USAJOBS_USER_AGENT }}
+          AUTO_APPLY_OWNER_USERNAME: Harsimarhs
+          AUTO_APPLY_ALLOWED_CHAT_ID: ${{ secrets.AUTO_APPLY_ALLOWED_CHAT_ID }}
