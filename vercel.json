@@ -1,4 +1,14 @@
 {
+  "functions": {
+    "api/scan.py": {
+      "maxDuration": 300,
+      "excludeFiles": "{tests/**,**/__pycache__/**,**/*.pyc}"
+    },
+    "api/webhook.py": {
+      "maxDuration": 60,
+      "excludeFiles": "{tests/**,**/__pycache__/**,**/*.pyc}"
+    }
+  },
   "crons": [
     { "path": "/api/scan", "schedule": "0 9 * * *" },
     { "path": "/api/scan", "schedule": "0 15 * * *" },
